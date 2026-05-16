@@ -4,7 +4,7 @@
 ;
 ; A native NSIS Wizard page (using nsDialogs) inserted between the directory
 ; selection page and the install-files page. Detects the baseline runtime
-; prerequisites (Python 3.11-3.13, Node.js, and Git for Windows); offers to
+; prerequisites (Python 3.11-3.13, Node.js 20+, and Git for Windows); offers to
 ; install missing items via winget.
 ;
 ; Page sequence:
@@ -38,9 +38,9 @@
 ;     returns exit 0 only when that specific version is installed. The
 ;     Microsoft Store "Python stub" doesn't install py.exe, so users with
 ;     only the stub get correctly classified as not-installed.
-;   Node.js: `where node` returns exit 0 if node is on PATH. We also check
-;     %LOCALAPPDATA%\hermes\node\node.exe for Hermes-managed installs.
-;   Git: check known Git Bash locations, then `where bash`.
+;   Node.js: require a modern Node (major >= 20). Check PATH first, then the
+;     Hermes-managed %LOCALAPPDATA%\hermes\node\node.exe if present.
+;   Git: check known Git Bash locations for Git for Windows / Hermes-managed Git.
 ;   winget: `where winget` returns exit 0 on Win11 / Win10 1809+ with App
 ;     Installer. If unavailable, the page shows manual download URLs.
 ;
@@ -393,13 +393,19 @@ Function HermesDetectPrereqs
     ${HermesLogKV} "after filesystem probe, HermesHasPython" "$HermesHasPython"
   ${EndIf}
 
-  ; --- Node.js ---
-  Push 'cmd.exe /c where node'
+  ; --- Node.js 20+ ---
+  Push 'cmd.exe /c node -e "process.exit(Number(process.versions.node.split(String.fromCharCode(46))[0]) >= 20 ? 0 : 1)"'
   Call HermesProbe
   ${If} $0 == 0
     StrCpy $HermesHasNode "1"
   ${ElseIf} ${FileExists} "$LOCALAPPDATA\hermes\node\node.exe"
-    StrCpy $HermesHasNode "1"
+    Push '"$LOCALAPPDATA\hermes\node\node.exe" -e "process.exit(Number(process.versions.node.split(String.fromCharCode(46))[0]) >= 20 ? 0 : 1)"'
+    Call HermesProbe
+    ${If} $0 == 0
+      StrCpy $HermesHasNode "1"
+    ${Else}
+      StrCpy $HermesHasNode "0"
+    ${EndIf}
   ${Else}
     StrCpy $HermesHasNode "0"
   ${EndIf}
@@ -419,12 +425,6 @@ Function HermesDetectPrereqs
     StrCpy $HermesHasGitBash "1"
   ${ElseIf} ${FileExists} "$LOCALAPPDATA\Programs\Git\bin\bash.exe"
     StrCpy $HermesHasGitBash "1"
-  ${Else}
-    Push 'cmd.exe /c where bash'
-    Call HermesProbe
-    ${If} $0 == 0
-      StrCpy $HermesHasGitBash "1"
-    ${EndIf}
   ${EndIf}
   ${HermesLogKV} "HermesHasGitBash" "$HermesHasGitBash"
 
@@ -537,7 +537,7 @@ Function HermesPrereqPageCreate
   ${EndIf}
 
   ; --- Node.js panel ---
-  ${NSD_CreateGroupBox} 0u 50u 100% 30u "Node.js LTS"
+  ${NSD_CreateGroupBox} 0u 50u 100% 30u "Node.js 20+ LTS"
   Pop $0
   ${If} $HermesHasNode == "1"
     ${NSD_CreateLabel} 8u 60u 95% 10u "Detected on your system."
