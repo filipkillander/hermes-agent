@@ -3907,7 +3907,12 @@ def generate_launchd_plist() -> str:
         )
     )
 
-    # Build ProgramArguments array, including --profile when using a named profile
+    # Build ProgramArguments array, including --profile when using a named profile.
+    # launchd is already the supervisor. Do not run the service-managed gateway
+    # with --replace: a freshly bootstrapped job should be the single owner,
+    # and restarts should happen through launchctl kickstart/KeepAlive. Baking
+    # --replace into the plist can create self-replacement churn and make
+    # scheduled restarts appear successful without launchd changing PID.
     prog_args = [
         f"<string>{python_path}</string>",
         "<string>-m</string>",
@@ -3920,7 +3925,6 @@ def generate_launchd_plist() -> str:
         [
             "<string>gateway</string>",
             "<string>run</string>",
-            "<string>--replace</string>",
         ]
     )
     prog_args_xml = "\n        ".join(prog_args)
