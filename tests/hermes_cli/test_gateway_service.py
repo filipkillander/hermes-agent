@@ -645,7 +645,8 @@ class TestLaunchdServiceRecovery:
             gateway_cli,
             "generate_launchd_plist",
             lambda: (
-                "<plist>--replace\n<key>HERMES_HOME</key>"
+                "<plist><string>gateway</string>\n<string>run</string>"
+                "<key>HERMES_HOME</key>"
                 "<string>/Users/alice/.hermes</string></plist>"
             ),
         )
@@ -664,7 +665,10 @@ class TestLaunchdServiceRecovery:
 
         label = gateway_cli.get_launchd_label()
         domain = gateway_cli._launchd_domain()
-        assert "--replace" in plist_path.read_text(encoding="utf-8")
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<string>gateway</string>" in plist_text
+        assert "<string>run</string>" in plist_text
+        assert "--replace" not in plist_text
         # The calls list includes launchctl print probes from _launchd_domain()
         # before the bootout/bootstrap calls. Filter to only bootout/bootstrap.
         service_calls = [c for c in calls if "bootout" in c or "bootstrap" in c]
@@ -2413,9 +2417,9 @@ class TestProfileArg:
         assert "--profile mybot" in unit
         assert "gateway run" in unit
         # Under a process supervisor (Restart=always), --replace makes each
-        # restart kill its predecessor → self-kill loop. The systemd unit must
-        # NOT use --replace; the supervisor owns the lifecycle. (--replace stays
-        # on the manual launchd fallback path — see test_launchd_plist_includes_profile.)
+        # restart kill its predecessor → self-kill loop. The systemd unit and
+        # launchd plist must NOT use --replace; the supervisor owns the
+        # lifecycle. (--replace stays on detached/manual fallback paths.)
         assert "--replace" not in unit
 
     def test_systemd_unit_for_target_user_includes_named_profile(self, tmp_path, monkeypatch):
@@ -2450,6 +2454,9 @@ class TestProfileArg:
         plist = gateway_cli.generate_launchd_plist()
         assert "<string>--profile</string>" in plist
         assert "<string>mybot</string>" in plist
+        assert "<string>gateway</string>" in plist
+        assert "<string>run</string>" in plist
+        assert "--replace" not in plist
 
     def test_launchd_plist_supports_aqua_and_background_sessions(self):
         # macOS 26+ only loads the agent in non-Aqua sessions when the plist
