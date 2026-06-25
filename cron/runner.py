@@ -492,70 +492,158 @@ def _run_script_job(job: dict, target_home: Path) -> RunResult:
 
 
 def _run_agent_job(job: dict, target_home: Path) -> RunResult:
-    """LLM job path (no_agent=False). The actual agent execution still
-    happens inside ``cron.scheduler.run_job``; we just want it to see the
-    target HERMES_HOME instead of the gateway's. We do that by spawning
-    the same Python interpreter with HERMES_HOME=<target_home> and the
-    ``hermes_cron_executor`` entrypoint, which loads the target profile
-    and runs the job.
+    """LLM job path (no_agent=False). The agent machinery (AIAgent,
+    SessionDB, skill loader, MCP servers, config.yaml) reads
+    ``HERMES_HOME`` at import time, so we MUST run the job in a
+    subprocess that inherits ``HERMES_HOME=<target_home>`` — otherwise
+    the agent would load the gateway's config/skills/state and stomp
+    on per-process caches.
 
-    The subprocess writes its own run-log (with a slightly richer payload
-    — see ``hermes_cron_executor``). We return whatever it wrote so the
-    caller (gateway scheduler) can update last_status / last_error as
-    usual.
+    The runner hands the job dict to the child via a small JSON file
+    under the master run-log dir, the child runs the agent under the
+    target profile, and writes a structured RunResult JSON back to
+    that same dir. The runner re-reads the RunResult so the caller
+    (gateway scheduler) gets the same shape as the script path.
+
+    The subprocess inherits a sanitized env (provider keys blocked,
+    HERMES_HOME / HERMES_CRON_* / run-log dir wired through). The
+    runner never mutates the gateway's master ``jobs.json`` — that's
+    the scheduler's job via ``mark_job_run``. The subprocess only
+    writes the run-log.
     """
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        # Should be caught upstream, but defend again so we never spawn
+        # an unkeyed child.
+        raise ValueError("_run_agent_job: job has no id")
+
     # Strip any HERMES_HOME that points at the gateway so the subprocess
     # definitely inherits the target's. Without this, an inherited env
     # would silently route the LLM back to the gateway profile.
     env = os.environ.copy()
     env["HERMES_HOME"] = str(target_home)
-    env["HERMES_CRON_JOB_ID"] = str(job.get("id") or "")
+    env["HERMES_CRON_JOB_ID"] = job_id
     env["HERMES_CRON_PROFILE"] = str(target_home.name)
-    env["HERMES_CRON_RUN_LOG_DIR"] = str(_runs_root() / _safe_job_id(str(job.get("id") or "")))
+
+    # The run-log dir is always on the gateway's master store (Lumi's
+    # HERMES_HOME), regardless of which profile did the work — see
+    # ``_runs_root`` for rationale. We drop a small job-payload JSON
+    # there so the child can read it without inheriting the full job
+    # dict via env (avoids blowing past env-var size limits and keeps
+    # prompt text out of `ps`-visible env).
+    run_log_dir = _runs_root() / _safe_job_id(job_id)
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run_log_dir.chmod(0o700)
+    except OSError:
+        pass
+    env["HERMES_CRON_RUN_LOG_DIR"] = str(run_log_dir)
+    job_payload_path = run_log_dir / "_job.json"
+    try:
+        job_payload_path.write_text(
+            json.dumps(job, ensure_ascii=False, indent=2)
+        )
+        try:
+            job_payload_path.chmod(0o600)
+        except OSError:
+            pass
+        env["HERMES_CRON_JOB_FILE"] = str(job_payload_path)
+    except Exception as exc:
+        # If we can't drop the payload, fall back to a /tmp file so the
+        # subprocess can still run. Never let IO failure crash a tick.
+        logger.warning(
+            "_run_agent_job: could not write job payload to %s: %s; "
+            "falling back to a tmp file",
+            job_payload_path,
+            exc,
+        )
+        import tempfile
+
+        fd, fallback_str = tempfile.mkstemp(
+            prefix="hermes_cron_job_", suffix=".json", text=True
+        )
+        try:
+            os.write(fd, json.dumps(job, ensure_ascii=False).encode("utf-8"))
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(fallback_str, 0o600)
+        except OSError:
+            pass
+        env["HERMES_CRON_JOB_FILE"] = fallback_str
+
+    # Sanitise the env so provider secrets in the gateway process don't
+    # leak verbatim into the child. Same helper the script path uses.
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+
+        env = _sanitize_subprocess_env(env)
+    except Exception as exc:
+        logger.debug("_run_agent_job: _sanitize_subprocess_env unavailable: %s", exc)
+
+    # Re-apply our explicit overrides AFTER sanitisation so a malicious
+    # blocklist entry can't clobber HERMES_HOME / HERMES_CRON_*. The
+    # _sanitize_subprocess_env helper preserves the keys we set, but
+    # defend explicitly so this stays correct if the helper's policy
+    # is widened later.
+    env["HERMES_HOME"] = str(target_home)
+    env["HERMES_CRON_JOB_ID"] = job_id
+    env["HERMES_CRON_PROFILE"] = str(target_home.name)
+    env["HERMES_CRON_RUN_LOG_DIR"] = str(run_log_dir)
+    env["HERMES_CRON_JOB_FILE"] = str(env["HERMES_CRON_JOB_FILE"])
+
+    argv = [
+        sys.executable,
+        "-m",
+        "cron.executor",
+        "--job-file",
+        str(env["HERMES_CRON_JOB_FILE"]),
+        "--run-log-dir",
+        str(run_log_dir),
+    ]
 
     started_at = _utc_now_iso()
     t0 = time.monotonic()
+    timeout_seconds = _resolve_timeout_seconds(job)
+    popen_kwargs: dict = {}
+    if sys.platform == "win32":
+        try:
+            from hermes_cli._subprocess_compat import windows_hide_flags
+
+            popen_kwargs["creationflags"] = windows_hide_flags()
+        except Exception:
+            pass
+
     try:
-        # Use -c to import + call so we don't need an extra file shipped
-        # in the repo. The executor module is loaded from the target
-        # profile's hermes checkout (the same one we're already running
-        # from here — see cron/ directory layout).
-        from cron.executor import run_job_entrypoint
-
-        # Hand the job dict to the entrypoint. The entrypoint picks up
-        # HERMES_HOME via get_hermes_home() and writes the canonical run
-        # record back to HERMES_CRON_RUN_LOG_DIR so the gateway sees
-        # exactly one log entry per run.
-        run_job_entrypoint(job, run_log_dir=Path(env["HERMES_CRON_RUN_LOG_DIR"]))
-
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            cwd=str(target_home),
+            env=env,
+            **popen_kwargs,
+        )
+    except subprocess.TimeoutExpired:
         duration_ms = int((time.monotonic() - t0) * 1000)
-        # Re-read what the entrypoint wrote so the caller has the same
-        # RunResult shape as the script path.
-        log_dir = Path(env["HERMES_CRON_RUN_LOG_DIR"])
-        latest = _latest_log(log_dir)
-        if latest is not None:
-            try:
-                return RunResult.from_dict(json.loads(latest.read_text()))
-            except Exception as exc:
-                logger.warning("Could not parse run log %s: %s", latest, exc)
-
-        # Fallback if the entrypoint wrote nothing (shouldn't happen).
-        return RunResult(
-            job_id=str(job.get("id") or ""),
+        run_result = RunResult(
+            job_id=job_id,
             profile=target_home.name,
-            status="ok",
-            exit_code=0,
+            status="timeout",
+            exit_code=-1,
             duration_ms=duration_ms,
             output="",
-            error=None,
+            error=f"Agent subprocess timed out after {timeout_seconds}s",
             script_path=None,
             started_at=started_at,
             finished_at=_utc_now_iso(),
         )
+        _write_run_log(run_result)
+        return run_result
     except Exception as exc:
         duration_ms = int((time.monotonic() - t0) * 1000)
-        return RunResult(
-            job_id=str(job.get("id") or ""),
+        run_result = RunResult(
+            job_id=job_id,
             profile=target_home.name,
             status="error",
             exit_code=1,
@@ -566,6 +654,73 @@ def _run_agent_job(job: dict, target_home: Path) -> RunResult:
             started_at=started_at,
             finished_at=_utc_now_iso(),
         )
+        _write_run_log(run_result)
+        return run_result
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    # Redact secrets in both streams before they hit the run-log.
+    stdout = (result.stdout or "")
+    stderr = (result.stderr or "")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        stdout = redact_sensitive_text(stdout)
+        stderr = redact_sensitive_text(stderr)
+    except Exception:
+        pass
+
+    # Re-read the canonical RunResult the child wrote. The child is
+    # authoritative about status/output/duration because it ran the
+    # actual agent. The runner just records the child's exit code as
+    # extra context if the child wrote nothing.
+    latest = _latest_log(run_log_dir)
+    if latest is not None:
+        try:
+            run_result = RunResult.from_dict(json.loads(latest.read_text()))
+            # Prefer the gateway's measured duration (it spans the
+            # whole subprocess lifetime) over the child's local clock.
+            if run_result.duration_ms in (0, None):
+                run_result.duration_ms = duration_ms
+            return run_result
+        except Exception as exc:
+            logger.warning(
+                "_run_agent_job: could not parse run log %s: %s",
+                latest,
+                exc,
+            )
+
+    # Child wrote nothing — synthesise a RunResult from the subprocess
+    # exit code + captured streams. This is the failure path (the
+    # child's contract is to always write a RunResult), so anything we
+    # build here is by definition a degraded signal.
+    if result.returncode == 0:
+        status = "ok"
+        error = None
+    else:
+        status = "error"
+        error = (
+            f"Agent subprocess exited {result.returncode} without writing "
+            f"a run-log entry"
+            + (f": {stderr.strip()}" if stderr.strip() else "")
+        )
+    output = stdout.strip() if status == "ok" else (
+        (stdout + ("\n" + stderr if stderr else "")).strip()
+    )
+    run_result = RunResult(
+        job_id=job_id,
+        profile=target_home.name,
+        status=status,
+        exit_code=result.returncode,
+        duration_ms=duration_ms,
+        output=output,
+        error=error,
+        script_path=None,
+        started_at=started_at,
+        finished_at=_utc_now_iso(),
+    )
+    _write_run_log(run_result)
+    return run_result
 
 
 def _latest_log(log_dir: Path) -> Optional[Path]:

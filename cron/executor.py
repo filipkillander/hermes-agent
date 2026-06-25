@@ -65,7 +65,6 @@ def run_job_entrypoint(job: dict, *, run_log_dir: Optional[Path] = None) -> RunR
             / "cron" / "runs" / _safe_job_id(job_id)
         )
         run_log_dir.mkdir(parents=True, exist_ok=True)
-
     # Import lazily so importing this module never pulls in
     # AIAgent / SessionDB unless we actually need them.
     try:
@@ -126,3 +125,82 @@ def run_job_entrypoint(job: dict, *, run_log_dir: Optional[Path] = None) -> RunR
         logger.warning("executor: could not write run log: %s", exc)
     _write_run_log(result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint — ``python -m cron.executor --job-file <path>``
+# ---------------------------------------------------------------------------
+
+
+def _main(argv: list[str]) -> int:
+    """Subprocess entrypoint used by ``cron.runner._run_agent_job``.
+
+    The runner (running in the gateway profile) writes the job dict to a
+    temp JSON file under the master run-log dir, sets ``HERMES_HOME`` to
+    the target profile, and spawns this module as a child process. We
+    load the job dict, hand it to ``run_job_entrypoint``, and exit with
+    the RunResult's ``exit_code`` so the runner can detect failures.
+
+    Args:
+        argv: Process argv (excluding ``[0]``, the script name). Accepted
+            forms:
+              * ``--job-file <path>``  — path to the job dict JSON
+              * ``--run-log-dir <path>`` — optional override of the
+                run-log directory. Defaults to the env-supplied
+                ``HERMES_CRON_RUN_LOG_DIR``.
+
+    Returns:
+        The RunResult's ``exit_code`` (``0`` on success). Errors return
+        ``1`` so the runner can mark the run failed.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m cron.executor")
+    parser.add_argument(
+        "--job-file",
+        default=os.environ.get("HERMES_CRON_JOB_FILE", ""),
+        help=(
+            "Path to a JSON file containing the cron job dict. Defaults "
+            "to the $HERMES_CRON_JOB_FILE env var."
+        ),
+    )
+    parser.add_argument(
+        "--run-log-dir",
+        default=os.environ.get("HERMES_CRON_RUN_LOG_DIR", ""),
+        help=(
+            "Directory where the RunResult JSON should be written. "
+            "Defaults to $HERMES_CRON_RUN_LOG_DIR (set by the runner)."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if not args.job_file:
+        logger.error("cron.executor: --job-file (or $HERMES_CRON_JOB_FILE) is required")
+        return 1
+
+    job_path = Path(args.job_file)
+    try:
+        job = json.loads(job_path.read_text())
+    except FileNotFoundError:
+        logger.error("cron.executor: job file not found: %s", job_path)
+        return 1
+    except Exception as exc:
+        logger.error("cron.executor: could not read job file %s: %s", job_path, exc)
+        return 1
+
+    run_log_dir = Path(args.run_log_dir) if args.run_log_dir else None
+    if run_log_dir is not None:
+        run_log_dir.mkdir(parents=True, exist_ok=True)
+
+    result = run_job_entrypoint(job, run_log_dir=run_log_dir)
+    try:
+        return int(result.exit_code)
+    except (TypeError, ValueError):
+        return 0 if result.status == "ok" else 1
+
+
+if __name__ == "__main__":  # pragma: no cover - subprocess entrypoint
+    import os
+    import sys as _sys
+
+    raise SystemExit(_main(_sys.argv[1:]))
