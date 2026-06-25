@@ -710,6 +710,76 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+_CHAT_HEADER_EXCLUDED_PLATFORMS = frozenset({"email", "webhook"})
+_CRON_NAME_PREFIX_TOKENS = frozenset({"lumi", "hermes"})
+_CRON_NAME_CADENCE_TOKENS = frozenset({
+    "daily", "nightly", "weekly", "monthly", "hourly", "morning", "evening",
+})
+_CRON_NAME_ACRONYM_TOKENS = frozenset({"ai", "api", "id", "kmr", "os", "sms", "ui", "url"})
+
+
+def _cron_chat_header_enabled(cron_cfg: dict) -> bool:
+    """Return whether compact chat-only cron headers are enabled."""
+    value = (cron_cfg or {}).get("chat_header", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "compact"}
+    return bool(value)
+
+
+def _is_chat_delivery_platform(platform_name: str) -> bool:
+    """Return True for delivery platforms that should get chat-style headers."""
+    name = (platform_name or "").strip().lower()
+    return bool(name) and name not in _CHAT_HEADER_EXCLUDED_PLATFORMS
+
+
+def _title_cron_name_token(token: str) -> str:
+    lower = token.lower()
+    if lower in _CRON_NAME_ACRONYM_TOKENS:
+        return lower.upper()
+    return token[:1].upper() + token[1:] if token else token
+
+
+def _clean_cron_delivery_name(job: dict) -> str:
+    """Turn an internal cron name/id into a compact human-facing title."""
+    raw = str(job.get("name") or job.get("id") or "Cron job").strip()
+    if not raw:
+        return "Cron Job"
+
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+    tokens = [part for part in re.split(r"[-_\s]+", spaced) if part]
+    if not tokens:
+        return raw
+
+    prefixes = set(_CRON_NAME_PREFIX_TOKENS)
+    profile = str(job.get("profile") or "").strip().lower()
+    if profile:
+        prefixes.add(profile)
+
+    while tokens and tokens[0].lower() in prefixes:
+        tokens.pop(0)
+    while tokens and tokens[0].lower() in _CRON_NAME_CADENCE_TOKENS:
+        tokens.pop(0)
+    while tokens and tokens[-1].lower() in _CRON_NAME_CADENCE_TOKENS:
+        tokens.pop()
+
+    if not tokens:
+        tokens = [part for part in re.split(r"[-_\s]+", spaced) if part]
+
+    return " ".join(_title_cron_name_token(token) for token in tokens)
+
+
+def _format_compact_cron_delivery(job: dict, content: str, *, run_time=None) -> str:
+    """Format a chat-delivered cron response with Filip's compact header."""
+    stamp = (run_time or _hermes_now()).strftime("%y%m%d, %H:%M")
+    job_id = str(job.get("id") or "").strip()
+    title = _clean_cron_delivery_name(job)
+    header = f"# {title}\n**Job ID**: {job_id}\n**Datum**: {stamp}"
+    body = (content or "").strip()
+    if not body:
+        return header
+    return f"{header}\n\n{body}"
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -734,31 +804,38 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # in config.yaml for clean output.  Compact chat headers are an additive
+    # profile opt-in (cron.chat_header: true) that leaves email/webhook targets
+    # untouched.
     wrap_response = True
+    chat_header = False
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        cron_cfg = user_cfg.get("cron", {}) if isinstance(user_cfg, dict) else {}
+        if not isinstance(cron_cfg, dict):
+            cron_cfg = {}
+        wrap_response = cron_cfg.get("wrap_response", True)
+        chat_header = _cron_chat_header_enabled(cron_cfg)
     except Exception:
         pass
 
-    if wrap_response:
+    def _build_delivery_content(platform_name: str) -> str:
+        if chat_header and _is_chat_delivery_platform(platform_name):
+            return _format_compact_cron_delivery(job, content)
+        if not wrap_response:
+            return content
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
+        return (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
             f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
         )
-    else:
-        delivery_content = content
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     try:
         config = load_gateway_config()
@@ -805,6 +882,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
             continue
+
+        delivery_content = _build_delivery_content(platform_name)
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
@@ -1381,12 +1462,68 @@ def _scan_assembled_cron_prompt(
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+
+    # ---------------------------------------------------------------
+    # Multiprofile routing — delegate to ``cron.runner.run_job_in_profile``
+    # when the job's ``profile`` differs from the gateway's. This keeps
+    # the Lumi master store as the single source of truth while letting
+    # individual jobs run in their declared profile's HERMES_HOME.
+    #
+    # In-process (legacy) behaviour is preserved when profile matches
+    # the gateway's HERMES_HOME, so existing jobs without a profile
+    # field keep working without configuration.
+    # ---------------------------------------------------------------
+    try:
+        from cron.profile_routing import decide_routing
+        from cron.runner import run_job_in_profile
+
+        _decision = decide_routing(job)
+        if _decision.action == "delegate":
+            _delegate_result = run_job_in_profile(job)
+            _delegate_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Mode:** delegated (profile={_decision.profile})\n"
+                f"**Status:** {_delegate_result.status}\n"
+                f"**Exit Code:** {_delegate_result.exit_code}\n"
+                f"**Duration (ms):** {_delegate_result.duration_ms}\n\n"
+                f"{_delegate_result.output}\n"
+            )
+            _delegate_ok = _delegate_result.status == "ok"
+            return (
+                _delegate_ok,
+                _delegate_doc,
+                _delegate_result.output if _delegate_ok else "",
+                _delegate_result.error,
+            )
+        if _decision.action == "unreachable":
+            _err = (
+                f"Cron job '{job_name}' targets profile={_decision.profile!r} "
+                f"but that profile directory is missing on this host. "
+                f"Reason: {_decision.reason}"
+            )
+            logger.error(_err)
+            _doc = (
+                f"# Cron Job: {job_name} (FAILED)\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Mode:** delegated (profile={_decision.profile})\n"
+                f"**Status:** unreachable\n\n"
+                f"{_err}\n"
+            )
+            return (False, _doc, "", _err)
+    except ImportError:
+        # Module not yet loaded (very early bootstrap) — fall through to
+        # legacy in-process path. This keeps `from cron.scheduler import
+        # run_job` working before the new helpers are wired in.
+        pass
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.

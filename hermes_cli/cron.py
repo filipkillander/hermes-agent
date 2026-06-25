@@ -152,8 +152,13 @@ def cron_tick():
 
 
 def cron_status():
-    """Show cron execution status."""
+    """Show cron execution status.
+
+    Multiprofile-aware: prints a per-profile job breakdown and a per-job
+    row showing profile, last status, next run, and unreachable flag.
+    """
     from cron.jobs import list_jobs
+    from cron.profile_routing import build_job_summary, count_jobs_by_profile
     from hermes_cli.gateway import find_gateway_pids
 
     print()
@@ -180,6 +185,44 @@ def cron_status():
             print(f"  Next run: {min(next_runs)}")
     else:
         print("  No active jobs")
+        print()
+        return
+
+    # Per-profile breakdown — only when there's more than one profile in
+    # the store, so single-profile setups stay quiet.
+    counts = count_jobs_by_profile(jobs)
+    if len(counts) > 1:
+        print()
+        print("  Per-profile breakdown:")
+        # Sort: gateway profile (empty / "default" / "lumi") first, then
+        # the rest alphabetically.
+        def _sort_key(name):
+            return (0 if name in ("", "default", "lumi") else 1, name or "unset")
+        for profile_name in sorted(counts.keys(), key=_sort_key):
+            display = profile_name or "(unset)"
+            print(f"    {display}: {counts[profile_name]}")
+
+    # Per-job table — name, profile, last_status, next_run, unreachable flag.
+    print()
+    print("  Jobs:")
+    for job in jobs:
+        s = build_job_summary(job)
+        profile_label = s["profile"] or "(gateway)"
+        status_label = s["last_status"] or "—"
+        if s.get("unreachable"):
+            status_label = color("UNREACHABLE", Colors.RED)
+        elif status_label == "ok":
+            status_label = color("ok", Colors.GREEN)
+        elif status_label == "error":
+            status_label = color("error", Colors.RED)
+        next_label = s["next_run_at"] or "—"
+        line = f"    • {s['name']}  [profile={profile_label}]  status={status_label}  next={next_label}"
+        print(line)
+        if s.get("last_error"):
+            err = str(s["last_error"]).strip()
+            if err:
+                short = err if len(err) <= 120 else err[:117] + "..."
+                print(color(f"        last error: {short}", Colors.DIM))
 
     print()
 

@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -574,6 +575,72 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    @pytest.mark.parametrize("platform_name", ["discord", "telegram"])
+    def test_delivery_uses_three_line_chat_header_when_enabled(self, platform_name):
+        """cron.chat_header adds Filip's compact chat-only header."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform(platform_name): pconfig}
+        fixed_now = datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc)
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "chat_header": True}}), \
+             patch("cron.scheduler._hermes_now", return_value=fixed_now):
+            job = {
+                "id": "0c85b33a8dab",
+                "name": "lumi-daily-heartbeat",
+                "profile": "lumi",
+                "deliver": "origin",
+                "origin": {"platform": platform_name, "chat_id": "123"},
+            }
+            _deliver_result(job, "**Läget:** klart")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == (
+            "# Heartbeat\n"
+            "**Job ID**: 0c85b33a8dab\n"
+            "**Datum**: 260622, 09:00\n\n"
+            "**Läget:** klart"
+        )
+        assert "Cronjob Response" not in sent_content
+        assert "-------------" not in sent_content
+        assert "To stop or manage this job" not in sent_content
+
+    @pytest.mark.parametrize(
+        ("platform_name", "chat_id"),
+        [("email", "filip@example.invalid"), ("webhook", "https://example.invalid/hook")],
+    )
+    def test_compact_chat_header_does_not_wrap_email_or_webhook(self, platform_name, chat_id):
+        """cron.chat_header should not add chat chrome to email/webhook deliveries."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform(platform_name): pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "chat_header": True}}):
+            job = {
+                "id": f"{platform_name}-job",
+                "name": "here-now-monthly-audit",
+                "deliver": "origin",
+                "origin": {"platform": platform_name, "chat_id": chat_id},
+            }
+            _deliver_result(job, "Body only.")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Body only."
+        assert "# " not in sent_content
+        assert "Job ID:" not in sent_content
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""

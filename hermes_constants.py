@@ -58,14 +58,11 @@ def get_hermes_home() -> Path:
     This is the single source of truth — all other copies should import this.
 
     When ``HERMES_HOME`` is unset but an ``active_profile`` file indicates
-    a non-default profile is active, logs a loud one-shot warning to
-    ``errors.log`` so cross-profile data corruption is diagnosable instead
-    of silent.  Behavior is unchanged otherwise — we still return
-    the platform-native default — because raising here would brick 30+ module-level
-    callers that import this at load time.  Subprocess spawners are
-    expected to propagate ``HERMES_HOME`` explicitly (see the systemd
-    template in ``hermes_cli/gateway.py`` and the kanban dispatcher in
-    ``hermes_cli/kanban_db.py``).  See https://github.com/NousResearch/hermes-agent/issues/18594.
+    a non-default profile is active, resolve to that profile's home when the
+    profile directory exists. This avoids silently reading or writing the
+    default profile from long-lived agent/tool processes whose spawner failed
+    to propagate ``HERMES_HOME``. See
+    https://github.com/NousResearch/hermes-agent/issues/18594.
     """
     override = get_hermes_home_override()
     if override:
@@ -75,30 +72,38 @@ def get_hermes_home() -> Path:
     if val:
         return Path(val)
 
-    # Guard: if a non-default profile is sticky-active, warn once that
-    # the fallback to the default profile is almost certainly wrong.
+    # Guard: if a non-default profile is sticky-active, prefer that profile
+    # rather than silently falling back to the default profile.
     global _profile_fallback_warned
-    if not _profile_fallback_warned:
-        try:
-            fallback_home = _get_platform_default_hermes_home()
-            active_path = fallback_home / "active_profile"
-            active = active_path.read_text().strip() if active_path.exists() else ""
-        except (UnicodeDecodeError, OSError):
-            active = ""
-        if active and active != "default":
+    fallback_home = _get_platform_default_hermes_home()
+    try:
+        active_path = fallback_home / "active_profile"
+        active = active_path.read_text().strip() if active_path.exists() else ""
+    except (UnicodeDecodeError, OSError):
+        active = ""
+    if active and active != "default":
+        profile_home = fallback_home / "profiles" / active
+        if profile_home.is_dir():
+            if not _profile_fallback_warned:
+                _profile_fallback_warned = True
+                msg = (
+                    f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
+                    f"profile is {active!r}. Using {profile_home} instead of "
+                    f"the default profile. The subprocess spawner should still "
+                    f"pass HERMES_HOME explicitly (see issue #18594)."
+                )
+                try:
+                    sys.stderr.write(msg + "\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            return profile_home
+        if not _profile_fallback_warned:
             _profile_fallback_warned = True
-            # Write directly to stderr.  We intentionally do NOT route this
-            # through ``logging`` because (a) this function is called at
-            # module-import time from 30+ sites, often before logging is
-            # configured, and (b) root-logger propagation would double-emit
-            # on consoles where a StreamHandler is already attached.
             msg = (
                 f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
-                f"profile is {active!r}. Falling back to {fallback_home}, which "
-                f"is the DEFAULT profile — not {active!r}. Any data this "
-                f"process writes will land in the wrong profile. The "
-                f"subprocess spawner should pass HERMES_HOME explicitly "
-                f"(see issue #18594)."
+                f"profile is {active!r}, but {profile_home} does not exist. "
+                f"Falling back to {fallback_home}."
             )
             try:
                 sys.stderr.write(msg + "\n")
