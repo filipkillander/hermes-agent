@@ -39,6 +39,10 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda *args, **kwargs: None)
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -574,6 +578,47 @@ class TestLaunchdServiceRecovery:
             gateway_cli._get_restart_drain_timeout()
             == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
         )
+
+    def test_generated_launchd_plist_omits_replace_under_launchd_keepalive(self, tmp_path, monkeypatch):
+        """Launchd KeepAlive should be the sole gateway authority.
+
+        Including --replace in the LaunchAgent command can make the service
+        repeatedly terminate its launchd-owned predecessor, which launchd then
+        interprets as a failure and restarts.
+        """
+        hermes_home = tmp_path / "profiles" / "lumi"
+        hermes_home.mkdir(parents=True)
+        venv = tmp_path / "hermes-agent" / "venv"
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_python_path",
+            lambda: str(venv / "bin" / "python"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_stable_service_working_dir",
+            lambda: hermes_home,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_hermes_home",
+            lambda: hermes_home,
+        )
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway-lumi")
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: venv)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_build_service_path_dirs",
+            lambda: [str(venv / "bin")],
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: None)
+        monkeypatch.setattr(gateway_cli, "_profile_arg", lambda hermes_home: "--profile lumi")
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<string>gateway</string>" in plist
+        assert "<string>run</string>" in plist
+        assert "--replace" not in plist
 
     def test_launchd_install_repairs_outdated_plist_without_force(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
@@ -1244,6 +1289,10 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda *args, **kwargs: None)
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 
