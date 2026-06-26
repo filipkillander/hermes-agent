@@ -474,12 +474,11 @@ def _ensure_current_event_loop(request):
     except RuntimeError:
         pass
 
-    if loop is None and sys.version_info < (3, 12):
-        try:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-        except RuntimeError:
-            loop = None
-
+    # When there is no running loop, install a fresh per-test loop and always
+    # close it at teardown.  On Python 3.11,
+    # get_event_loop_policy().get_event_loop() can create and set a loop as a
+    # side effect; treating that as "not created" leaks the loop and its
+    # selector sockets between sync tests.
     created = loop is None or loop.is_closed()
     if created:
         loop = asyncio.new_event_loop()

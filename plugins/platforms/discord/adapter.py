@@ -85,9 +85,21 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
 )
 
 try:
-    import discord
-    from discord import Message as DiscordMessage, Intents
-    from discord.ext import commands
+    import warnings
+
+    # discord.py imports stdlib audioop on Python <3.13 for voice support.  The
+    # project already depends on audioop-lts for Python >=3.13 via discord.py,
+    # so this is only noisy third-party deprecation chatter during imports.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"'audioop' is deprecated and slated for removal in Python 3\.13",
+            category=DeprecationWarning,
+            module=r"discord\.player",
+        )
+        import discord
+        from discord import Message as DiscordMessage, Intents
+        from discord.ext import commands
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
