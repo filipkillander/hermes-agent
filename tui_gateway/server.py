@@ -2501,7 +2501,7 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        ctx_used = max(0, int(getattr(comp, "last_prompt_tokens", 0) or 0))
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max:
             usage["context_used"] = ctx_used

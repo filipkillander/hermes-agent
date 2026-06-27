@@ -2598,6 +2598,8 @@ class GatewaySlashCommandsMixin:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
+                platform=source.platform,
+                gateway_session_key=session_key,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None

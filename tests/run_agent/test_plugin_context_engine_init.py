@@ -37,6 +37,16 @@ class _ToolEngine(_StubEngine):
         ]
 
 
+class _CloningEngine(_StubEngine):
+    def __init__(self, label="prototype"):
+        self.label = label
+        self.clone_count = 0
+
+    def clone_for_agent(self):
+        self.clone_count += 1
+        return _CloningEngine(label="agent")
+
+
 def test_plugin_engine_gets_context_length_on_init():
     """Plugin context engine should have context_length set during AIAgent init."""
     engine = _StubEngine()
@@ -65,6 +75,35 @@ def test_plugin_engine_gets_context_length_on_init():
     assert agent.context_compressor is engine
     assert engine.context_length == 204_800
     assert engine.threshold_tokens == int(204_800 * engine.threshold_percent)
+
+
+def test_plugin_engine_clone_for_agent_is_used_when_available():
+    """Shared plugin engines can provide per-agent binding via clone_for_agent()."""
+    prototype = _CloningEngine()
+    cfg = {"context": {"engine": "stub"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.context_engine.load_context_engine", return_value=prototype),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="x",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert prototype.clone_count == 1
+    assert agent.context_compressor is not prototype
+    assert agent.context_compressor.label == "agent"
+    assert agent.context_compressor.context_length == 204_800
 
 
 def test_active_context_engine_tools_survive_explicit_platform_toolsets():

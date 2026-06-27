@@ -130,7 +130,7 @@ async def test_compress_works_with_plugin_context_engine():
     with (
         patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
         patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("run_agent.AIAgent", return_value=agent_instance) as agent_cls,
         patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100),
     ):
         result = await runner._handle_compress_command(_make_event("/compress"))
@@ -141,6 +141,9 @@ async def test_compress_works_with_plugin_context_engine():
     assert "_find_tail_cut_by_tokens" not in result
     # Happy path fired
     agent_instance._compress_context.assert_called_once()
+    kwargs = agent_cls.call_args.kwargs
+    assert kwargs["platform"] == Platform.TELEGRAM
+    assert kwargs["gateway_session_key"] == build_session_key(_make_source())
 
 
 @pytest.mark.asyncio

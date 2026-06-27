@@ -1520,6 +1520,15 @@ def init_agent(
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
     if _selected_engine is not None:
+        if hasattr(_selected_engine, "clone_for_agent"):
+            try:
+                _selected_engine = _selected_engine.clone_for_agent()
+            except Exception as _clone_err:
+                _ra().logger.warning(
+                    "Context engine '%s' clone_for_agent() failed — using shared instance: %s",
+                    getattr(_selected_engine, "name", _engine_name),
+                    _clone_err,
+                )
         agent.context_compressor = _selected_engine
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length

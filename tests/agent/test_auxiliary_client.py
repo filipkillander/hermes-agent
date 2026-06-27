@@ -973,6 +973,34 @@ class TestGetTextAuxiliaryClient:
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
 
+    def test_auto_compression_uses_task_fallback_model_when_main_codex_unavailable(self):
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "auto",
+                    "model": "",
+                    "fallback_chain": [
+                        {"provider": "ollama-cloud", "model": "deepseek-v4-flash"},
+                    ],
+                }
+            },
+        }
+        fallback_client = MagicMock()
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=cfg),
+            patch("agent.auxiliary_client._read_codex_access_token", return_value=None),
+            patch(
+                "agent.auxiliary_client._resolve_fallback_entry",
+                return_value=(fallback_client, "deepseek-v4-flash"),
+            ),
+        ):
+            client, model = get_text_auxiliary_client("compression")
+
+        assert client is fallback_client
+        assert model == "deepseek-v4-flash"
+
 
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""
@@ -1275,7 +1303,7 @@ class TestAuxiliaryPoolAwareness:
                     "gmi",
                     "google/gemini-3.1-flash-lite-preview",
                     base_url="https://api.gmi-serving.com/v1",
-                    api_key="gmi-key",
+                    api_key="x",
                 )
                 assert client is fake_client
                 assert model == "google/gemini-3.1-flash-lite-preview"
@@ -1284,7 +1312,7 @@ class TestAuxiliaryPoolAwareness:
                     "gmi",
                     "openai/gpt-5.4-mini",
                     base_url="https://api.gmi-serving.com/v1",
-                    api_key="gmi-key",
+                    api_key="x",
                 )
             finally:
                 aux.shutdown_cached_clients()

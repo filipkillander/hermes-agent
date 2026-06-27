@@ -4107,6 +4107,26 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert "/set-home" not in canon
 
 
+def test_get_usage_does_not_use_cumulative_total_as_context_usage():
+    agent = types.SimpleNamespace(
+        model="lcm-model",
+        session_total_tokens=4_200_000,
+        session_api_calls=1,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=0,
+            context_length=120_000,
+            compression_count=0,
+        ),
+    )
+
+    usage = server._get_usage(agent)
+
+    assert usage["total"] == 4_200_000
+    assert usage["context_used"] == 0
+    assert usage["context_max"] == 120_000
+    assert usage["context_percent"] == 0
+
+
 def test_session_status_reads_live_gateway_agent(monkeypatch):
     agent = types.SimpleNamespace(
         model="live-model",
