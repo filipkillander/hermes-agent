@@ -1222,6 +1222,45 @@ class TestPrompt:
         )
 
     @pytest.mark.asyncio
+    async def test_prompt_binds_hermes_session_id_contextvar(self, agent, monkeypatch):
+        """ACP must bind HERMES_SESSION_ID in the isolated ContextVar context.
+
+        Tool code reads HERMES_SESSION_ID through get_session_env(). If ACP only
+        sets os.environ after binding a ContextVar context with an empty
+        session_id, ContextVar-aware tools see "" and suppress the env fallback.
+        """
+        monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        captured: dict[str, str | None] = {}
+
+        def mock_run(user_message, conversation_history=None, task_id=None, **kwargs):
+            from gateway.session_context import get_session_env
+
+            captured["contextvar"] = get_session_env("HERMES_SESSION_ID", "")
+            captured["env"] = os.environ.get("HERMES_SESSION_ID")
+            captured["task_id"] = task_id
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert captured == {
+            "contextvar": new_resp.session_id,
+            "env": new_resp.session_id,
+            "task_id": new_resp.session_id,
+        }
+        assert os.environ.get("HERMES_SESSION_ID") == "stale-env-session"
+
+    @pytest.mark.asyncio
     async def test_prompt_restores_prior_hermes_session_id(self, agent, monkeypatch):
         """If the env already had HERMES_SESSION_ID set (e.g. nested
         agent loops), the prior value must be restored after the inner
