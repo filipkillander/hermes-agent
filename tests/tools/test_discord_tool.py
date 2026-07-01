@@ -1140,3 +1140,36 @@ class TestModelToolsIntegration:
         assert "discord" not in names
         assert "discord_admin" not in names
         assert "discord_server" not in names
+
+
+def _reset_gateway_session_contextvars():
+    """Return gateway session ContextVars to the unset state for env-fallback tests."""
+    from gateway.session_context import _UNSET, _VAR_MAP
+
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
+
+
+def test_create_thread_rejects_cross_channel_when_discord_context_bound(monkeypatch):
+    """A Discord session may not create a thread in a channel other than its live chat."""
+    # This test is written without pytest's @patch decorator so the assertion can
+    # also verify that the HTTP call never happens on a guard failure.
+    from unittest.mock import patch
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+    tokens = set_session_vars(platform="discord", chat_id="current-channel")
+    try:
+        with patch("tools.discord_tool._discord_request") as req:
+            req.return_value = {"id": "800", "name": "Wrong Channel"}
+            result = json.loads(discord_core(
+                action="create_thread",
+                channel_id="other-channel",
+                name="Wrong Channel",
+            ))
+            assert "error" in result
+            assert "current-channel" in result["error"]
+            req.assert_not_called()
+    finally:
+        clear_session_vars(tokens)
+        _reset_gateway_session_contextvars()

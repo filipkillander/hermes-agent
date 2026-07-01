@@ -2010,3 +2010,62 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+def _reset_gateway_session_contextvars():
+    """Return gateway session ContextVars to the unset state for env-fallback tests."""
+    from gateway.session_context import _UNSET, _VAR_MAP
+
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
+
+
+def test_create_stamps_session_id_from_contextvars_not_stale_env(monkeypatch, worker_env):
+    """kanban_create must trust the current isolated session context, not stale process env."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tokens = set_session_vars(session_id="ctx-session-current")
+    try:
+        out = kt._handle_create({
+            "title": "from isolated session context",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+        d = json.loads(out)
+        assert d["ok"] is True
+        conn = kb.connect()
+        try:
+            new_task = kb.get_task(conn, d["task_id"])
+            assert new_task.session_id == "ctx-session-current"
+        finally:
+            conn.close()
+    finally:
+        clear_session_vars(tokens)
+        _reset_gateway_session_contextvars()
+
+
+def test_create_does_not_auto_subscribe_from_stale_session_key_env(monkeypatch, worker_env):
+    """Explicitly empty current context must suppress stale HERMES_SESSION_KEY fallback."""
+    monkeypatch.setenv("HERMES_SESSION_KEY", "stale-tui-session-key")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    tokens = set_session_vars(platform="", chat_id="", session_key="")
+    try:
+        out = kt._handle_create({
+            "title": "no stale auto-subscription",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+        d = json.loads(out)
+        assert d["ok"] is True
+        assert d["subscribed"] is False
+        assert _list_subs_for_task(d["task_id"]) == []
+    finally:
+        clear_session_vars(tokens)
+        _reset_gateway_session_contextvars()

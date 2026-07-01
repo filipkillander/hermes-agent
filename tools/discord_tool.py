@@ -824,6 +824,27 @@ def check_discord_tool_requirements() -> bool:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _guard_create_thread_current_discord_channel(action: str, channel_id: str) -> Optional[str]:
+    """Fail closed when a Discord gateway session tries to thread elsewhere."""
+    if action != "create_thread":
+        return None
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    if get_session_env("HERMES_SESSION_PLATFORM", "") != "discord":
+        return None
+    current_channel_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not current_channel_id or str(channel_id) == str(current_channel_id):
+        return None
+    return (
+        "Refusing to create a Discord thread in channel "
+        f"{channel_id!r}; current session is bound to channel "
+        f"{current_channel_id!r}."
+    )
+
+
 def _run_discord_action(
     action: str,
     valid_actions: Dict[str, Any],
@@ -879,6 +900,10 @@ def _run_discord_action(
         return json.dumps({
             "error": f"Missing required parameters for '{action}': {', '.join(missing)}",
         })
+
+    guard_error = _guard_create_thread_current_discord_channel(action, channel_id)
+    if guard_error:
+        return json.dumps({"error": guard_error})
 
     try:
         return action_fn(
