@@ -739,10 +739,19 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
-    # Stamp the originating session id when the agent loop runs under
-    # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
-    # CLI / dashboard paths and on legacy hosts that don't set the env.
-    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    # Stamp the originating session id from the current isolated session
+    # context when available. Fall back to os.environ only when no
+    # ContextVar was ever bound in this process (CLI/legacy compatibility);
+    # an explicitly empty ContextVar must suppress stale process env.
+    if args.get("session_id"):
+        session_id = args.get("session_id")
+    else:
+        try:
+            from gateway.session_context import get_session_env
+
+            session_id = get_session_env("HERMES_SESSION_ID", "") or None
+        except Exception:
+            session_id = os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
     # Resolve workspace. If the caller passed one explicitly, honor it.
     # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
@@ -901,10 +910,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             # every CLI invocation, which is exactly the over-eager
             # behaviour that got #19718 reverted upstream. The TUI
             # poller keys on HERMES_SESSION_KEY.
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
-            )
+            # ``get_session_env`` already falls back to os.environ when
+            # the ContextVar is truly unset. If the current context set an
+            # explicit empty value, trust that and do not resurrect a stale
+            # process-global HERMES_SESSION_KEY from another session.
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
             if not session_key:
                 return False  # CLI / cron / test — no persistent channel
             platform = "tui"
