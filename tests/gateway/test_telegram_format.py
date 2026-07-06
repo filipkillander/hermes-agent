@@ -110,6 +110,30 @@ class TestFormatMessageBasic:
         result = adapter.format_message("Hello world")
         assert result == "Hello world"
 
+    def test_format_gate_rewrites_chat_report_markdown_before_markdownv2(self, adapter):
+        result = adapter.format_message("## Status\n\n> report quote\n\n---\nSaknas: Inget")
+
+        assert "*Status*" in result
+        assert "report quote" in result
+        assert "\\>" not in result
+        assert "\\-\\-\\-" not in result
+        assert "Saknas" not in result
+
+
+    def test_format_gate_lint_only_config_does_not_rewrite(self, adapter):
+        adapter.config.extra["format_gate"] = "lint-only"
+
+        result = adapter.format_message("---")
+
+        assert "\\-\\-\\-" in result
+
+    def test_format_gate_can_be_disabled(self, adapter):
+        adapter.config.extra["format_gate"] = False
+
+        result = adapter.format_message("---")
+
+        assert "\\-\\-\\-" in result
+
 
 # =========================================================================
 # format_message - code blocks
@@ -463,6 +487,13 @@ class TestFormatMessageSpoiler:
 
 
 class TestFormatMessageBlockquote:
+    @pytest.fixture(autouse=True)
+    def _disable_format_gate(self, adapter):
+        # These tests cover Telegram MarkdownV2 blockquote conversion itself;
+        # the chat format gate intentionally strips report-style blockquotes
+        # before the converter runs.
+        adapter.config.extra["format_gate"] = False
+
     def test_blockquote_converted(self, adapter):
         result = adapter.format_message("> This is a quote")
         assert "> This is a quote" in result
@@ -1217,3 +1248,31 @@ class TestTelegramGuestMentionGating:
         message.caption_entities = [_guest_mention_entity(text)]
 
         assert adapter._should_process_message(message) is True
+
+
+@pytest.mark.asyncio
+async def test_send_rich_path_applies_format_gate_before_raw_rich_payload(adapter):
+    from gateway.platforms.base import SendResult
+    from unittest.mock import AsyncMock
+
+    adapter._bot = object()
+    adapter._should_attempt_rich = lambda content, metadata=None: True
+    adapter._try_send_rich = AsyncMock(return_value=SendResult(success=True, message_id="42"))
+    adapter.send_typing = AsyncMock()
+
+    result = await adapter.send("123", "## Status\n\n> report quote\n\n---", metadata={"notify": True})
+
+    assert result.success is True
+    sent_content = adapter._try_send_rich.await_args.args[1]
+    assert sent_content == "**Status**\n\nreport quote"
+
+
+@pytest.mark.asyncio
+async def test_send_skips_when_format_gate_rewrites_content_to_empty(adapter):
+    adapter._bot = object()
+    adapter._should_attempt_rich = lambda content, metadata=None: False
+
+    result = await adapter.send("123", "---")
+
+    assert result.success is True
+    assert result.message_id is None

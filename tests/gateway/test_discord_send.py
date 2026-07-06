@@ -46,6 +46,22 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_send_skips_when_format_gate_rewrites_content_to_empty():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "---")
+
+    assert result.success is True
+    assert result.message_id is None
+    channel.send.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_system_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
 

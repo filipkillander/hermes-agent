@@ -102,6 +102,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 
+from gateway.format_gate import apply_chat_format_gate
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
@@ -1938,12 +1939,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            # Format and skip messages that the chat format gate reduces to
+            # empty text (for example a lone horizontal rule). Discord rejects
+            # empty sends, and forum channels would otherwise create empty
+            # threads.
+            formatted = self.format_message(content)
+            if not formatted or not formatted.strip():
+                return SendResult(success=True, message_id=None)
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
+            # Split message if needed
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
@@ -2027,6 +2035,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # module — no cross-module import needed.
 
         formatted = self.format_message(content)
+        if not formatted or not formatted.strip():
+            return SendResult(success=True, message_id=None)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
         thread_name = _derive_forum_thread_name(content)
@@ -3865,14 +3875,20 @@ class DiscordAdapter(BasePlatformAdapter):
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
-    def format_message(self, content: str) -> str:
-        """Format message for Discord.
+    def _format_gate_enabled(self) -> bool:
+        config = getattr(self, "config", None)
+        extra = getattr(config, "extra", {}) or {}
+        value = extra.get("format_gate", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off", "lint-only"}
+        return value is not False
 
-        Converts GFM markdown tables to bullet-list groups since Discord
-        does not render pipe tables natively.
-        """
+    def format_message(self, content: str) -> str:
+        """Format message for Discord chat output."""
         if not content:
             return content
+        if self._format_gate_enabled():
+            return apply_chat_format_gate(content, platform="discord")
         return convert_table_to_bullets(content)
 
     async def _run_simple_slash(

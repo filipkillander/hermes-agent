@@ -197,6 +197,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.format_gate import apply_chat_format_gate
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -3488,13 +3489,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            gated_content = self._apply_format_gate(content)
+            if not gated_content or not gated_content.strip():
+                return SendResult(success=True, message_id=None)
+
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
-                rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
+            if self._should_attempt_rich(gated_content, metadata=metadata):
+                rich_result = await self._try_send_rich(chat_id, gated_content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
                         # Re-trigger typing like the legacy success path does,
@@ -3511,7 +3516,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return rich_result
 
             # Format and split message if needed
-            formatted = self.format_message(content)
+            formatted = self.format_message(gated_content)
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
@@ -6360,6 +6365,21 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
+    def _format_gate_enabled(self) -> bool:
+        value = self.config.extra.get("format_gate") if getattr(self.config, "extra", None) else None
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off", "lint-only"}
+        return bool(value)
+
+    def _apply_format_gate(self, content: str) -> str:
+        return apply_chat_format_gate(
+            content,
+            platform="telegram",
+            enabled=self._format_gate_enabled(),
+        )
+
     def format_message(self, content: str) -> str:
         """
         Convert standard markdown to Telegram MarkdownV2 format.
@@ -6371,6 +6391,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return content
+
+        content = self._apply_format_gate(content)
 
         placeholders: dict = {}
         counter = [0]

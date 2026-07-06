@@ -56,3 +56,37 @@ class TestDiscordFormatMessage:
     def test_empty_string(self):
         adapter = _make_discord_adapter()
         assert adapter.format_message("") == ""
+
+    def test_format_gate_rewrites_chat_report_markdown(self):
+        adapter = _make_discord_adapter()
+        text = "## Status\n\n> report quote\n\n---\nSaknas: Inget"
+
+        out = adapter.format_message(text)
+
+        assert out == "**Status**\n\nreport quote"
+
+
+    def test_format_gate_lint_only_config_does_not_rewrite(self):
+        from gateway.config import PlatformConfig
+
+        adapter = _make_discord_adapter()
+        adapter.config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"format_gate": "lint-only"},
+        )
+
+        assert adapter.format_message("## Status") == "## Status"
+
+    def test_format_gate_can_be_disabled_without_disabling_existing_table_rewrite(self):
+        from gateway.config import PlatformConfig
+
+        adapter = _make_discord_adapter()
+        adapter.config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"format_gate": False},
+        )
+        text = "## Status\n\n> report quote\n\n---"
+
+        assert adapter.format_message(text) == text
