@@ -74,3 +74,35 @@ def test_chat_gate_rewrites_h1_report_heading_but_preserves_cron_header():
 
     assert out.startswith("# Daily check\n**Job ID**: abc123")
     assert "**Details**" in out
+
+
+def test_chat_gate_passes_through_for_raycast_platform():
+    """Raycast is an external API client surface, not a chat adapter.
+
+    apply_chat_format_gate must return content unchanged for raycast so the
+    agent's native markdown is preserved for the Raycast extension to render.
+    This is a guardrail regression test — raycast is explicitly out of scope.
+    """
+    text = "## Report\n\n> keep this\n\n---\n| a | b |\n|---|---|\n| 1 | 2 |"
+    assert apply_chat_format_gate(text, platform="raycast") == text
+
+
+def test_chat_gate_passes_through_for_chrome_platform():
+    """Chrome is an extension/tool surface, not a chat adapter.
+
+    apply_chat_format_gate must return content unchanged for chrome so the
+    agent's native markdown is preserved for the Chrome extension to render.
+    This is a guardrail regression test — chrome is explicitly out of scope.
+    """
+    text = "## Report\n\n> keep this\n\n---\n| a | b |\n|---|---|\n| 1 | 2 |"
+    assert apply_chat_format_gate(text, platform="chrome") == text
+
+
+def test_chat_gate_passes_through_for_email_platform():
+    """Email keeps its native formatting; the chat gate must not touch it.
+
+    This is an explicit guardrail regression test complementing the existing
+    email/file pass-through assertions.
+    """
+    text = "## Report\n\n> keep this\n\n---\n| a | b |\n|---|---|\n| 1 | 2 |"
+    assert apply_chat_format_gate(text, platform="email") == text

@@ -3489,17 +3489,19 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            gated_content = self._apply_format_gate(content)
-            if not gated_content or not gated_content.strip():
+            if not content or not content.strip():
                 return SendResult(success=True, message_id=None)
 
-            # Bot API 10.1 rich fast-path: send the raw agent markdown via
-            # sendRichMessage so tables/task lists/etc. render natively. Falls
-            # through to the legacy MarkdownV2 path on permanent/capability
-            # errors or DM-topic routing skips; returns directly on success or
-            # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(gated_content, metadata=metadata):
-                rich_result = await self._try_send_rich(chat_id, gated_content, reply_to, metadata)
+            # Bot API 10.1 rich fast-path: send the RAW agent markdown via
+            # sendRichMessage so tables/task lists/etc. render natively. The
+            # format gate must NOT run before the rich path — it rewrites
+            # headings/tables into chat-flat constructs that destroy the very
+            # rich syntax we want to preserve. Falls through to the legacy
+            # MarkdownV2 path on permanent/capability errors or DM-topic routing
+            # skips; returns directly on success or on a transient failure
+            # (which must NOT be legacy-resent).
+            if self._should_attempt_rich(content, metadata=metadata):
+                rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
                         # Re-trigger typing like the legacy success path does,
@@ -3515,8 +3517,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
-            formatted = self.format_message(gated_content)
+            # Format and split message if needed. ``format_message`` applies
+            # the chat format gate only after the raw-rich fast path was bypassed.
+            formatted = self.format_message(content)
+            if not formatted or not formatted.strip():
+                return SendResult(success=True, message_id=None)
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )

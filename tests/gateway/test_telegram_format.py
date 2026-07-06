@@ -1251,7 +1251,7 @@ class TestTelegramGuestMentionGating:
 
 
 @pytest.mark.asyncio
-async def test_send_rich_path_applies_format_gate_before_raw_rich_payload(adapter):
+async def test_send_rich_path_preserves_raw_markdown_before_format_gate(adapter):
     from gateway.platforms.base import SendResult
     from unittest.mock import AsyncMock
 
@@ -1259,12 +1259,14 @@ async def test_send_rich_path_applies_format_gate_before_raw_rich_payload(adapte
     adapter._should_attempt_rich = lambda content, metadata=None: True
     adapter._try_send_rich = AsyncMock(return_value=SendResult(success=True, message_id="42"))
     adapter.send_typing = AsyncMock()
+    content = "## Status\n\n> report quote\n\n---"
 
-    result = await adapter.send("123", "## Status\n\n> report quote\n\n---", metadata={"notify": True})
+    result = await adapter.send("123", content, metadata={"notify": True})
 
     assert result.success is True
     sent_content = adapter._try_send_rich.await_args.args[1]
-    assert sent_content == "**Status**\n\nreport quote"
+    assert sent_content == content
+
 
 
 @pytest.mark.asyncio

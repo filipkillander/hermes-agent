@@ -3881,7 +3881,7 @@ class DiscordAdapter(BasePlatformAdapter):
         value = extra.get("format_gate", True)
         if isinstance(value, str):
             return value.strip().lower() not in {"false", "0", "no", "off", "lint-only"}
-        return value is not False
+        return bool(value)
 
     def format_message(self, content: str) -> str:
         """Format message for Discord chat output."""

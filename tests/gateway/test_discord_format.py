@@ -78,6 +78,18 @@ class TestDiscordFormatMessage:
 
         assert adapter.format_message("## Status") == "## Status"
 
+    def test_format_gate_zero_config_disables_rewrite(self):
+        from gateway.config import PlatformConfig
+
+        adapter = _make_discord_adapter()
+        adapter.config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"format_gate": 0},
+        )
+
+        assert adapter.format_message("## Status\n\n---") == "## Status\n\n---"
+
     def test_format_gate_can_be_disabled_without_disabling_existing_table_rewrite(self):
         from gateway.config import PlatformConfig
 
