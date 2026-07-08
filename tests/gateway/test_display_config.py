@@ -94,6 +94,81 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_discord_guild_override_wins_over_platform_and_global(self):
+        """Discord guild overrides silence one server without muting Discord globally."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "tool_progress": "all",
+                "platforms": {
+                    "discord": {
+                        "tool_progress": "new",
+                        "guilds": {
+                            "guild-vendelip": {"tool_progress": False},
+                            "guild-private": {"tool_progress": "all"},
+                        },
+                    },
+                },
+            }
+        }
+
+        assert (
+            resolve_display_setting(
+                config, "discord", "tool_progress", guild_id="guild-vendelip"
+            )
+            == "off"
+        )
+        assert (
+            resolve_display_setting(
+                config, "discord", "tool_progress", guild_id="guild-private"
+            )
+            == "all"
+        )
+        assert resolve_display_setting(config, "discord", "tool_progress") == "new"
+
+    def test_discord_channel_override_wins_over_parent_and_guild(self):
+        """Exact channel settings win over parent-channel and guild settings."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "discord": {
+                        "tool_progress": "all",
+                        "guilds": {"guild-vendelip": {"tool_progress": "off"}},
+                        "channels": {
+                            "parent-channel": {"tool_progress": "new"},
+                            "thread-channel": {"tool_progress": "verbose"},
+                        },
+                    },
+                },
+            }
+        }
+
+        assert (
+            resolve_display_setting(
+                config,
+                "discord",
+                "tool_progress",
+                guild_id="guild-vendelip",
+                parent_chat_id="parent-channel",
+                channel_id="thread-channel",
+            )
+            == "verbose"
+        )
+        assert (
+            resolve_display_setting(
+                config,
+                "discord",
+                "tool_progress",
+                guild_id="guild-vendelip",
+                parent_chat_id="parent-channel",
+                channel_id="unknown-thread",
+            )
+            == "new"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides

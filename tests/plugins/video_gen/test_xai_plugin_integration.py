@@ -213,3 +213,85 @@ class TestXAIClamping:
         provider, captured = xai_provider
         provider.generate("x", aspect_ratio="21:9")
         assert _last_post(captured)["json"]["aspect_ratio"] == "16:9"
+
+
+class _QuotaThenOpenRouterAsyncClient:
+    def __init__(self):
+        self.posts: List[Dict[str, Any]] = []
+        self.gets: List[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append({"url": url, "headers": headers or {}, "json": json})
+        if url.endswith("/videos/generations"):
+            return _FakeResponse(429, {"error": {"message": "video credits exhausted"}})
+        if url == "https://openrouter.ai/api/v1/videos":
+            return _FakeResponse(202, {
+                "id": "or-job-123",
+                "polling_url": "https://openrouter.ai/api/v1/videos/or-job-123",
+                "status": "pending",
+            })
+        return _FakeResponse(404, {"error": {"message": f"unexpected post {url}"}})
+
+    async def get(self, url, headers=None, timeout=None):
+        self.gets.append(url)
+        if url == "https://openrouter.ai/api/v1/videos/or-job-123":
+            return _FakeResponse(200, {
+                "id": "or-job-123",
+                "generation_id": "gen-abc",
+                "polling_url": "https://openrouter.ai/api/v1/videos/or-job-123",
+                "status": "completed",
+                "unsigned_urls": [
+                    "https://openrouter.ai/api/v1/videos/or-job-123/content?index=0"
+                ],
+                "usage": {"cost": 0.25},
+            })
+        return _FakeResponse(404, {"error": {"message": f"unexpected get {url}"}})
+
+
+def test_xai_video_quota_error_falls_back_to_openrouter(monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+
+    import plugins.video_gen.xai as xai_plugin
+
+    captured: Dict[str, _QuotaThenOpenRouterAsyncClient] = {}
+
+    def _client_factory():
+        captured["client"] = _QuotaThenOpenRouterAsyncClient()
+        return captured["client"]
+
+    monkeypatch.setattr(xai_plugin.httpx, "AsyncClient", _client_factory)
+
+    async def _no_sleep(*a, **k):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    result = xai_plugin.XAIVideoGenProvider().generate(
+        "a dog on a skateboard",
+        duration=8,
+        aspect_ratio="16:9",
+        resolution="720p",
+    )
+
+    assert result["success"] is True
+    assert result["provider"] == "openrouter"
+    assert result["model"] == "x-ai/grok-imagine-video"
+    assert result["video"] == "https://openrouter.ai/api/v1/videos/or-job-123/content?index=0"
+    assert result["fallback_from"] == "xai"
+
+    posts = captured["client"].posts
+    assert posts[0]["url"].endswith("/videos/generations")
+    assert posts[1]["url"] == "https://openrouter.ai/api/v1/videos"
+    payload = posts[1]["json"]
+    assert payload["model"] == "x-ai/grok-imagine-video"
+    assert payload["prompt"] == "a dog on a skateboard"
+    assert payload["duration"] == 8
+    assert payload["aspect_ratio"] == "16:9"
+    assert payload["resolution"] == "720p"

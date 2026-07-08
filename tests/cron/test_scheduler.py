@@ -77,6 +77,59 @@ class TestPerJobToolsetMcpMerge:
         assert set(result) == set(sentinel)
 
 
+class TestCronFailureSummaries:
+    def test_script_timeout_is_not_reported_as_provider_timeout(self):
+        from cron.scheduler import _summarize_cron_failure_for_delivery
+
+        msg = _summarize_cron_failure_for_delivery(
+            {"name": "hermes-nightly-platform-maintenance"},
+            "Script timed out after 120s: /Users/ai/.hermes/profiles/lumi/scripts/hermes-nightly-platform-maintenance.sh",
+        )
+
+        assert "script timeout" in msg
+        assert "provider timeout" not in msg
+        assert "Fallback chain" not in msg
+
+    def test_provider_timeout_still_reports_provider_timeout(self):
+        from cron.scheduler import _summarize_cron_failure_for_delivery
+
+        msg = _summarize_cron_failure_for_delivery(
+            {"name": "llm-digest"},
+            "API call failed after 3 retries: ReadTimeout: request timed out",
+        )
+
+        assert "provider timeout" in msg
+        assert "Full details saved in cron output" in msg
+
+
+class TestCronScriptTimeoutResolution:
+    def test_configured_script_timeout_is_used_when_no_override_is_set(self, monkeypatch):
+        import cron.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_SCRIPT_TIMEOUT", scheduler._DEFAULT_SCRIPT_TIMEOUT)
+        monkeypatch.delenv("HERMES_CRON_SCRIPT_TIMEOUT", raising=False)
+        monkeypatch.setattr(
+            scheduler,
+            "load_config",
+            lambda: {"cron": {"script_timeout_seconds": 1800}},
+        )
+
+        assert scheduler._get_script_timeout() == 1800
+
+    def test_env_script_timeout_takes_precedence_over_config(self, monkeypatch):
+        import cron.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_SCRIPT_TIMEOUT", scheduler._DEFAULT_SCRIPT_TIMEOUT)
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "900")
+        monkeypatch.setattr(
+            scheduler,
+            "load_config",
+            lambda: {"cron": {"script_timeout_seconds": 1800}},
+        )
+
+        assert scheduler._get_script_timeout() == 900
+
+
 class TestResolveOrigin:
     def test_full_origin(self):
         job = {
@@ -545,6 +598,10 @@ class TestRoutingIntents:
 
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+        # Keep this test about token case only. Lumi runtime may load EMAIL_*
+        # from Bitwarden, which correctly makes `all` include email in live use.
+        for key in ("EMAIL_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "EMAIL_LUMI_HOME_ADDRESS"):
+            monkeypatch.delenv(key, raising=False)
 
         for token in ("ALL", "All", "all"):
             targets = _resolve_delivery_targets({"deliver": token, "origin": None})

@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_sources._cache import (
     CachedFetch as _CachedFetch,
@@ -487,6 +487,109 @@ def _run_bws_list(
     return secrets, warnings
 
 
+def _is_valid_env_name(name: str) -> bool:
+    if not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    return all(c.isalnum() or c == "_" for c in name)
+
+
+def _keychain_cfg_enabled(access_token_keychain: Any) -> bool:
+    return (
+        isinstance(access_token_keychain, dict)
+        and bool(access_token_keychain.get("enabled"))
+    )
+
+
+def _keychain_cfg_field(access_token_keychain: Any, field: str) -> str:
+    if not isinstance(access_token_keychain, dict):
+        return ""
+    return str(access_token_keychain.get(field, "") or "").strip()
+
+
+def macos_keychain_generic_password_exists(service: str, account: str) -> bool:
+    """Return whether a generic password exists without reading its value."""
+    service = (service or "").strip()
+    account = (account or "").strip()
+    if not service or not account or platform.system() != "Darwin":
+        return False
+    proc = subprocess.run(  # noqa: S603 — fixed system binary, no shell
+        [
+            "/usr/bin/security",
+            "find-generic-password",
+            "-s",
+            service,
+            "-a",
+            account,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        stdin=subprocess.DEVNULL,
+    )
+    return proc.returncode == 0
+
+
+def read_macos_keychain_generic_password(service: str, account: str) -> str:
+    """Read a macOS generic password value without logging or shell expansion."""
+    service = (service or "").strip()
+    account = (account or "").strip()
+    if platform.system() != "Darwin":
+        raise RuntimeError("macOS Keychain token source is only available on Darwin")
+    if not service or not account:
+        raise RuntimeError("macOS Keychain service/account is incomplete")
+
+    proc = subprocess.run(  # noqa: S603 — fixed system binary, no shell
+        [
+            "/usr/bin/security",
+            "find-generic-password",
+            "-s",
+            service,
+            "-a",
+            account,
+            "-w",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        stdin=subprocess.DEVNULL,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().replace("\x1b", "")
+        raise RuntimeError(
+            f"macOS Keychain item {service}/{account} could not be read"
+            + (f": {err[:200]}" if err else "")
+        )
+    token = proc.stdout.rstrip("\r\n")
+    if not token:
+        raise RuntimeError(
+            f"macOS Keychain item {service}/{account} returned an empty token"
+        )
+    return token
+
+
+def resolve_access_token(
+    *,
+    access_token_env: str = "BWS_ACCESS_TOKEN",
+    access_token_keychain: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """Resolve the BWS bootstrap token from env first, then macOS Keychain."""
+    token = os.environ.get(access_token_env, "").strip()
+    if token:
+        return token, f"env:{access_token_env}"
+
+    if not _keychain_cfg_enabled(access_token_keychain):
+        raise RuntimeError(
+            f"{access_token_env} is not set and no access_token_keychain "
+            "fallback is enabled"
+        )
+
+    service = _keychain_cfg_field(access_token_keychain, "service")
+    account = _keychain_cfg_field(access_token_keychain, "account")
+    token = read_macos_keychain_generic_password(service, account)
+    return token, f"macos-keychain:{service}/{account}"
+
 # ---------------------------------------------------------------------------
 # Public entry point — called from hermes_cli.env_loader
 # ---------------------------------------------------------------------------
@@ -502,6 +605,7 @@ def apply_bitwarden_secrets(
     auto_install: bool = True,
     server_url: str = "",
     home_path: Optional[Path] = None,
+    access_token_keychain: Optional[Dict[str, Any]] = None,
 ) -> FetchResult:
     """Pull secrets from BSM and set them on ``os.environ``.
 
@@ -521,11 +625,17 @@ def apply_bitwarden_secrets(
     if not enabled:
         return result
 
-    access_token = os.environ.get(access_token_env, "").strip()
-    if not access_token:
+    try:
+        access_token, token_source = resolve_access_token(
+            access_token_env=access_token_env,
+            access_token_keychain=access_token_keychain,
+        )
+        result.access_token_source = token_source
+    except RuntimeError as exc:
         result.error = (
-            f"secrets.bitwarden.enabled is true but {access_token_env} is "
-            "not set.  Run `hermes secrets bitwarden setup`."
+            f"secrets.bitwarden.enabled is true but {access_token_env} is not "
+            f"available: {exc}.  Run `hermes secrets bitwarden setup` or repair "
+            "the configured Keychain bootstrap."
         )
         return result
 
@@ -637,6 +747,10 @@ class BitwardenSource(SecretSource):
                 "description": "Region / self-hosted endpoint (empty = US Cloud)",
                 "default": "",
             },
+            "access_token_keychain": {
+                "description": "macOS Keychain fallback for the bootstrap token",
+                "default": {},
+            },
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
@@ -644,11 +758,17 @@ class BitwardenSource(SecretSource):
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
-        if not access_token:
+        try:
+            access_token, token_source = resolve_access_token(
+                access_token_env=access_token_env,
+                access_token_keychain=cfg.get("access_token_keychain"),
+            )
+            result.access_token_source = token_source
+        except RuntimeError as exc:
             result.error = (
-                f"secrets.bitwarden.enabled is true but {access_token_env} is "
-                "not set.  Run `hermes secrets bitwarden setup`."
+                f"secrets.bitwarden.enabled is true but {access_token_env} is not "
+                f"available: {exc}.  Run `hermes secrets bitwarden setup` or repair "
+                "the configured Keychain bootstrap."
             )
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result

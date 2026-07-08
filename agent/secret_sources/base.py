@@ -99,6 +99,9 @@ class FetchResult:
     # Path of the helper binary used, when the source is CLI-driven.
     # Surfaced by status commands; None for SDK/API-driven sources.
     binary_path: Optional[Path] = None
+    # Where the access token came from — env:<name> or macos-keychain:<service>/<account>.
+    # Surfaced in status output; None when no keychain fallback was used.
+    access_token_source: Optional[str] = None
 
     @property
     def ok(self) -> bool:

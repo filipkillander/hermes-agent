@@ -509,6 +509,100 @@ def test_apply_missing_token(monkeypatch):
     assert "BWS_ACCESS_TOKEN" in result.error
 
 
+def test_read_macos_keychain_generic_password_uses_security_without_shell(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return mock.Mock(returncode=0, stdout="0.keychain\n", stderr="")
+
+    monkeypatch.setattr(bw.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    token = bw.read_macos_keychain_generic_password("svc", "acct")
+
+    assert token == "0.keychain"
+    cmd, kwargs = calls[0]
+    assert cmd == [
+        "/usr/bin/security",
+        "find-generic-password",
+        "-s",
+        "svc",
+        "-a",
+        "acct",
+        "-w",
+    ]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["capture_output"] is True
+
+
+def test_apply_uses_keychain_when_env_token_missing(monkeypatch, tmp_path):
+    monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        bw,
+        "read_macos_keychain_generic_password",
+        lambda service, account: "0.keychain",
+    )
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "OPENAI_API_KEY", "value": "fresh"}])
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs["env"]["BWS_ACCESS_TOKEN"] == "0.keychain"
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        auto_install=False,
+        access_token_keychain={
+            "enabled": True,
+            "service": "svc",
+            "account": "acct",
+        },
+    )
+
+    assert result.ok
+    assert result.access_token_source == "macos-keychain:svc/acct"
+    assert os.environ["OPENAI_API_KEY"] == "fresh"
+
+
+def test_apply_prefers_env_token_over_keychain(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.env")
+    monkeypatch.setattr(
+        bw,
+        "read_macos_keychain_generic_password",
+        mock.Mock(side_effect=AssertionError("keychain should not be read")),
+    )
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "OPENAI_API_KEY", "value": "fresh"}])
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs["env"]["BWS_ACCESS_TOKEN"] == "0.env"
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        auto_install=False,
+        access_token_keychain={
+            "enabled": True,
+            "service": "svc",
+            "account": "acct",
+        },
+    )
+
+    assert result.ok
+    assert result.access_token_source == "env:BWS_ACCESS_TOKEN"
+
+
 def test_apply_missing_project_id(monkeypatch):
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
     result = bw.apply_bitwarden_secrets(
@@ -630,6 +724,10 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
         "    enabled: true\n"
         "    project_id: 'proj-1'\n"
         "    access_token_env: 'BWS_ACCESS_TOKEN'\n"
+        "    access_token_keychain:\n"
+        "      enabled: true\n"
+        "      service: svc\n"
+        "      account: acct\n"
         "    cache_ttl_seconds: 0\n"
         "    override_existing: false\n"
         "    auto_install: false\n"
@@ -643,7 +741,11 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
     def fake_fetch(**kwargs):
         called["n"] += 1
         assert kwargs["project_id"] == "proj-1"
-        return {"MY_BSM_KEY": "from-bsm"}, []
+        os.environ["MY_BSM_KEY"] = "from-bsm"
+        return (
+            {"MY_BSM_KEY": "from-bsm"},
+            [],
+        )
 
     monkeypatch.setattr(
         "agent.secret_sources.bitwarden.find_bws",

@@ -298,6 +298,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     project_id = bw_cfg.get("project_id", "")
     server_url = str(bw_cfg.get("server_url", "") or "").strip()
     token_set = bool(os.environ.get(token_env))
+    keychain_cfg = bw_cfg.get("access_token_keychain")
+    keychain_enabled = bool(
+        isinstance(keychain_cfg, dict) and keychain_cfg.get("enabled")
+    )
+    keychain_service = (
+        str(keychain_cfg.get("service", "") or "").strip()
+        if isinstance(keychain_cfg, dict)
+        else ""
+    )
+    keychain_account = (
+        str(keychain_cfg.get("account", "") or "").strip()
+        if isinstance(keychain_cfg, dict)
+        else ""
+    )
+    keychain_present = False
+    if keychain_enabled and keychain_service and keychain_account:
+        try:
+            keychain_present = bw.macos_keychain_generic_password_exists(
+                keychain_service,
+                keychain_account,
+            )
+        except Exception:  # noqa: BLE001 — status should stay diagnostic-only
+            keychain_present = False
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("", style="bold")
@@ -305,6 +328,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("Enabled",         _yn(enabled))
     table.add_row("Token env var",   token_env)
     table.add_row("Token in env",    _yn(token_set))
+    table.add_row("Keychain token",  _yn(keychain_present) if keychain_enabled else "[dim]disabled[/dim]")
+    if keychain_enabled:
+        table.add_row(
+            "Keychain item",
+            f"{keychain_service or '[dim](unset)[/dim]'}/"
+            f"{keychain_account or '[dim](unset)[/dim]'}",
+        )
     table.add_row("Project ID",      project_id or "[dim](unset)[/dim]")
     table.add_row(
         "Server URL",
@@ -325,10 +355,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not enabled:
         console.print("\n  Run [cyan]hermes secrets bitwarden setup[/cyan] to enable.")
         return 0
-    if not token_set:
+    if not token_set and not keychain_present:
         console.print(
-            f"\n  [yellow]Enabled but {token_env} is not set — Hermes will skip BSM "
-            "and warn on next startup.[/yellow]"
+            f"\n  [yellow]Enabled but {token_env} is not set and no configured "
+            "Keychain token is present — Hermes will skip BSM and warn on next "
+            "startup.[/yellow]"
         )
     if not project_id:
         console.print(
@@ -349,9 +380,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     token_env = bw_cfg.get("access_token_env", "BWS_ACCESS_TOKEN")
-    token = os.environ.get(token_env, "").strip()
-    if not token:
-        console.print(f"[red]{token_env} is not set.[/red]")
+    try:
+        token, token_source = bw.resolve_access_token(
+            access_token_env=token_env,
+            access_token_keychain=bw_cfg.get("access_token_keychain"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{token_env} is not available: {exc}[/red]")
         return 1
 
     project_id = bw_cfg.get("project_id", "")
@@ -375,6 +410,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if not secrets:
         console.print("[yellow]No secrets in project.[/yellow]")
         return 0
+
+    console.print(f"[dim]Token source: {token_source}[/dim]")
 
     override = bool(bw_cfg.get("override_existing", False)) or args.apply
     table = Table(show_header=True, header_style="bold")

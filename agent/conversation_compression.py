@@ -885,11 +885,17 @@ def compress_context(
         # passes the SAME id (the boundary is real even though the id didn't move).
         try:
             if _is_boundary and hasattr(agent.context_compressor, "on_session_start"):
+                _platform = getattr(agent, "platform", None)
+                if hasattr(_platform, "value"):
+                    _platform = _platform.value
+                _platform = str(_platform or os.environ.get("HERMES_SESSION_SOURCE", "cli")).strip() or "cli"
                 agent.context_compressor.on_session_start(
                     agent.session_id or "",
                     boundary_reason="compression",
                     old_session_id=_boundary_parent,
-                    platform=getattr(agent, "platform", None) or "cli",
+                    platform=_platform,
+                    model=getattr(agent, "model", ""),
+                    context_length=getattr(agent.context_compressor, "context_length", None),
                     conversation_id=getattr(agent, "_gateway_session_key", None),
                 )
         except Exception as _ce_err:

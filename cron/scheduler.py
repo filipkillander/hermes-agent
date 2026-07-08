@@ -58,6 +58,15 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    script_timeout = re.search(r"\bscript\s+timed\s+out\s+after\s+([^:.,;\s]+)", text, re.IGNORECASE)
+    if script_timeout:
+        timeout_label = script_timeout.group(1)
+        return (
+            f"⚠️ Cron '{job_name}' failed: script timeout after {timeout_label}. "
+            "The scheduled script exceeded its runtime budget. "
+            "Full details saved in cron output."
+        )
+
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
         reason = "rate limit"
@@ -2499,14 +2508,28 @@ def run_job(
             )
             return True, silent_doc, SILENT_MARKER, None
 
-        doc = (
-            f"# Cron Job: {job_name}\n\n"
-            f"**Job ID:** {job_id}\n"
-            f"**Run Time:** {now_iso}\n"
-            f"**Mode:** no_agent (script)\n\n"
-            f"---\n\n"
-            f"{output}\n"
-        )
+        # When cron.wrap_response is false, deliver the raw script output
+        # without the Cron Job wrapper.  This lets no-agent scripts that
+        # own their formatting (e.g. Heartbeat with its own # header) reach
+        # the chat surface verbatim.  When wrap_response is true (default
+        # for other profiles), keep the wrapper for traceability.
+        _wrap = True
+        try:
+            _cfg = load_config()
+            _wrap = _cfg.get("cron", {}).get("wrap_response", True)
+        except Exception:
+            pass
+        if _wrap:
+            doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {now_iso}\n"
+                f"**Mode:** no_agent (script)\n\n"
+                f"---\n\n"
+                f"{output}\n"
+            )
+        else:
+            doc = output
         return True, doc, output, None
 
     # ---------------------------------------------------------------

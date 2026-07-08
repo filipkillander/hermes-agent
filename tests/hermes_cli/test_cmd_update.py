@@ -225,6 +225,34 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_update_skip_gateway_restart_does_not_restart_launchd_gateway(
+        self, mock_run, _mock_which, mock_args, tmp_path, capsys
+    ):
+        """--skip-gateway-restart lets wrappers defer gateway restart safely."""
+        from hermes_cli import main as hm
+
+        mock_args.skip_gateway_restart = True
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+        plist = tmp_path / "ai.hermes.gateway-lumi.plist"
+        plist.write_text("<plist />")
+
+        with patch("hermes_cli.gateway.is_macos", return_value=True), \
+             patch("hermes_cli.gateway.get_launchd_plist_path", return_value=plist), \
+             patch("hermes_cli.gateway.get_launchd_label", return_value="ai.hermes.gateway-lumi"), \
+             patch("hermes_cli.gateway.launchd_restart") as restart_mock, \
+             patch.object(hm, "_is_termux_env", return_value=False), \
+             patch.object(hm, "_run_with_idle_timeout", return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")):
+            cmd_update(mock_args)
+
+        restart_mock.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Skipping gateway restart" in out
+
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_update_on_fork_checks_upstream_when_origin_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):
