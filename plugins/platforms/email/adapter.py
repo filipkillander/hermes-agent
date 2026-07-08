@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import html
 import imaplib
 import logging
 import os
@@ -65,6 +66,132 @@ _AUTOMATED_HEADERS = {
 MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
+
+_EMAIL_INTERNAL_LEAK_MARKERS = (
+    "Compacting context",
+    "Preflight compression",
+    "tool_call",
+    "status_callback",
+)
+
+
+def _sanitize_outbound_body(body: str) -> str:
+    """Remove internal runtime/progress markers from outbound email bodies."""
+    sanitized = body or ""
+    for marker in _EMAIL_INTERNAL_LEAK_MARKERS:
+        sanitized = sanitized.replace(marker, "[internal status removed]")
+    return sanitized
+
+
+def _looks_like_html(body: str) -> bool:
+    return bool(re.search(r"<\s*(?:!doctype|html|body|p|br|div|h[1-6]|strong|b|em|i|ul|ol|li|a|span)\b", body, re.IGNORECASE))
+
+
+def _markdown_inline_to_html(text: str) -> str:
+    escaped = html.escape(text, quote=True)
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+|mailto:[^\s)]+)\)",
+        lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>',
+        escaped,
+    )
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def _markdown_to_email_html(body: str) -> str:
+    """Render the small Markdown subset Hermes reports commonly emit as HTML."""
+    parts: List[str] = []
+    list_kind: str | None = None
+
+    def close_list() -> None:
+        nonlocal list_kind
+        if list_kind:
+            parts.append(f"</{list_kind}>")
+            list_kind = None
+
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            close_list()
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading:
+            close_list()
+            level = min(len(heading.group(1)), 3)
+            parts.append(f"<h{level}>{_markdown_inline_to_html(heading.group(2))}</h{level}>")
+            continue
+
+        section = re.match(r"^([A-ZÅÄÖ])\.\s+(.+)$", line)
+        if section:
+            close_list()
+            parts.append(f"<h2>{_markdown_inline_to_html(line)}</h2>")
+            continue
+
+        bullet = re.match(r"^(?:[-*•])\s+(.+)$", line)
+        if bullet:
+            if list_kind != "ul":
+                close_list()
+                parts.append("<ul>")
+                list_kind = "ul"
+            parts.append(f"<li>{_markdown_inline_to_html(bullet.group(1))}</li>")
+            continue
+
+        numbered = re.match(r"^\d+[.)]\s+(.+)$", line)
+        if numbered:
+            if list_kind != "ol":
+                close_list()
+                parts.append("<ol>")
+                list_kind = "ol"
+            parts.append(f"<li>{_markdown_inline_to_html(numbered.group(1))}</li>")
+            continue
+
+        item_prefix = re.match(r"^([A-ZÅÄÖ]\d+)\.\s+(.+)$", line)
+        close_list()
+        if item_prefix:
+            parts.append(
+                f"<p><strong>{html.escape(item_prefix.group(1))}.</strong> "
+                f"{_markdown_inline_to_html(item_prefix.group(2))}</p>"
+            )
+        else:
+            parts.append(f"<p>{_markdown_inline_to_html(line)}</p>")
+
+    close_list()
+    return "<!doctype html><html><body>" + "\n".join(parts) + "</body></html>"
+
+
+def _markdown_to_plain_text(body: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 <\2>", body)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", text)
+    return text.strip()
+
+
+def _email_body_parts(body: str) -> Tuple[str, str]:
+    clean = _sanitize_outbound_body(body)
+    if _looks_like_html(clean):
+        html_body = clean
+        plain_body = _strip_html(clean)
+    else:
+        html_body = _markdown_to_email_html(clean)
+        plain_body = _markdown_to_plain_text(clean)
+    return plain_body, html_body
+
+
+def _attach_email_body(msg: MIMEMultipart, body: str) -> None:
+    plain_body, html_body = _email_body_parts(body)
+    if msg.get_content_subtype() == "alternative":
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        return
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(plain_body, "plain", "utf-8"))
+    alternative.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alternative)
 
 
 def _create_ipv4_connection(
@@ -925,7 +1052,7 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg = MIMEMultipart()
+        msg = MIMEMultipart("alternative")
         msg["From"] = self._address
         msg["To"] = to_addr
 
@@ -946,7 +1073,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        _attach_email_body(msg, body)
 
         smtp = self._connect_smtp()
         try:
@@ -1060,7 +1187,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_email_body(msg, body)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1140,7 +1267,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_email_body(msg, body)
 
         # Attach file
         p = Path(file_path)
@@ -1216,7 +1343,8 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart("alternative")
+        _attach_email_body(msg, message)
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"

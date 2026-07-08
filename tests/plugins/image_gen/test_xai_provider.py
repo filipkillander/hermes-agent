@@ -265,6 +265,64 @@ class TestGenerate:
         assert result["error_type"] == "api_error"
         assert "xAI image generation failed (401): Invalid API key" in result["error"]
 
+
+    def test_quota_error_falls_back_to_openrouter_grok_image(self, monkeypatch):
+        import requests as req_lib
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+
+        xai_resp = MagicMock()
+        xai_resp.status_code = 429
+        xai_resp.text = json.dumps({"error": {"message": "monthly image quota exhausted"}})
+        xai_resp.json.return_value = {"error": {"message": "monthly image quota exhausted"}}
+        xai_resp.raise_for_status.side_effect = req_lib.HTTPError(response=xai_resp)
+
+        or_resp = MagicMock()
+        or_resp.status_code = 200
+        or_resp.raise_for_status = MagicMock()
+        or_resp.json.return_value = {"data": [{"b64_json": "b3BlbnJvdXRlci1pbWc="}]}
+
+        with patch("plugins.image_gen.xai.requests.post", side_effect=[xai_resp, or_resp]) as mock_post, \
+             patch("plugins.image_gen.xai.save_b64_image", return_value="/tmp/openrouter.png"):
+            provider = XAIImageGenProvider()
+            result = provider.generate(prompt="A cat playing piano", aspect_ratio="landscape")
+
+        assert result["success"] is True
+        assert result["provider"] == "openrouter"
+        assert result["model"] == "x-ai/grok-imagine-image-quality"
+        assert result["image"] == "/tmp/openrouter.png"
+        assert result["fallback_from"] == "xai"
+
+        assert mock_post.call_count == 2
+        fallback_call = mock_post.call_args_list[1]
+        assert fallback_call.args[0] == "https://openrouter.ai/api/v1/images"
+        payload = fallback_call.kwargs["json"]
+        assert payload["model"] == "x-ai/grok-imagine-image-quality"
+        assert payload["prompt"] == "A cat playing piano"
+        assert payload["aspect_ratio"] == "16:9"
+        assert payload["resolution"] == "1K"
+
+    def test_auth_error_does_not_fallback_to_openrouter(self, monkeypatch):
+        import requests as req_lib
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+
+        xai_resp = MagicMock()
+        xai_resp.status_code = 401
+        xai_resp.text = json.dumps({"error": {"message": "Invalid API key"}})
+        xai_resp.json.return_value = {"error": {"message": "Invalid API key"}}
+        xai_resp.raise_for_status.side_effect = req_lib.HTTPError(response=xai_resp)
+
+        with patch("plugins.image_gen.xai.requests.post", return_value=xai_resp) as mock_post:
+            provider = XAIImageGenProvider()
+            result = provider.generate(prompt="test")
+
+        assert result["success"] is False
+        assert result["error_type"] == "api_error"
+        assert mock_post.call_count == 1
+
     def test_timeout(self):
         import requests as req_lib
 

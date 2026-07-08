@@ -746,6 +746,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    source_kwargs=None,
 ):
     if config_data:
         import yaml
@@ -772,6 +773,7 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        **(source_kwargs or {}),
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
@@ -1204,6 +1206,61 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
         ["typing-stopped"] * events.index("callback-start")
     )
     assert any(call["metadata"] == {"stopped": True} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_discord_guild_override_silences_only_that_guild(monkeypatch, tmp_path):
+    config = {
+        "display": {
+            "tool_progress": "all",
+            "platforms": {
+                "discord": {
+                    "tool_progress": "all",
+                    "guilds": {
+                        "guild-vendelip": {"tool_progress": False},
+                        "guild-private": {"tool_progress": "all"},
+                    },
+                }
+            },
+        }
+    }
+
+    vendelip_adapter, vendelip_result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-discord-vendelip-progress-off",
+        config_data=config,
+        platform=Platform.DISCORD,
+        chat_id="vendelip-channel",
+        chat_type="group",
+        thread_id=None,
+        source_kwargs={"guild_id": "guild-vendelip"},
+    )
+
+    assert vendelip_result["final_response"] == "done"
+    assert vendelip_adapter.sent == []
+    assert vendelip_adapter.edits == []
+
+    private_adapter, private_result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-discord-private-progress-on",
+        config_data=config,
+        platform=Platform.DISCORD,
+        chat_id="private-channel",
+        chat_type="group",
+        thread_id=None,
+        source_kwargs={"guild_id": "guild-private"},
+    )
+
+    assert private_result["final_response"] == "done"
+    private_progress = " ".join(
+        call["content"] for call in private_adapter.sent + private_adapter.edits
+    )
+    assert "Running pwd" in private_progress
+    assert "Browsing https://example.com" in private_progress
 
 
 @pytest.mark.asyncio

@@ -693,6 +693,50 @@ class TestLoadGatewayConfig:
 
         assert os.environ.get("DISCORD_BOTS_REQUIRE_INLINE_MENTION") == "true"
 
+    def test_bridges_discord_token_env_from_config_yaml(self, tmp_path, monkeypatch):
+        """discord.token_env should bridge a profile-specific token env into Discord."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  token_env: DISCORD_SPARK_BOT_TOKEN\n",
+            encoding="utf-8",
+        )
+
+        token = "mfa.aBcDeFgHiJkLmNoPqRsTuVwXyZ.1234567890abcdefghijklmnopqrstu"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("DISCORD_SPARK_BOT_TOKEN", token)
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+
+        config = load_gateway_config()
+
+        assert os.environ.get("DISCORD_BOT_TOKEN") == token
+        assert config.platforms[Platform.DISCORD].token == token
+        assert config.platforms[Platform.DISCORD].enabled is True
+
+    def test_discord_token_env_does_not_overwrite_explicit_env(self, tmp_path, monkeypatch):
+        """Explicit DISCORD_BOT_TOKEN keeps env > yaml precedence."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  token_env: DISCORD_SPARK_BOT_TOKEN\n",
+            encoding="utf-8",
+        )
+
+        explicit = "mfa.explicitTokenValueForDiscord.1234567890abcdefghijklmnopqrstu"
+        spark = "mfa.sparkTokenValueForDiscord.1234567890abcdefghijklmnopqrstu"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", explicit)
+        monkeypatch.setenv("DISCORD_SPARK_BOT_TOKEN", spark)
+
+        config = load_gateway_config()
+
+        assert os.environ.get("DISCORD_BOT_TOKEN") == explicit
+        assert config.platforms[Platform.DISCORD].token == explicit
+
     def test_bridges_discord_allow_from_from_config_yaml(self, tmp_path, monkeypatch):
         """discord.allow_from should populate DISCORD_ALLOWED_USERS for auth."""
         hermes_home = tmp_path / ".hermes"

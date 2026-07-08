@@ -73,4 +73,14 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+    update_parser.add_argument(
+        "--skip-gateway-restart",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not restart running gateway processes after updating. "
+            "Use this from external maintenance wrappers that schedule their "
+            "own detached restart."
+        ),
+    )
     update_parser.set_defaults(func=cmd_update)

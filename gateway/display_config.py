@@ -4,10 +4,13 @@ Provides ``resolve_display_setting()`` — the single entry-point for reading
 display settings with platform-specific overrides and sensible defaults.
 
 Resolution order (first non-None wins):
-    1. ``display.platforms.<platform>.<key>``  — explicit per-platform user override
-    2. ``display.<key>``                       — global user setting
-    3. ``_PLATFORM_DEFAULTS[<platform>][<key>]``  — built-in sensible default
-    4. ``_GLOBAL_DEFAULTS[<key>]``              — built-in global default
+    1. ``display.platforms.<platform>.channels.<channel_id>.<key>``
+    2. ``display.platforms.<platform>.channels.<parent_chat_id>.<key>``
+    3. ``display.platforms.<platform>.guilds.<scope_id/guild_id>.<key>``
+    4. ``display.platforms.<platform>.<key>``   — explicit per-platform user override
+    5. ``display.<key>``                        — global user setting
+    6. ``_PLATFORM_DEFAULTS[<platform>][<key>]``  — built-in sensible default
+    7. ``_GLOBAL_DEFAULTS[<key>]``               — built-in global default
 
 Exception: ``display.streaming`` is CLI-only.  Gateway streaming follows the
 top-level ``streaming`` config unless ``display.platforms.<platform>.streaming``
@@ -167,8 +170,13 @@ def resolve_display_setting(
     platform_key: str,
     setting: str,
     fallback: Any = None,
+    *,
+    scope_id: Any = None,
+    guild_id: Any = None,
+    channel_id: Any = None,
+    parent_chat_id: Any = None,
 ) -> Any:
-    """Resolve a display setting with per-platform override support.
+    """Resolve a display setting with platform and scoped overrides.
 
     Parameters
     ----------
@@ -181,22 +189,59 @@ def resolve_display_setting(
         Display setting name (e.g. ``"tool_progress"``, ``"show_reasoning"``).
     fallback : Any
         Fallback value when the setting isn't found anywhere.
+    scope_id : Any
+        Canonical server/workspace scope id (Discord guild, Slack workspace,
+        Matrix server). During the D-Q2.5 migration this wins over ``guild_id``.
+    guild_id : Any
+        Deprecated Discord-specific alias for ``scope_id``.
+    channel_id : Any
+        Exact chat/channel/thread id for per-channel overrides.
+    parent_chat_id : Any
+        Parent channel id when ``channel_id`` points at a thread.
 
     Returns
     -------
     The resolved value, or *fallback* if nothing is configured.
     """
+    if not isinstance(user_config, dict):
+        user_config = {}
     display_cfg = user_config.get("display") or {}
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
 
-    # 1. Explicit per-platform override (display.platforms.<platform>.<key>)
     platforms = display_cfg.get("platforms") or {}
-    plat_overrides = platforms.get(platform_key)
+    plat_overrides = platforms.get(platform_key) if isinstance(platforms, dict) else None
+
     if isinstance(plat_overrides, dict):
-        val = plat_overrides.get(setting)
-        if val is not None:
+        # 1. Exact channel/thread override, then parent channel override.  This
+        # lets a Discord thread override its parent, while a parent channel can
+        # still override the broader guild.
+        channels = plat_overrides.get("channels")
+        if isinstance(channels, dict):
+            for key in _unique_keys(channel_id, parent_chat_id):
+                found, val = _setting_from_mapping(channels.get(key), setting)
+                if found:
+                    return _normalise(setting, val)
+
+        # 2. Server/workspace scope override.  `scope_id` is canonical,
+        # `guild_id` is the Discord legacy alias.  Support both the current
+        # config bucket name (guilds) and the platform-neutral future spelling
+        # (scopes) so the resolver is migration-safe.
+        for bucket_name in ("scopes", "guilds"):
+            bucket = plat_overrides.get(bucket_name)
+            if not isinstance(bucket, dict):
+                continue
+            for key in _unique_keys(scope_id, guild_id):
+                found, val = _setting_from_mapping(bucket.get(key), setting)
+                if found:
+                    return _normalise(setting, val)
+
+        # 3. Explicit per-platform override (display.platforms.<platform>.<key>)
+        found, val = _setting_from_mapping(plat_overrides, setting)
+        if found:
             return _normalise(setting, val)
 
-    # 1b. Backward compat: display.tool_progress_overrides.<platform>
+    # 3b. Backward compat: display.tool_progress_overrides.<platform>
     if setting == "tool_progress":
         legacy = display_cfg.get("tool_progress_overrides")
         if isinstance(legacy, dict):
@@ -204,22 +249,22 @@ def resolve_display_setting(
             if val is not None:
                 return _normalise(setting, val)
 
-    # 2. Global user setting (display.<key>).  Skip display.streaming because
+    # 4. Global user setting (display.<key>).  Skip display.streaming because
     # that key controls only CLI terminal streaming; gateway token streaming is
     # governed by the top-level streaming config plus per-platform overrides.
     if setting != "streaming":
-        val = display_cfg.get(setting)
-        if val is not None:
+        found, val = _setting_from_mapping(display_cfg, setting)
+        if found:
             return _normalise(setting, val)
 
-    # 3. Built-in platform default
+    # 5. Built-in platform default
     plat_defaults = _PLATFORM_DEFAULTS.get(platform_key)
     if plat_defaults:
         val = plat_defaults.get(setting)
         if val is not None:
             return val
 
-    # 4. Built-in global default
+    # 6. Built-in global default
     val = _GLOBAL_DEFAULTS.get(setting)
     if val is not None:
         return val
@@ -230,6 +275,37 @@ def resolve_display_setting(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _key(value: Any) -> str | None:
+    """Return a normalized config lookup key or None for empty values."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _unique_keys(*values: Any) -> list[str]:
+    """Return unique non-empty config keys preserving priority order."""
+    seen: set[str] = set()
+    keys: list[str] = []
+    for value in values:
+        key = _key(value)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def _setting_from_mapping(mapping: Any, setting: str) -> tuple[bool, Any]:
+    """Read setting from a mapping, treating False as an explicit value."""
+    if not isinstance(mapping, dict) or setting not in mapping:
+        return False, None
+    value = mapping.get(setting)
+    if value is None:
+        return False, None
+    return True, value
+
 
 def _normalise(setting: str, value: Any) -> Any:
     """Normalise YAML quirks (bare ``off`` → False in YAML 1.1)."""

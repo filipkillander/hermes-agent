@@ -57,6 +57,64 @@ VALID_ASPECT_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}
 VALID_RESOLUTIONS = {"480p", "720p"}
 MAX_REFERENCE_IMAGES = 7
 
+_OPENROUTER_VIDEO_MODEL_MAP = {
+    "grok-imagine-video": "x-ai/grok-imagine-video",
+    "grok-imagine-video-1.5": "x-ai/grok-imagine-video",
+    "grok-imagine-video-1.5-preview": "x-ai/grok-imagine-video",
+    "grok-imagine-video-1.5-2026-05-30": "x-ai/grok-imagine-video",
+}
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _is_xai_quota_error(status: int, message: str) -> bool:
+    """Return True only for exhausted quota/credits/billing errors."""
+    text = (message or "").lower()
+    return status in {402, 429} and any(
+        token in text
+        for token in (
+            "quota",
+            "credit",
+            "credits",
+            "billing",
+            "balance",
+            "exhaust",
+            "insufficient funds",
+            "payment required",
+        )
+    )
+
+
+def _resolve_openrouter_runtime() -> Tuple[str, str]:
+    """Resolve OpenRouter credentials at call time so fallback needs no restart."""
+    runtime: Dict[str, Any] = {}
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="openrouter") or {}
+    except Exception as exc:
+        logger.debug("OpenRouter runtime resolution failed: %s", exc)
+
+    api_key = str(runtime.get("api_key") or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    base_url = (
+        str(runtime.get("base_url") or "").strip()
+        or os.environ.get("OPENROUTER_BASE_URL", "").strip()
+        or _OPENROUTER_BASE_URL
+    ).rstrip("/")
+    return api_key, base_url
+
+
+def _openrouter_video_model_for_xai(model_id: str) -> str:
+    return _OPENROUTER_VIDEO_MODEL_MAP.get(model_id, "x-ai/grok-imagine-video")
+
+
+def _openrouter_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
+        "X-Title": "Hermes Agent",
+    }
+
 
 _MODELS: Dict[str, Dict[str, Any]] = {
     "grok-imagine-video": {
@@ -356,6 +414,213 @@ async def _poll(
         elapsed += poll_interval
 
     return {"status": "timeout", "body": {"status": last_status}}
+
+
+def _httpx_error_message(response: Any, exc: Exception) -> str:
+    try:
+        body = response.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if msg:
+                return str(msg)
+        if isinstance(body, dict) and body.get("message"):
+            return str(body["message"])
+    except Exception:
+        pass
+    try:
+        return str(response.text[:500])
+    except Exception:
+        return str(exc)
+
+
+def _openrouter_image_part(value: Any, *, frame_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    url = ""
+    if isinstance(value, dict):
+        raw = value.get("image_url")
+        if isinstance(raw, dict):
+            url = str(raw.get("url") or "").strip()
+        url = url or str(value.get("url") or "").strip()
+    elif isinstance(value, str):
+        url = value.strip()
+    if not url:
+        return None
+    part: Dict[str, Any] = {"type": "image_url", "image_url": {"url": url}}
+    if frame_type:
+        part["frame_type"] = frame_type
+    return part
+
+
+def _openrouter_video_payload(
+    *,
+    xai_payload: Dict[str, Any],
+    xai_model: str,
+    prompt: str,
+    aspect_ratio: str,
+    duration: int,
+    resolution: Optional[str],
+) -> Tuple[str, Dict[str, Any]]:
+    openrouter_model = _openrouter_video_model_for_xai(xai_model)
+    payload: Dict[str, Any] = {
+        "model": openrouter_model,
+        "prompt": prompt,
+        "duration": duration,
+        "aspect_ratio": aspect_ratio,
+    }
+    if resolution:
+        payload["resolution"] = resolution
+
+    frame = _openrouter_image_part(xai_payload.get("image"), frame_type="first_frame")
+    if frame:
+        payload["frame_images"] = [frame]
+    refs = []
+    for ref in xai_payload.get("reference_images") or []:
+        part = _openrouter_image_part(ref)
+        if part:
+            refs.append(part)
+    if refs:
+        payload["input_references"] = refs
+    return openrouter_model, payload
+
+
+async def _submit_openrouter_video_fallback(
+    client: httpx.AsyncClient,
+    *,
+    xai_payload: Dict[str, Any],
+    xai_error: str,
+    prompt: str,
+    resolved_model: str,
+    modality: str,
+    aspect_ratio: str,
+    duration: int,
+    resolution: Optional[str],
+) -> Dict[str, Any]:
+    api_key, base_url = _resolve_openrouter_runtime()
+    openrouter_model, payload = _openrouter_video_payload(
+        xai_payload=xai_payload,
+        xai_model=resolved_model,
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        duration=duration,
+        resolution=resolution,
+    )
+    if not api_key:
+        return error_response(
+            error=f"xAI quota exhausted, and OpenRouter fallback is unavailable: OPENROUTER_API_KEY is not configured ({xai_error})",
+            error_type="missing_api_key",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+        )
+
+    headers = _openrouter_headers(api_key)
+    try:
+        response = await client.post(
+            f"{base_url}/videos",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        detail = _httpx_error_message(exc.response, exc)
+        return error_response(
+            error=f"OpenRouter video fallback submit failed ({status}): {detail}",
+            error_type="api_error",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+        )
+
+    elapsed = 0.0
+    poll_body = body
+    while elapsed <= DEFAULT_TIMEOUT_SECONDS:
+        status = (poll_body.get("status") or "").lower()
+        if status == "completed":
+            urls = poll_body.get("unsigned_urls") or []
+            content_url = str(urls[0]).strip() if urls else ""
+            if not content_url:
+                return error_response(
+                    error="OpenRouter video fallback completed without a content URL",
+                    error_type="empty_response",
+                    provider="openrouter",
+                    model=openrouter_model,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                )
+            extra: Dict[str, Any] = {
+                "fallback_from": "xai",
+                "xai_error": xai_error,
+            }
+            if resolution:
+                extra["resolution"] = resolution
+            for key in ("id", "generation_id", "polling_url", "usage"):
+                if poll_body.get(key):
+                    extra[f"openrouter_{key}" if key == "id" else key] = poll_body[key]
+            return success_response(
+                video=content_url,
+                model=openrouter_model,
+                prompt=prompt,
+                modality=modality,
+                aspect_ratio=aspect_ratio,
+                duration=duration,
+                provider="openrouter",
+                extra=extra,
+            )
+        if status == "failed":
+            detail = poll_body.get("error") or poll_body.get("message") or "unknown error"
+            return error_response(
+                error=f"OpenRouter video fallback failed: {detail}",
+                error_type="api_error",
+                provider="openrouter",
+                model=openrouter_model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+            )
+
+        polling_url = str(poll_body.get("polling_url") or body.get("polling_url") or "").strip()
+        job_id = str(poll_body.get("id") or body.get("id") or "").strip()
+        if not polling_url and job_id:
+            polling_url = f"{base_url}/videos/{job_id}"
+        if not polling_url:
+            return error_response(
+                error="OpenRouter video fallback response did not include polling_url",
+                error_type="invalid_response",
+                provider="openrouter",
+                model=openrouter_model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+            )
+        await asyncio.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
+        elapsed += DEFAULT_POLL_INTERVAL_SECONDS
+        try:
+            poll_response = await client.get(polling_url, headers=headers, timeout=30)
+            poll_response.raise_for_status()
+            poll_body = poll_response.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            detail = _httpx_error_message(exc.response, exc)
+            return error_response(
+                error=f"OpenRouter video fallback poll failed ({status_code}): {detail}",
+                error_type="api_error",
+                provider="openrouter",
+                model=openrouter_model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+            )
+
+    return error_response(
+        error=f"Timed out waiting for OpenRouter video fallback after {DEFAULT_TIMEOUT_SECONDS}s",
+        error_type="timeout",
+        provider="openrouter",
+        model=openrouter_model,
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -818,13 +1083,23 @@ async def _submit_xai_video_payload(
                 endpoint=endpoint,
             )
         except httpx.HTTPStatusError as exc:
-            detail = ""
-            try:
-                detail = exc.response.text[:500]
-            except Exception:
-                pass
+            status = exc.response.status_code
+            detail = _httpx_error_message(exc.response, exc)
+            xai_error = f"xAI submit failed ({status}): {detail or exc}"
+            if _is_xai_quota_error(status, detail):
+                return await _submit_openrouter_video_fallback(
+                    client,
+                    xai_payload=payload,
+                    xai_error=xai_error,
+                    prompt=prompt,
+                    resolved_model=resolved_model,
+                    modality=modality,
+                    aspect_ratio=aspect_ratio,
+                    duration=duration,
+                    resolution=resolution,
+                )
             return error_response(
-                error=f"xAI submit failed ({exc.response.status_code}): {detail or exc}",
+                error=xai_error,
                 error_type="api_error",
                 provider="xai",
                 model=resolved_model,

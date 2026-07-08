@@ -8241,6 +8241,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
+    and ``discord.token_env`` → ``DISCORD_BOT_TOKEN``,
     ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
@@ -8266,6 +8267,20 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             candidate_extra = discord_platform_cfg.get("extra")
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
+    # token_env lets profile-specific secret names (for example a secondary
+    # bot's DISCORD_SPARK_BOT_TOKEN) feed the canonical DISCORD_BOT_TOKEN that
+    # the config loader and Discord adapter already understand.  Only the env
+    # var NAME is stored in config; the secret value stays in the process env.
+    token_env_cfg = (
+        discord_cfg["token_env"] if "token_env" in discord_cfg
+        else platform_extra_cfg.get("token_env")
+    )
+    if token_env_cfg is not None and not os.getenv("DISCORD_BOT_TOKEN"):
+        token_env_name = str(token_env_cfg).strip()
+        if token_env_name:
+            token_value = os.getenv(token_env_name)
+            if token_value:
+                os.environ["DISCORD_BOT_TOKEN"] = token_value
     allowed_users_cfg = (
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")

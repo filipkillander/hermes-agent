@@ -80,6 +80,58 @@ _XAI_RESOLUTIONS = {"1k", "2k"}
 
 DEFAULT_RESOLUTION = "1k"
 
+_OPENROUTER_IMAGE_MODEL_MAP = {
+    "grok-imagine-image": "x-ai/grok-imagine-image-quality",
+    "grok-imagine-image-quality": "x-ai/grok-imagine-image-quality",
+}
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _is_xai_quota_error(status: int, message: str) -> bool:
+    """Return True only for exhausted quota/credits/billing errors."""
+    text = (message or "").lower()
+    return status in {402, 429} and any(
+        token in text
+        for token in (
+            "quota",
+            "credit",
+            "credits",
+            "billing",
+            "balance",
+            "exhaust",
+            "insufficient funds",
+            "payment required",
+        )
+    )
+
+
+def _resolve_openrouter_runtime() -> Tuple[str, str]:
+    """Resolve OpenRouter credentials at call time so fallback needs no restart."""
+    runtime: Dict[str, Any] = {}
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="openrouter") or {}
+    except Exception as exc:
+        logger.debug("OpenRouter runtime resolution failed: %s", exc)
+
+    api_key = str(runtime.get("api_key") or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    base_url = (
+        str(runtime.get("base_url") or "").strip()
+        or os.environ.get("OPENROUTER_BASE_URL", "").strip()
+        or _OPENROUTER_BASE_URL
+    ).rstrip("/")
+    return api_key, base_url
+
+
+def _openrouter_image_model_for_xai(model_id: str) -> str:
+    return _OPENROUTER_IMAGE_MODEL_MAP.get(model_id, "x-ai/grok-imagine-image-quality")
+
+
+def _openrouter_resolution(resolution: str) -> str:
+    normalized = (resolution or DEFAULT_RESOLUTION).strip().lower()
+    return {"1k": "1K", "2k": "2K"}.get(normalized, "1K")
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -149,6 +201,166 @@ def _xai_image_field(source: str) -> Dict[str, str]:
         ext = "jpeg"
     b64 = base64.b64encode(raw).decode("utf-8")
     return {"url": f"data:image/{ext};base64,{b64}", "type": "image_url"}
+
+
+def _openrouter_input_reference(source: str) -> Dict[str, Any]:
+    field = _xai_image_field(source)
+    return {"type": "image_url", "image_url": {"url": field["url"]}}
+
+
+def _fallback_to_openrouter_image(
+    *,
+    prompt: str,
+    xai_model: str,
+    aspect: str,
+    xai_aspect_ratio: str,
+    xai_resolution: str,
+    source_images: List[str],
+    modality: str,
+    xai_error: str,
+) -> Dict[str, Any]:
+    """Generate the same Grok Imagine image through OpenRouter after xAI quota exhaustion."""
+    api_key, base_url = _resolve_openrouter_runtime()
+    openrouter_model = _openrouter_image_model_for_xai(xai_model)
+    resolution = _openrouter_resolution(xai_resolution)
+    if not api_key:
+        return error_response(
+            error=f"xAI quota exhausted, and OpenRouter fallback is unavailable: OPENROUTER_API_KEY is not configured ({xai_error})",
+            error_type="missing_api_key",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+
+    payload: Dict[str, Any] = {
+        "model": openrouter_model,
+        "prompt": prompt,
+        "aspect_ratio": xai_aspect_ratio,
+        "resolution": resolution,
+        "n": 1,
+    }
+    if source_images:
+        try:
+            payload["input_references"] = [_openrouter_input_reference(source) for source in source_images]
+        except Exception as exc:
+            return error_response(
+                error=f"Could not prepare OpenRouter reference image fallback: {exc}",
+                error_type="io_error",
+                provider="openrouter",
+                model=openrouter_model,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
+        "X-Title": "Hermes Agent",
+    }
+    try:
+        response = requests.post(
+            f"{base_url}/images",
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response = exc.response
+        status = response.status_code if response is not None else 0
+        try:
+            err_msg = response.json().get("error", {}).get("message", response.text[:300])
+        except Exception:
+            err_msg = response.text[:300] if response is not None else str(exc)
+        return error_response(
+            error=f"OpenRouter image fallback failed ({status}): {err_msg}",
+            error_type="api_error",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+    except requests.Timeout:
+        return error_response(
+            error="OpenRouter image fallback timed out (120s)",
+            error_type="timeout",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+    except requests.ConnectionError as exc:
+        return error_response(
+            error=f"OpenRouter image fallback connection error: {exc}",
+            error_type="connection_error",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+
+    try:
+        result = response.json()
+    except Exception as exc:
+        return error_response(
+            error=f"OpenRouter image fallback returned invalid JSON: {exc}",
+            error_type="invalid_response",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+
+    data = result.get("data", []) if isinstance(result, dict) else []
+    first = data[0] if data and isinstance(data[0], dict) else {}
+    b64 = first.get("b64_json")
+    url = first.get("url")
+    if b64:
+        try:
+            image_ref = str(save_b64_image(b64, prefix=f"openrouter_{openrouter_model.replace('/', '_')}"))
+        except Exception as exc:
+            return error_response(
+                error=f"Could not save OpenRouter fallback image: {exc}",
+                error_type="io_error",
+                provider="openrouter",
+                model=openrouter_model,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+    elif url:
+        try:
+            image_ref = str(save_url_image(url, prefix=f"openrouter_{openrouter_model.replace('/', '_')}"))
+        except Exception as exc:
+            logger.warning("OpenRouter image URL %s could not be cached (%s); falling back to bare URL.", url, exc)
+            image_ref = url
+    else:
+        return error_response(
+            error="OpenRouter image fallback returned no image data",
+            error_type="empty_response",
+            provider="openrouter",
+            model=openrouter_model,
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+
+    extra: Dict[str, Any] = {
+        "fallback_from": "xai",
+        "xai_error": xai_error,
+        "resolution": resolution,
+    }
+    if isinstance(result, dict) and result.get("usage"):
+        extra["usage"] = result["usage"]
+    return success_response(
+        image=image_ref,
+        model=openrouter_model,
+        prompt=prompt,
+        aspect_ratio=aspect,
+        provider="openrouter",
+        modality=modality,
+        extra=extra,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -348,8 +560,20 @@ class XAIImageGenProvider(ImageGenProvider):
             except Exception:
                 err_msg = response.text[:300] if response is not None else str(exc)
             logger.error("xAI image gen failed (%d): %s", status, err_msg)
+            xai_error = f"xAI image generation failed ({status}): {err_msg}"
+            if _is_xai_quota_error(status, err_msg):
+                return _fallback_to_openrouter_image(
+                    prompt=prompt,
+                    xai_model=model_id,
+                    aspect=aspect,
+                    xai_aspect_ratio=xai_ar,
+                    xai_resolution=xai_res,
+                    source_images=source_images,
+                    modality=modality,
+                    xai_error=xai_error,
+                )
             return error_response(
-                error=f"xAI image generation failed ({status}): {err_msg}",
+                error=xai_error,
                 error_type="api_error",
                 provider=provider_name,
                 model=model_id,
