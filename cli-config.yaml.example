@@ -834,6 +834,7 @@ platform_toolsets:
 #     guest_mode: false
 #     # allowed_chats: ["-1001234567890"]
 #     extra:
+#       delivery_envelope: enforce     # enforce | lkg | off; per-surface deterministic chat renderer and kill switch
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default false for copyable legacy MarkdownV2, set true to opt in
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; default false because Telegram Desktop/macOS can visually overlay draft frames
@@ -848,6 +849,9 @@ platform_toolsets:
 #         priority_mode: prepend
 #         priority:
 #           - my_plugin_command
+#   discord:
+#     extra:
+#       delivery_envelope: enforce    # enforce | lkg | off; per-surface deterministic chat renderer and kill switch
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under

@@ -197,6 +197,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.delivery_envelope import prepare_platform_delivery_content
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -501,6 +502,13 @@ class TelegramAdapter(BasePlatformAdapter):
     def message_len_fn(self):
         """Telegram measures message length in UTF-16 code units."""
         return utf16_len
+
+    def _prepare_delivery_content(self, content: str | None) -> str:
+        return prepare_platform_delivery_content(
+            content,
+            surface="telegram",
+            config=getattr(self, "config", None),
+        )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
@@ -1498,15 +1506,19 @@ class TelegramAdapter(BasePlatformAdapter):
     def _rich_message_payload(
         self, content: str, *, skip_entity_detection: bool = False
     ) -> Dict[str, Any]:
-        """Build the ``InputRichMessage`` object from RAW markdown.
+        """Build the ``InputRichMessage`` object from envelope markdown.
 
         Never pass ``format_message(content)`` here — that converts to
-        MarkdownV2 and would escape/destroy rich syntax like table pipes.
+        MarkdownV2 and would escape/destroy remaining rich syntax.
 
         Single newlines are normalized to Markdown hard breaks so that
         multi-line content (slash-command lists, etc.) renders correctly
         in the rich-message path.  See ``_rich_normalize_linebreaks``.
         """
+        # Rich delivery intentionally bypasses ``format_message``.  Apply the
+        # same delivery envelope here so rich send/edit/draft cannot bypass the
+        # post-agent policy boundary.
+        content = self._prepare_delivery_content(content)
         payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
@@ -1608,6 +1620,9 @@ class TelegramAdapter(BasePlatformAdapter):
         caller must NOT legacy-resend), or ``None`` to signal "fall back to the
         legacy MarkdownV2 path" (permanent/capability error or DM-topic skip).
         """
+        delivery_content = self._prepare_delivery_content(content)
+        if not self._content_fits_rich_limits(delivery_content):
+            return None
         thread_id = self._metadata_thread_id(metadata)
         routing = self._compute_single_send_routing(chat_id, reply_to, metadata, thread_id)
         if routing is None:
@@ -1616,7 +1631,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
-            "rich_message": self._rich_message_payload(content),
+            "rich_message": self._rich_message_payload(delivery_content),
         }
         # Only forward non-None routing keys: when direct_messages_topic_id is
         # present _thread_kwargs_for_send pairs it with message_thread_id=None,
@@ -1694,7 +1709,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # what we sent — replies to this message resolve via this index.
             try:
                 from gateway import rich_sent_store
-                rich_sent_store.record(str(chat_id), str(message_id), content)
+                rich_sent_store.record(str(chat_id), str(message_id), delivery_content)
             except Exception:
                 pass
         return SendResult(
@@ -1722,10 +1737,13 @@ class TelegramAdapter(BasePlatformAdapter):
         - transient / unknown → ``SendResult(success=False)`` with retry
           semantics (the message may already be edited; do NOT legacy-resend)
         """
+        delivery_content = self._prepare_delivery_content(content)
+        if not self._content_fits_rich_limits(delivery_content):
+            return None
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
             "message_id": int(message_id),
-            "rich_message": self._rich_message_payload(content),
+            "rich_message": self._rich_message_payload(delivery_content),
         }
         thread_id = self._metadata_thread_id(metadata)
         thread_kwargs = self._thread_kwargs_for_send(
@@ -1816,10 +1834,13 @@ class TelegramAdapter(BasePlatformAdapter):
         legacy plain-text draft. A permanent/capability failure additionally
         latches ``_rich_draft_disabled`` so later frames skip the rich attempt.
         """
+        delivery_content = self._prepare_delivery_content(content)
+        if not self._content_fits_rich_limits(delivery_content):
+            return False
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
             "draft_id": int(draft_id),
-            "rich_message": self._rich_message_payload(content),
+            "rich_message": self._rich_message_payload(delivery_content),
         }
         thread_id = self._metadata_thread_id(metadata)
         if thread_id is not None:
@@ -3574,9 +3595,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
         try:
-            # Bot API 10.1 rich fast-path: send the raw agent markdown via
+            # Bot API 10.1 rich fast-path: send envelope markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
@@ -3955,6 +3976,10 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if rich_result is not None:
                 return rich_result
+
+        # Rich eligibility intentionally examines the model's raw markdown,
+        # but every legacy/interim transport receives the envelope output.
+        content = self._prepare_delivery_content(content)
 
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.  During streaming
@@ -4390,7 +4415,7 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Stream a partial message via Telegram's native draft API.
 
-        Uses ``sendRichMessageDraft`` (Bot API 10.1) with the raw markdown when
+        Uses ``sendRichMessageDraft`` (Bot API 10.1) with envelope markdown when
         rich messages are enabled and supported, otherwise the plain-text
         ``sendMessageDraft``. The Bot API animates the preview when the same
         ``draft_id`` is reused across consecutive calls in the same chat.  When
@@ -4404,13 +4429,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="not_connected")
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
-        # streaming preview with the same raw markdown the final
+        # streaming preview with the same envelope markdown the final
         # sendRichMessage will persist, so the animated draft matches the final
         # message. Any failure degrades to the legacy plain-text draft below.
         if self._should_attempt_rich_draft(content):
             if await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
                 # Drafts have no message_id; report success without one.
                 return SendResult(success=True, message_id=None)
+
+        content = self._prepare_delivery_content(content)
 
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
@@ -4567,6 +4594,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+            description = self._prepare_delivery_content(description)
             text = (
                 f"⚠️ <b>Command Approval Required</b>\n\n"
                 f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
@@ -4696,6 +4724,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            question = self._prepare_delivery_content(question)
             text = f"❓ {_html.escape(question)}"
             thread_id = self._metadata_thread_id(metadata)
 
@@ -6509,6 +6538,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return content
+
+        content = self._prepare_delivery_content(content)
 
         placeholders: dict = {}
         counter = [0]

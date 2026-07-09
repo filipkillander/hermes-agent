@@ -106,6 +106,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 
+from gateway.delivery_envelope import prepare_platform_delivery_content
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
@@ -3997,11 +3998,17 @@ class DiscordAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Format message for Discord.
 
-        Converts GFM markdown tables to bullet-list groups since Discord
-        does not render pipe tables natively.
+        The delivery envelope is the common post-agent/pre-chunk boundary for
+        normal sends, streaming edits, cron/worker delivery, and slash/control
+        messages that use the adapter formatter.
         """
         if not content:
             return content
+        content = prepare_platform_delivery_content(
+            content, surface="discord", config=getattr(self, "config", None)
+        )
+        # Kept as a compatibility guard for callers running with the envelope
+        # kill switch off; the helper is idempotent after envelope rendering.
         return convert_table_to_bullets(content)
 
     async def _run_simple_slash(
@@ -5551,7 +5558,11 @@ class DiscordAdapter(BasePlatformAdapter):
         budget = max(0, self.MAX_MESSAGE_LENGTH - len(prefix) - len(suffix))
         if len(body) > budget:
             body = body[: max(0, budget - len(truncated_suffix))] + truncated_suffix
-        return f"{prefix}{body}{suffix}"
+        return prepare_platform_delivery_content(
+            f"{prefix}{body}{suffix}",
+            surface="discord",
+            config=getattr(self, "config", None),
+        )
 
     def _approval_mention_content(self) -> Optional[str]:
         """Return user mentions for approval prompts when explicitly enabled.
@@ -5597,7 +5608,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # command and reason must be visible in the same content block as
             # the approval buttons.
             reason_budget = 300
-            reason_display = str(description or "dangerous command")
+            reason_display = prepare_platform_delivery_content(
+                str(description or "dangerous command"),
+                surface="discord",
+                config=getattr(self, "config", None),
+            )
             if len(reason_display) > reason_budget:
                 reason_display = reason_display[: reason_budget - 15] + "... [truncated]"
 
@@ -5670,6 +5685,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            message = prepare_platform_delivery_content(
+                message, surface="discord", config=getattr(self, "config", None)
+            )
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
@@ -5737,6 +5755,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            question = prepare_platform_delivery_content(
+                question, surface="discord", config=getattr(self, "config", None)
+            )
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
@@ -5845,6 +5866,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client or not DISCORD_AVAILABLE:
             return SendResult(success=False, error="Not connected")
         try:
+            prompt = prepare_platform_delivery_content(
+                prompt, surface="discord", config=getattr(self, "config", None)
+            )
             target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
             channel = self._client.get_channel(int(target_id))
             if not channel:
@@ -7900,6 +7924,10 @@ async def _standalone_send(
     ``force_document`` is accepted for signature parity but unused — Discord
     treats every uploaded file as a generic attachment.
     """
+    if message.strip() or not media_files:
+        message = prepare_platform_delivery_content(
+            message, surface="discord", config=pconfig
+        )
     try:
         import aiohttp
     except ImportError:

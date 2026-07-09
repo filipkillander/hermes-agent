@@ -1,7 +1,8 @@
 """Tests for Bot API 10.1 Rich Messages (sendRichMessage) on Telegram.
 
 Final / new-message replies opportunistically use ``sendRichMessage`` with the
-RAW agent markdown so tables, task lists, etc. render natively. The legacy
+delivery-envelope markdown so rich constructs render natively without
+bypassing chat formatting invariants. The legacy
 MarkdownV2 ``send_message`` path stays as the fallback for unsupported /
 oversized content and for transports that lack the endpoint.
 
@@ -17,13 +18,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.delivery_envelope import prepare_delivery_content
 from gateway.platforms.base import SendResult
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, _rich_normalize_linebreaks
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 
-# Content exercising rich-only constructs: a heading, a real Markdown table,
-# and a task list. Pipes / brackets must survive untouched into the payload.
+# Content exercising rich-only constructs before the deterministic envelope.
 RICH_CONTENT = "## Results\n\n| Case | Status |\n|---|---|\n| rich | ✅ |\n\n- [x] table renders"
 CJK_RICH_CONTENT = "## 持仓\n\n| 项目 | 状态 |\n|---|---|\n| 早盘 | 正常 |"
 ASTRAL_CJK_RICH_CONTENT = "## Rare Han\n\n| glyph | status |\n|---|---|\n| \U00030000 | ok |"
@@ -109,7 +110,7 @@ async def test_rich_result_shapes_extract_message_id(raw, expected_id):
 
 
 @pytest.mark.asyncio
-async def test_rich_happy_path_sends_raw_markdown():
+async def test_rich_happy_path_sends_envelope_markdown():
     adapter = _make_adapter()
 
     result = await adapter.send("12345", RICH_CONTENT)
@@ -118,9 +119,12 @@ async def test_rich_happy_path_sends_raw_markdown():
     assert result.message_id == "123"
     adapter._bot.do_api_request.assert_awaited_once()
     api_kwargs = _rich_api_kwargs(adapter)
-    # Raw markdown — NOT MarkdownV2-escaped. Table pipes still present.
-    assert api_kwargs["rich_message"]["markdown"] == RICH_CONTENT
-    assert "| Case | Status |" in api_kwargs["rich_message"]["markdown"]
+    delivered = api_kwargs["rich_message"]["markdown"]
+    expected = _rich_normalize_linebreaks(
+        prepare_delivery_content(RICH_CONTENT, surface="telegram")
+    )
+    assert delivered == expected
+    assert "| Case | Status |" not in delivered
     assert "- [x] table renders" in api_kwargs["rich_message"]["markdown"]
     # Legacy path must not run on rich success.
     adapter._bot.send_message.assert_not_called()
@@ -590,7 +594,7 @@ async def test_table_only_uses_rich_when_rich_messages_opt_out():
 
     assert result.success is True
     api_kwargs = _rich_api_kwargs(adapter)
-    assert api_kwargs["rich_message"]["markdown"] == TABLE_ONLY_CONTENT
+    assert "|---|" not in api_kwargs["rich_message"]["markdown"]
     adapter._bot.send_message.assert_not_called()
 
 
@@ -631,7 +635,7 @@ async def test_dm_topic_resumed_send_uses_rich_for_table_without_reply_anchor():
     api_kwargs = _rich_api_kwargs(adapter)
     assert api_kwargs["direct_messages_topic_id"] == 20189
     assert "reply_parameters" not in api_kwargs
-    assert api_kwargs["rich_message"]["markdown"] == TABLE_ONLY_CONTENT
+    assert "|---|" not in api_kwargs["rich_message"]["markdown"]
 
 
 @pytest.mark.asyncio
@@ -649,7 +653,7 @@ async def test_finalize_edit_rich_includes_forum_topic_routing():
     assert result.success is True
     api_kwargs = _rich_edit_kwargs(adapter)
     assert api_kwargs["message_thread_id"] == 5
-    assert api_kwargs["rich_message"]["markdown"] == TABLE_ONLY_CONTENT
+    assert "|---|" not in api_kwargs["rich_message"]["markdown"]
 
 
 @pytest.mark.asyncio
@@ -697,7 +701,7 @@ async def test_rich_draft_default_uses_legacy_to_avoid_tdesktop_reflow_glitches(
 
 
 @pytest.mark.asyncio
-async def test_rich_draft_opt_in_sends_raw_markdown():
+async def test_rich_draft_opt_in_sends_envelope_markdown():
     adapter = _make_adapter(extra={"rich_drafts": True})
     adapter._bot.do_api_request = AsyncMock(return_value=True)
 
@@ -709,7 +713,9 @@ async def test_rich_draft_opt_in_sends_raw_markdown():
     assert call.args[0] == "sendRichMessageDraft"
     api_kwargs = call.kwargs["api_kwargs"]
     assert api_kwargs["draft_id"] == 7
-    assert api_kwargs["rich_message"]["markdown"] == RICH_CONTENT
+    assert api_kwargs["rich_message"]["markdown"] == _rich_normalize_linebreaks(
+        prepare_delivery_content(RICH_CONTENT, surface="telegram")
+    )
     # Legacy plain-text draft must not run when rich draft succeeds.
     adapter._bot.send_message_draft.assert_not_called()
 
@@ -849,8 +855,9 @@ async def test_finalize_edit_uses_rich_for_table_content():
     assert result.message_id == "555"  # same message, edited in place
     api_kwargs = _rich_edit_kwargs(adapter)
     assert api_kwargs["message_id"] == 555
-    # RAW markdown is passed through so table pipes survive.
-    assert api_kwargs["rich_message"]["markdown"] == RICH_CONTENT
+    assert api_kwargs["rich_message"]["markdown"] == _rich_normalize_linebreaks(
+        prepare_delivery_content(RICH_CONTENT, surface="telegram")
+    )
     # No fresh send / delete — the whole point of the in-place rich edit.
     adapter._bot.edit_message_text.assert_not_called()
     adapter._bot.delete_message.assert_not_called()
@@ -991,7 +998,7 @@ async def test_finalize_edit_rich_over_markdownv2_limit_not_split():
 
     assert result.success is True
     api_kwargs = _rich_edit_kwargs(adapter)
-    assert api_kwargs["rich_message"]["markdown"] == big_table
+    assert "|---|" not in api_kwargs["rich_message"]["markdown"]
     adapter._bot.edit_message_text.assert_not_called()
 
 
