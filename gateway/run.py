@@ -4696,6 +4696,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_state: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        adapter: Any = None,
     ) -> None:
         try:
             from gateway.status import write_runtime_status
@@ -4704,6 +4705,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_state=platform_state,
                 error_code=error_code,
                 error_message=error_message,
+                credential_fingerprint=(
+                    self._adapter_credential_fingerprint(adapter)
+                    if adapter is not None
+                    else None
+                ),
             )
         except Exception:
             pass
@@ -7178,6 +7184,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_state="connected",
                         error_code=None,
                         error_message=None,
+                        adapter=adapter,
                     )
                     logger.info("✓ %s connected", platform.value)
                 else:
@@ -8010,6 +8017,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             platform_state="connected",
                             error_code=None,
                             error_message=None,
+                            adapter=adapter,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
@@ -8733,8 +8741,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Used only to detect two profiles claiming the same bot token. Returns a
         salted hash (never the token itself) of the adapter's primary
-        credential, or None when no credential is discoverable (in which case
-        we don't attempt conflict detection for it).
+        credential, or None when no credential/key is available (in which case
+        readiness fails closed and duplicate detection is not attempted).
         """
         token = None
         for attr in ("token", "bot_token", "_token", "api_token", "_bot_token"):
@@ -8749,8 +8757,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 token = val.strip()
         if not token:
             return None
-        import hashlib
-        return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
+        from hermes_cli.runtime_registry import credential_fingerprint
+
+        return credential_fingerprint(token)
 
     def _create_adapter(
         self, 

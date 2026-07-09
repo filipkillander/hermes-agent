@@ -4,6 +4,14 @@ import pytest
 from gateway.run import GatewayRunner
 
 
+@pytest.fixture(autouse=True)
+def _fingerprint_key(tmp_path, monkeypatch):
+    key_path = tmp_path / "bot-fingerprint.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o600)
+    monkeypatch.setenv("HERMES_BOT_FINGERPRINT_KEY_FILE", str(key_path))
+
+
 class _FakeAdapter:
     def __init__(self, token=None, config=None):
         self.token = token
@@ -20,7 +28,8 @@ class TestCredentialFingerprint:
         fp2 = GatewayRunner._adapter_credential_fingerprint(_FakeAdapter(token="secret-bot-token"))
         assert fp1 == fp2  # stable
         assert "secret-bot-token" not in (fp1 or "")  # never the raw token
-        assert len(fp1) == 16
+        assert fp1.startswith("hmac-sha256:")
+        assert len(fp1) == len("hmac-sha256:") + 64
 
     def test_distinct_tokens_distinct_fp(self):
         a = GatewayRunner._adapter_credential_fingerprint(_FakeAdapter(token="tok-A"))

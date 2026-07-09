@@ -9,6 +9,7 @@ single Kanban dispatcher.  Missing data always denies optional capabilities.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 from dataclasses import dataclass, field
@@ -74,6 +75,35 @@ class RuntimeRegistry:
 def default_registry_path() -> Path:
     override = os.environ.get("HERMES_RUNTIME_REGISTRY", "").strip()
     return Path(override) if override else get_default_hermes_root() / "runtime-registry.yaml"
+
+
+def default_fingerprint_key_path() -> Path:
+    override = os.environ.get("HERMES_BOT_FINGERPRINT_KEY_FILE", "").strip()
+    return (
+        Path(override)
+        if override
+        else get_default_hermes_root() / "control-plane" / "bot-fingerprint.key"
+    )
+
+
+def credential_fingerprint(
+    credential: str,
+    *,
+    key_path: Optional[Path] = None,
+) -> Optional[str]:
+    """Return a keyed, non-reversible equality fingerprint or fail closed."""
+    if not isinstance(credential, str) or not credential.strip():
+        return None
+    path = Path(key_path or default_fingerprint_key_path())
+    try:
+        key = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return None
+    if len(key) < 32 or mode & 0o077:
+        return None
+    digest = hmac.new(key, credential.strip().encode("utf-8"), hashlib.sha256)
+    return f"hmac-sha256:{digest.hexdigest()}"
 
 
 def _as_string_list(raw: Any, field_name: str) -> tuple[str, ...]:
@@ -269,6 +299,12 @@ def runtime_identity(home: Optional[Path] = None) -> dict[str, Any]:
     try:
         registry = load_runtime_registry(required=True)
         profile = registry.require(name)
+        try:
+            from hermes_cli.env_loader import get_external_secret_readiness
+
+            secret_readiness = get_external_secret_readiness(home)
+        except Exception:
+            secret_readiness = {"state": "unavailable", "ready": False}
         return {
             "profile": profile.name,
             "role": profile.role,
@@ -277,10 +313,12 @@ def runtime_identity(home: Optional[Path] = None) -> dict[str, Any]:
             "port": profile.port,
             "allowed_platforms": list(profile.allowed_platforms),
             "required_platforms": list(profile.required_platforms),
+            "bot_fingerprints": dict(profile.bot_fingerprints),
             "config_revision": config_revision,
             "code_revision": os.environ.get("HERMES_RELEASE_REVISION") or profile.release_revision,
             "registry_revision": registry.revision,
             "registry_verified": profile.home.resolve() == home.resolve(),
+            "secret_readiness": secret_readiness,
         }
     except (RegistryError, OSError):
         return {
@@ -293,4 +331,5 @@ def runtime_identity(home: Optional[Path] = None) -> dict[str, Any]:
             "registry_verified": False,
             "config_revision": config_revision,
             "code_revision": os.environ.get("HERMES_RELEASE_REVISION") or None,
+            "secret_readiness": {"state": "unavailable", "ready": False},
         }

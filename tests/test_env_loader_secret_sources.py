@@ -356,3 +356,70 @@ def test_read_only_diagnostic_skips_secret_bootstrap_and_file_repair(
 
     env_loader.load_hermes_dotenv(hermes_home=tmp_path)
     assert touched == {"bootstrap": 0, "repair": 0}
+
+
+def test_external_secret_readiness_is_count_only(tmp_path, monkeypatch):
+    from agent.secret_sources.base import FetchResult, SecretSource
+    from agent.secret_sources.registry import _reset_registry_for_tests, register_source
+
+    class ReadySource(SecretSource):
+        name = "ready_source"
+        label = "Ready source"
+
+        def fetch(self, cfg, home_path):
+            return FetchResult(secrets={"PRIVATE_PROVIDER_KEY": "must-not-appear"})
+
+    _reset_registry_for_tests()
+    register_source(ReadySource())
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  ready_source:\n"
+        "    enabled: true\n"
+        "    allowed_env_vars: [PRIVATE_PROVIDER_KEY]\n"
+        "    required_env_vars: [PRIVATE_PROVIDER_KEY]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("PRIVATE_PROVIDER_KEY", raising=False)
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    status = env_loader.get_external_secret_readiness(tmp_path)
+    assert status == {
+        "state": "ready",
+        "ready": True,
+        "enabled_sources": 1,
+        "applied_count": 1,
+        "failed_sources": 0,
+        "missing_required_count": 0,
+    }
+    serialized = repr(status)
+    assert "PRIVATE_PROVIDER_KEY" not in serialized
+    assert "must-not-appear" not in serialized
+
+
+def test_external_secret_readiness_marks_policy_failure(tmp_path):
+    from agent.secret_sources.base import FetchResult, SecretSource
+    from agent.secret_sources.registry import _reset_registry_for_tests, register_source
+
+    class MissingSource(SecretSource):
+        name = "missing_source"
+        label = "Missing source"
+
+        def fetch(self, cfg, home_path):
+            return FetchResult(secrets={})
+
+    _reset_registry_for_tests()
+    register_source(MissingSource())
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  missing_source:\n"
+        "    enabled: true\n"
+        "    required_env_vars: [NEEDED_KEY]\n",
+        encoding="utf-8",
+    )
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    status = env_loader.get_external_secret_readiness(tmp_path)
+    assert status["state"] == "degraded"
+    assert status["ready"] is False
+    assert status["failed_sources"] == 1
+    assert status["missing_required_count"] == 1
