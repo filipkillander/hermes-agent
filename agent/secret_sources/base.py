@@ -43,7 +43,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Sequence
+from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence
 
 # Bump ONLY for breaking changes to the required contract surface
 # (abstract-method signatures, FetchResult required fields).  Additive
@@ -57,6 +57,15 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 
 # Default timeout for run_secret_cli() subprocess invocations.
 DEFAULT_CLI_TIMEOUT_SECONDS = 30.0
+
+# Non-secret process capabilities that helper CLIs need in order to start.
+# Everything else, especially credentials, must be named explicitly by the
+# caller.  Keeping this list here gives worker launchers and secret backends a
+# single audited environment-construction primitive.
+_RUNTIME_ENV_CAPABILITIES = (
+    "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
+    "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+)
 
 
 class ErrorKind(str, Enum):
@@ -216,6 +225,38 @@ def scrub_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+def build_capability_env(
+    capabilities: Sequence[str] = (),
+    *,
+    source_env: Optional[Mapping[str, str]] = None,
+    extra_env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    """Build a minimal child environment from explicit capabilities.
+
+    The parent process may contain every credential available to an agent.
+    Child processes therefore receive only basic runtime variables plus the
+    exact names in ``capabilities``.  ``extra_env`` is for values resolved by
+    the caller (for example a one-shot bootstrap token); it is explicit rather
+    than inherited.  Invalid environment names are rejected so malformed
+    configuration cannot create surprising subprocess state.
+    """
+    parent = source_env if source_env is not None else os.environ
+    env: Dict[str, str] = {}
+    for key in (*_RUNTIME_ENV_CAPABILITIES, *capabilities):
+        if not is_valid_env_name(key):
+            raise ValueError("invalid child-environment capability name")
+        value = parent.get(key)
+        if value is not None:
+            env[key] = str(value)
+    if extra_env:
+        for key, value in extra_env.items():
+            if not is_valid_env_name(key):
+                raise ValueError("invalid child-environment capability name")
+            env[key] = str(value)
+    env.setdefault("NO_COLOR", "1")
+    return env
+
+
 def run_secret_cli(
     argv: Sequence[str],
     *,
@@ -243,16 +284,7 @@ def run_secret_cli(
     surface); returns the completed process otherwise — callers own
     returncode interpretation.
     """
-    base_keep = ("PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
-                 "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
-    env: Dict[str, str] = {}
-    for key in (*base_keep, *allow_env):
-        val = os.environ.get(key)
-        if val is not None:
-            env[key] = val
-    if extra_env:
-        env.update(extra_env)
-    env.setdefault("NO_COLOR", "1")
+    env = build_capability_env(allow_env, extra_env=extra_env)
 
     try:
         proc = subprocess.run(  # noqa: S603 — argv list, no shell
