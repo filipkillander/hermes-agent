@@ -24,12 +24,21 @@ def _has_configured_mcp_servers() -> bool:
         return True
 
 
-def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
-    """Spawn one shared background MCP discovery thread for this process."""
+def start_background_mcp_discovery(*, logger, thread_name: str, force: bool = False) -> None:
+    """Spawn one shared background MCP discovery thread for this process.
+
+    When ``force`` is True, restart discovery for a different profile. The
+    dashboard process (launched with -p default) caches MCP discovery under
+    the launch profile's config. When a _build() thread switches HERMES_HOME
+    to a different profile (e.g. lumi), call this with force=True so the
+    target profile's mcp_servers config is discovered instead of the
+    launch profile's. The previous thread is left to finish — it owns
+    the tool registry, which is rebuilt by the new discovery pass.
+    """
     global _mcp_discovery_started, _mcp_discovery_thread
 
     with _mcp_discovery_lock:
-        if _mcp_discovery_started:
+        if _mcp_discovery_started and not force:
             return
         _mcp_discovery_started = True
         if not _has_configured_mcp_servers():

@@ -973,9 +973,16 @@ def _get_db():
     global _db, _db_error
     if _db is None:
         from hermes_state import SessionDB
+        from hermes_constants import get_hermes_home
 
         try:
-            _db = SessionDB()
+            # Resolve the state.db path from get_hermes_home() at call time
+            # so the override-aware _build() path (which sets HERMES_HOME
+            # to the target profile) persists to the correct state.db.
+            # Without this, the cached SessionDB() would bind to the
+            # launch profile's state.db even when building a cross-profile
+            # session. Wrap in Path() so str-returning mocks still work.
+            _db = SessionDB(db_path=Path(get_hermes_home()) / "state.db")
             _db_error = None
         except Exception as exc:
             _db_error = str(exc)
@@ -1361,6 +1368,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 except Exception as exc:
                     logger.debug(
                         "Plugin re-discovery for profile %s failed: %s",
+                        profile_home, exc,
+                    )
+                # Force MCP re-discovery for the target profile. The dashboard
+                # process launched with -p default cached MCP discovery under
+                # the launch profile's mcp_servers config. When _build() switches
+                # HERMES_HOME to lumi (or another profile), the cached discovery
+                # would miss the target profile's MCP servers — call
+                # start_background_mcp_discovery(force=True) to discover them
+                # for the active HERMES_HOME override.
+                try:
+                    from hermes_cli.mcp_startup import start_background_mcp_discovery
+                    start_background_mcp_discovery(
+                        logger=logger,
+                        thread_name=f"build-mcp-discovery-{sid}",
+                        force=True,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "MCP re-discovery for profile %s failed: %s",
                         profile_home, exc,
                     )
                 try:
@@ -1965,8 +1991,17 @@ def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
 
     from hermes_cli.config import atomic_config_write
+    from hermes_constants import get_hermes_home_override
 
-    path = _hermes_home / "config.yaml"
+    # Resolve home the same way _load_cfg does: override first, then
+    # fallback to the module-level _hermes_home (launch profile). Using
+    # get_hermes_home() directly would diverge from _load_cfg because
+    # get_hermes_home also checks HERMES_HOME env and platform default,
+    # which _load_cfg deliberately ignores. Wrap in Path() so a
+    # str-returning mock (pre-existing test convention) still works.
+    override = get_hermes_home_override()
+    home = override if isinstance(override, str) and override else _hermes_home
+    path = Path(home) / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
