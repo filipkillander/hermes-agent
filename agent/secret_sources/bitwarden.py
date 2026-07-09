@@ -10,14 +10,12 @@ Design summary
   first use.  Hermes pins one version (``_BWS_VERSION``) and downloads
   the matching asset from the official GitHub Releases page, verifying
   the SHA-256 against the release's published checksum file.
-* The access token is stored in ``~/.hermes/.env`` as
-  ``BWS_ACCESS_TOKEN`` (or whatever name the user picked in
-  ``secrets.bitwarden.access_token_env``).  This is the one
-  bootstrap secret — every other provider key can live in Bitwarden.
-* Pulling secrets is a single ``bws secret list <project_id>
-  --output json`` call.  We cache the result in-process for
-  ``cache_ttl_seconds`` so back-to-back ``hermes`` invocations don't
-  hammer the API.
+* The access token is resolved from an explicitly named environment variable
+  or a configured OS-keystore adapter.  It is the one bootstrap capability —
+  every other provider key can live in Bitwarden.
+* Pulling secrets is a single ``bws secret list <project_id> --output json``
+  call.  Results are cached in-process.  The legacy plaintext cross-process
+  cache exists only as an explicit, disabled-by-default migration option.
 * Failures NEVER block Hermes startup.  Missing binary, no network,
   expired token, etc. all emit a one-line warning and continue with
   whatever credentials ``.env`` already had.
@@ -34,6 +32,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -51,7 +50,7 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name as _is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import ErrorKind, SecretSource, run_secret_cli
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +124,21 @@ def _hermes_bin_dir() -> Path:
     return get_hermes_home() / "bin"
 
 
-def find_bws(*, install_if_missing: bool = False) -> Optional[Path]:
+def bws_binary_version(binary: Path) -> Optional[str]:
+    """Return a helper's semantic version using a secret-free subprocess."""
+    try:
+        proc = run_secret_cli([str(binary), "--version"], timeout=5)
+    except RuntimeError:
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)", proc.stdout or "")
+    return match.group(1) if match else None
+
+
+def find_bws(
+    *, install_if_missing: bool = False, require_pinned_version: bool = True
+) -> Optional[Path]:
     """Return a path to a usable ``bws`` binary, or None.
 
     Resolution order:
@@ -137,15 +150,21 @@ def find_bws(*, install_if_missing: bool = False) -> Optional[Path]:
     """
     managed = _hermes_bin_dir() / _platform_binary_name()
     if managed.exists() and os.access(managed, os.X_OK):
-        return managed
+        if not require_pinned_version or bws_binary_version(managed) == _BWS_VERSION:
+            return managed
+        logger.warning("managed bws version does not match the Hermes pin")
 
     system = shutil.which("bws")
     if system:
-        return Path(system)
+        candidate = Path(system)
+        if not require_pinned_version or bws_binary_version(candidate) == _BWS_VERSION:
+            return candidate
+        logger.warning("system bws version does not match the Hermes pin")
 
     if install_if_missing:
         try:
-            return install_bws()
+            # Replace a stale managed binary as well as installing a missing one.
+            return install_bws(force=managed.exists())
         except Exception as exc:  # noqa: BLE001 — never block startup
             logger.warning("bws auto-install failed: %s", exc)
             return None
@@ -355,6 +374,7 @@ def fetch_bitwarden_secrets(
     binary: Optional[Path] = None,
     cache_ttl_seconds: float = 300,
     use_cache: bool = True,
+    disk_cache_enabled: bool = False,
     server_url: str = "",
     home_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
@@ -368,12 +388,10 @@ def fetch_bitwarden_secrets(
     (``https://vault.bitwarden.com``, US Cloud).  This is plumbed into
     the subprocess as ``BWS_SERVER_URL``.
 
-    Caching is a two-layer LRU: an in-process dict (for hot-reload paths
-    inside one process) and a disk-persisted JSON file under
-    ``<hermes_home>/cache/bws_cache.json`` (for back-to-back CLI invocations).
-    Both share the same TTL.  Pass ``home_path`` so disk cache lookups find
-    the right directory in tests / non-standard installs; otherwise we fall
-    back to ``$HERMES_HOME`` / ``~/.hermes``.
+    Caching is in-process by default.  The legacy plaintext disk cache is
+    disabled unless ``disk_cache_enabled`` is explicitly true.  This keeps a
+    migration-safe escape hatch for existing deployments without creating new
+    secret-bearing files in fresh/default configurations.
 
     Raises :class:`RuntimeError` for fatal conditions (missing binary,
     auth failure, unparseable output).  Callers in the env_loader path
@@ -391,12 +409,13 @@ def fetch_bitwarden_secrets(
         if cached and cached.is_fresh(cache_ttl_seconds):
             return cached.secrets, []
         # L2: disk cache. ~5ms on cache hit vs ~380ms for `bws secret list`.
-        disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
-        if disk_cached is not None:
-            # Promote into in-process cache so subsequent fetches in the
-            # same process skip the disk read too.
-            _CACHE[cache_key] = disk_cached
-            return disk_cached.secrets, []
+        if disk_cache_enabled:
+            disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
+            if disk_cached is not None:
+                # Promote into in-process cache so subsequent fetches in the
+                # same process skip the disk read too.
+                _CACHE[cache_key] = disk_cached
+                return disk_cached.secrets, []
 
     bws = binary or find_bws(install_if_missing=True)
     if bws is None:
@@ -410,7 +429,7 @@ def fetch_bitwarden_secrets(
     secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
     _CACHE[cache_key] = entry
-    if use_cache:
+    if use_cache and disk_cache_enabled:
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
     return secrets, warnings
 
@@ -419,40 +438,41 @@ def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
-    env["BWS_ACCESS_TOKEN"] = access_token
-    # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
-    # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
-    # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
-    # self-hosted users need their own URL.  When unset, fall back to whatever
-    # BWS_SERVER_URL the caller already had in their shell env (preserved by
-    # the copy above) so manual overrides keep working too.
+    extra_env = {"BWS_ACCESS_TOKEN": access_token}
+    # Region / self-hosted support. bws defaults to https://vault.bitwarden.com
+    # (US Cloud); EU Cloud and self-hosted users need an explicit URL. The
+    # parent's BWS_SERVER_URL is intentionally not inherited: subprocess
+    # capabilities come only from this profile's validated config.
     if server_url:
-        env["BWS_SERVER_URL"] = server_url
+        extra_env["BWS_SERVER_URL"] = server_url
 
     try:
-        proc = subprocess.run(  # noqa: S603 — bws path is trusted
+        proc = run_secret_cli(
             cmd,
-            env=env,
-            capture_output=True,
-            text=True,
+            extra_env=extra_env,
             timeout=_BWS_RUN_TIMEOUT,
-            stdin=subprocess.DEVNULL,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"failed to invoke bws: {exc}") from exc
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     if proc.returncode != 0:
-        # bws writes auth/network errors to stderr in plain English.
-        # Strip ANSI just in case and surface the first 200 chars.
-        err = (proc.stderr or proc.stdout or "").strip().replace("\x1b", "")
+        # Helper output is untrusted and may echo a key/value.  Keep startup
+        # diagnostics structural; interactive setup can guide the user to run
+        # bws directly when deeper provider diagnostics are required.
+        diagnostic = f"{proc.stderr or ''} {proc.stdout or ''}".lower()
+        if any(token in diagnostic for token in (
+            "unauthorized", "forbidden", "authentication", "invalid token",
+            "invalid access token", "bad token", "401", "403",
+        )):
+            category = "authentication failed"
+        elif any(token in diagnostic for token in (
+            "network", "connection", "dns", "resolve host", "timed out",
+        )):
+            category = "network request failed"
+        else:
+            category = "command failed"
         raise RuntimeError(
-            f"bws exited {proc.returncode}: {err[:200]}"
+            f"bws {category} (status {proc.returncode}; provider output suppressed)"
         )
 
     raw = proc.stdout.strip()
@@ -478,6 +498,10 @@ def _run_bws_list(
         value = item.get("value")
         if not isinstance(key, str) or not isinstance(value, str):
             continue
+        if key in secrets:
+            # Never let list order silently choose a credential.  Do not put
+            # the duplicate name in the exception because this reaches logs.
+            raise RuntimeError("bws response contains duplicate secret keys")
         if not _is_valid_env_name(key):
             warnings.append(
                 f"Skipping secret {key!r}: not a valid env-var name"
@@ -602,6 +626,7 @@ def apply_bitwarden_secrets(
     project_id: str = "",
     override_existing: bool = False,
     cache_ttl_seconds: float = 300,
+    disk_cache_enabled: bool = False,
     auto_install: bool = True,
     server_url: str = "",
     home_path: Optional[Path] = None,
@@ -661,6 +686,7 @@ def apply_bitwarden_secrets(
             project_id=project_id,
             binary=binary,
             cache_ttl_seconds=cache_ttl_seconds,
+            disk_cache_enabled=disk_cache_enabled,
             server_url=server_url,
             home_path=home_path,
         )
@@ -732,12 +758,24 @@ class BitwardenSource(SecretSource):
             },
             "project_id": {"description": "BSM project UUID", "default": ""},
             "cache_ttl_seconds": {
-                "description": "Disk+memory cache TTL; 0 disables",
+                "description": "In-memory cache TTL; 0 disables",
                 "default": 300,
+            },
+            "disk_cache_enabled": {
+                "description": "Legacy plaintext cross-process cache (not recommended)",
+                "default": False,
             },
             "override_existing": {
                 "description": "BSM values overwrite .env/shell values",
                 "default": True,
+            },
+            "allowed_env_vars": {
+                "description": "Optional allowlist; fetched names outside it are ignored",
+                "default": None,
+            },
+            "required_env_vars": {
+                "description": "Required names; any missing name aborts this source atomically",
+                "default": [],
             },
             "auto_install": {
                 "description": "Auto-download the pinned bws binary",
@@ -804,6 +842,7 @@ class BitwardenSource(SecretSource):
                 project_id=project_id,
                 binary=binary,
                 cache_ttl_seconds=ttl,
+                disk_cache_enabled=bool(cfg.get("disk_cache_enabled", False)),
                 server_url=str(cfg.get("server_url", "") or "").strip(),
                 home_path=home_path,
             )

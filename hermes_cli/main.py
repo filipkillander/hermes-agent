@@ -266,6 +266,13 @@ def _try_termux_ultrafast_version() -> bool:
     return True
 
 
+if _is_termux_fast_version_argv(sys.argv[1:]):
+    # Version reporting is deliberately configuration- and secret-free on all
+    # platforms.  It must remain usable while Keychain/BWS/network are down and
+    # must not refresh caches merely because an operator asked for a version.
+    _print_fast_version_info()
+    raise SystemExit(0)
+
 if _try_termux_ultrafast_version():
     raise SystemExit(0)
 
@@ -532,7 +539,39 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+
+def _is_read_only_diagnostic_argv(argv: list[str]) -> bool:
+    """Return whether a CLI invocation must avoid external secret bootstrap."""
+    if "--help" in argv or "-h" in argv:
+        return True
+    positional = [item for item in argv if not item.startswith("-")]
+    if not positional:
+        return False
+    if positional[0] in {"doctor", "status", "dump", "debug", "version"}:
+        return True
+    if positional[0] == "dashboard" and "--status" in argv:
+        return True
+    return len(positional) >= 2 and positional[1] == "status" and positional[0] in {
+        "gateway", "cron", "secrets", "dashboard", "honcho", "curator",
+    }
+
+
+_READ_ONLY_DIAGNOSTIC = _is_read_only_diagnostic_argv(sys.argv[1:])
+if _READ_ONLY_DIAGNOSTIC:
+    # The flag also protects lazy imports (doctor.py loads dotenv itself).
+    os.environ["HERMES_SKIP_EXTERNAL_SECRETS"] = "1"
+    os.environ["HERMES_ENV_LOADER_READ_ONLY"] = "1"
+
+# Help/version are package metadata and need no dotenv state at all. Other
+# diagnostic commands may inspect ordinary .env values but stay read-only and
+# never touch Keychain/BWS/cache through the flags above.
+_PURE_METADATA = (
+    "--help" in sys.argv[1:]
+    or "-h" in sys.argv[1:]
+    or sys.argv[1:] in (["version"], ["--version"], ["-V"])
+)
+if not _PURE_METADATA:
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -4412,7 +4451,7 @@ def _print_version_info(*, check_updates: bool = True) -> None:
 
 def cmd_version(args):
     """Show version."""
-    _print_version_info(check_updates=True)
+    _print_version_info(check_updates=False)
 
 
 def cmd_uninstall(args):
