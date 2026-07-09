@@ -84,9 +84,21 @@ def resolve_copilot_token() -> tuple[str, str]:
         if val:
             valid, msg = validate_copilot_token(val)
             if not valid:
-                logger.warning(
-                    "Token from %s is not supported: %s", env_var, msg
-                )
+                # COPILOT_GITHUB_TOKEN is Copilot-specific: a classic PAT
+                # there IS a user misconfiguration — warn loudly.
+                # GITHUB_TOKEN / GH_TOKEN are general-purpose GitHub tokens
+                # (git, gh CLI, CI): a classic PAT is the expected case,
+                # not a Copilot misconfiguration. Skip silently so we don't
+                # spam the log on every agent build / model picker open.
+                if env_var == "COPILOT_GITHUB_TOKEN":
+                    logger.warning(
+                        "Token from %s is not supported: %s", env_var, msg
+                    )
+                else:
+                    logger.debug(
+                        "Token from %s is not a Copilot token (%s) — skipping",
+                        env_var, msg.split('.')[0],
+                    )
                 continue
             return val, env_var
 

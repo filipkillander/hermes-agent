@@ -1263,6 +1263,22 @@ def _start_agent_build(sid: str, session: dict) -> None:
             session_db = None
             if profile_home:
                 home_token = set_hermes_home_override(profile_home)
+                # Force plugin re-discovery for the target profile. The
+                # dashboard process starts with the launch profile's plugins
+                # cached in PluginManager._discovered; when _build() switches
+                # HERMES_HOME to a different profile, the cached discovery
+                # misses profile-local plugins (e.g. hermes-lcm context
+                # engine). Re-discover with force=True so context engine,
+                # tools, and hooks from the target profile are loaded before
+                # agent_init probes for them.
+                try:
+                    from hermes_cli.plugins import discover_plugins
+                    discover_plugins(force=True)
+                except Exception as exc:
+                    logger.debug(
+                        "Plugin re-discovery for profile %s failed: %s",
+                        profile_home, exc,
+                    )
                 try:
                     from hermes_state import SessionDB
 
