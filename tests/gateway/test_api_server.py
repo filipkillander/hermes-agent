@@ -772,13 +772,33 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is False
 
     @pytest.mark.asyncio
-    async def test_health_detailed_requires_auth(self, auth_adapter):
-        """Detailed health must not leak runtime state without Bearer auth."""
+    async def test_health_detailed_is_secret_free_for_verified_loopback(self, auth_adapter):
+        """Local coordinator can probe readiness without inheriting API secrets."""
         app = _create_app(auth_adapter)
         with patch("gateway.status.read_runtime_status", return_value=None):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
-                assert resp.status == 401
+                assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_requires_auth_for_non_loopback_peer(self, auth_adapter):
+        """Forwarded headers cannot turn a remote TCP peer into loopback."""
+        request = MagicMock()
+        request.headers = {"X-Forwarded-For": "127.0.0.1"}
+        request.remote = "203.0.113.10"
+        request.transport.get_extra_info.return_value = ("203.0.113.10", 45678)
+        resp = await auth_adapter._handle_health_detailed(request)
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_accepts_bearer_for_non_loopback_peer(self, auth_adapter):
+        request = MagicMock()
+        request.headers = {"Authorization": f"Bearer {auth_adapter._api_key}"}
+        request.remote = "203.0.113.10"
+        request.transport.get_extra_info.return_value = ("203.0.113.10", 45678)
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}):
+            resp = await auth_adapter._handle_health_detailed(request)
+        assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_health_detailed_allows_authenticated_request(self, auth_adapter):

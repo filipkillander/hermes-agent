@@ -302,11 +302,18 @@ def atomic_roundtrip_yaml_update(
 
     This is intentionally narrower than :func:`atomic_yaml_write`: it is for
     user-edited config files where comments, ordering, quoting, and Unicode
-    should survive a single setting mutation.  Writes still use the same temp
-    file + fsync + atomic replace pattern.
+    should survive a single setting mutation. The update uses the same
+    parse/schema/CAS/readback transaction as full config writes, so malformed
+    input or an overlapping writer can never collapse the file.
     """
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
+    from hermes_cli.config import (
+        ConfigTransactionError,
+        _config_write_lock,
+        read_config_snapshot,
+        validate_config_structure,
+    )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +324,7 @@ def atomic_roundtrip_yaml_update(
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
+    base = read_config_snapshot(path)
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
             config = yaml_rt.load(f) or CommentedMap()
@@ -348,10 +356,32 @@ def atomic_roundtrip_yaml_update(
             yaml_rt.dump(config, f)
             f.flush()
             os.fsync(f.fileno())
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
+        staged = read_config_snapshot(Path(tmp_path))
+        errors = [
+            issue.message
+            for issue in validate_config_structure(staged.data)
+            if issue.severity == "error"
+        ]
+        if errors:
+            raise ConfigTransactionError(
+                f"Refusing config mutation: schema validation failed: {'; '.join(errors[:5])}"
+            )
+        with _config_write_lock(path):
+            current_snapshot = read_config_snapshot(path)
+            if current_snapshot.content_hash != base.content_hash:
+                raise ConfigTransactionError(
+                    "Refusing config mutation: config.yaml changed since it was read; "
+                    "reload and retry the edit"
+                )
+            real_path = atomic_replace(tmp_path, path)
+            real_path_obj = Path(real_path)
+            _restore_file_owner(real_path_obj, original_owner)
+            _restore_file_mode(real_path_obj, original_mode)
+            published = read_config_snapshot(path)
+            if published.data != staged.data:
+                raise ConfigTransactionError(
+                    "Config publication readback did not match the validated candidate"
+                )
     except BaseException:
         try:
             os.unlink(tmp_path)
