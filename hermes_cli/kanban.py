@@ -136,7 +136,7 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
-      config has ``kanban.dispatch_in_gateway`` on (default). Message
+      config and runtime registry both authorize embedded dispatch. Message
       is a short status line.
     - ``running=False``: either no gateway is running, or the gateway
       is running but the config flag is off. Message is human guidance
@@ -144,9 +144,8 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
 
     Used by ``hermes kanban create`` (and callers) to warn when a task
     will sit in ``ready`` because nothing is there to pick it up.
-    Defensive against import failures and config-read errors — if the
-    probe itself errors, we return ``(True, "")`` so we don't spam
-    false warnings (better to miss a warning than to cry wolf).
+    Dispatcher authority fails closed: an unreadable config or registry is
+    reported as disabled rather than assuming a worker-spawning capability.
     """
     try:
         from gateway.status import get_running_pid  # type: ignore
@@ -160,19 +159,24 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
         from hermes_cli.config import load_config
+        from hermes_cli.runtime_registry import dispatcher_authorized
+        from hermes_constants import get_hermes_home
         cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
+        dispatch_on = bool(
+            cfg.get("kanban", {}).get("dispatch_in_gateway", False)
+            and dispatcher_authorized(get_hermes_home())
+        )
     except Exception:
-        dispatch_on = True  # can't tell — assume default
+        dispatch_on = False
 
     if pid and dispatch_on:
         return (True, f"gateway pid={pid}, dispatch enabled")
     if pid and not dispatch_on:
         return (
             False,
-            "Gateway is running but kanban.dispatch_in_gateway=false in "
-            "config.yaml — the task will sit in 'ready' until you flip it "
-            "back on and restart the gateway, OR run the legacy "
+            "Gateway is running but embedded dispatch is not authorized by both "
+            "config.yaml and runtime-registry.yaml — the task will sit in 'ready' "
+            "until the operator authorizes one dispatcher and restarts it, OR run the legacy "
             "standalone daemon (`hermes kanban daemon --force`)."
         )
     return (

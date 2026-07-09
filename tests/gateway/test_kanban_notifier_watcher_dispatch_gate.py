@@ -63,12 +63,13 @@ def test_notifier_watcher_runs_when_dispatch_enabled():
     import hermes_cli.kanban_db as _kb
 
     with patch("hermes_cli.config.load_config", return_value=_fake_config(True)):
-        with patch.object(
-            _kb, "list_boards",
-            side_effect=lambda *a, **kw: past_gate.append(True) or [],
-        ):
-            with patch("asyncio.sleep", side_effect=fake_sleep):
-                with patch("asyncio.to_thread", side_effect=fake_to_thread):
-                    asyncio.run(runner._kanban_notifier_watcher())
+        with patch("gateway.kanban_watchers._registry_authorizes_dispatcher", return_value=True):
+            with patch.object(
+                _kb, "list_boards",
+                side_effect=lambda *a, **kw: past_gate.append(True) or [],
+            ):
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    with patch("asyncio.to_thread", side_effect=fake_to_thread):
+                        asyncio.run(runner._kanban_notifier_watcher())
 
     assert past_gate, "list_boards should be called when dispatch_in_gateway=true"

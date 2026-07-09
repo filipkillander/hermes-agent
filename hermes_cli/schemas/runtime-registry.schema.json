@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes.local/schemas/runtime-registry.schema.json",
+  "title": "Hermes runtime registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profiles"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profiles": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
+      "additionalProperties": {"$ref": "#/$defs/profile"}
+    }
+  },
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "home"],
+      "properties": {
+        "role": {"enum": ["external_gateway", "internal_worker"]},
+        "home": {"type": "string", "pattern": "^/"},
+        "service_label": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
+        "health_url": {"type": "string", "pattern": "^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]+/"},
+        "dispatcher": {"type": "boolean", "default": false},
+        "allowed_platforms": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "required_platforms": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "bot_fingerprints": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}},
+        "release_revision": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{7,128}$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"role": {"const": "external_gateway"}}},
+          "then": {"required": ["service_label", "port"]}
+        },
+        {
+          "if": {"properties": {"role": {"const": "internal_worker"}}},
+          "then": {
+            "properties": {
+              "service_label": false,
+              "port": false,
+              "health_url": false,
+              "dispatcher": {"const": false},
+              "allowed_platforms": {"maxItems": 0},
+              "required_platforms": {"maxItems": 0},
+              "bot_fingerprints": {"maxProperties": 0}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

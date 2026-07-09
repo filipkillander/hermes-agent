@@ -133,17 +133,17 @@ class HolographicMemoryProvider(MemoryProvider):
         from pathlib import Path
         config_path = Path(hermes_home) / "config.yaml"
         try:
-            import yaml
-            existing = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8-sig") as f:
-                    existing = yaml.safe_load(f) or {}
+            from hermes_cli.config import atomic_config_write, read_config_snapshot
+
+            snapshot = read_config_snapshot(config_path)
+            existing = snapshot.data
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(existing, f, default_flow_style=False)
+            atomic_config_write(
+                config_path, existing, expected_base_hash=snapshot.content_hash
+            )
         except Exception:
-            pass
+            logger.exception("Failed to persist hermes-memory-store config")
 
     def get_config_schema(self):
         from hermes_constants import display_hermes_home

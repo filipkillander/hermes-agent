@@ -420,12 +420,23 @@ def _build_pid_record() -> dict:
 
 def _build_runtime_status_record() -> dict[str, Any]:
     payload = _build_pid_record()
+    try:
+        from hermes_cli.runtime_registry import runtime_identity
+
+        identity = runtime_identity(_get_process_hermes_home())
+    except Exception:
+        identity = {
+            "profile": _profile_name_for_home(_get_process_hermes_home()) or "default",
+            "role": "unknown",
+            "registry_verified": False,
+        }
     payload.update({
         "gateway_state": "starting",
         "exit_reason": None,
         "restart_requested": False,
         "active_agents": 0,
         "platforms": {},
+        "runtime_identity": identity,
         "updated_at": _utc_now_iso(),
     })
     return payload
@@ -780,6 +791,12 @@ def write_runtime_status(
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
     payload["updated_at"] = _utc_now_iso()
+    try:
+        from hermes_cli.runtime_registry import runtime_identity
+
+        payload["runtime_identity"] = runtime_identity(_get_process_hermes_home())
+    except Exception:
+        payload.setdefault("runtime_identity", {"registry_verified": False})
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
@@ -807,6 +824,55 @@ def write_runtime_status(
         payload["platforms"][platform] = platform_payload
 
     _write_json_file(path, payload)
+
+
+def evaluate_runtime_readiness(
+    payload: Optional[dict[str, Any]],
+    *,
+    expected_profile: Optional[str] = None,
+    expected_service_label: Optional[str] = None,
+    expected_port: Optional[int] = None,
+    expected_registry_revision: Optional[str] = None,
+) -> tuple[bool, list[str]]:
+    """Validate liveness *and identity* from a detailed health payload.
+
+    A port returning HTTP 200 is not sufficient: a different Hermes profile
+    can own the port.  This contract is shared by dashboards, watchdogs, and
+    the restart coordinator so they all reject that split-brain state.
+    """
+    failures: list[str] = []
+    if not isinstance(payload, dict):
+        return False, ["missing_payload"]
+    identity = payload.get("runtime_identity")
+    if not isinstance(identity, dict):
+        failures.append("missing_runtime_identity")
+        identity = {}
+    if not identity.get("registry_verified"):
+        failures.append("registry_unverified")
+    if identity.get("role") != "external_gateway":
+        failures.append("wrong_runtime_role")
+    comparisons = (
+        (expected_profile, identity.get("profile"), "profile_mismatch"),
+        (expected_service_label, identity.get("service_label"), "service_label_mismatch"),
+        (expected_port, identity.get("port"), "port_mismatch"),
+        (expected_registry_revision, identity.get("registry_revision"), "registry_revision_mismatch"),
+    )
+    for expected, actual, reason in comparisons:
+        if expected is not None and actual != expected:
+            failures.append(reason)
+    if payload.get("gateway_state") != "running":
+        failures.append("gateway_not_running")
+    required = identity.get("required_platforms") or []
+    allowed = set(identity.get("allowed_platforms") or [])
+    platforms = payload.get("platforms") if isinstance(payload.get("platforms"), dict) else {}
+    for platform, state in platforms.items():
+        if isinstance(state, dict) and state.get("state") == "connected" and platform not in allowed:
+            failures.append(f"unauthorized_platform_connected:{platform}")
+    for platform in required:
+        state = platforms.get(platform, {})
+        if not isinstance(state, dict) or state.get("state") != "connected":
+            failures.append(f"required_platform_disconnected:{platform}")
+    return not failures, failures
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:

@@ -13,6 +13,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -2628,12 +2630,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
-        # Run the dispatcher inside the gateway process. On by default —
-        # the cost is ~300µs every `dispatch_interval_seconds` when idle,
-        # and gateway is the supervisor users already have. Set to false
-        # only if you run the dispatcher as a separate systemd unit or
-        # don't want the gateway to spawn workers.
-        "dispatch_in_gateway": True,
+        # Privileged capability: a gateway may spawn workers only when both
+        # this explicit profile setting AND runtime-registry.yaml authorize it.
+        # Missing config/registry therefore fails closed instead of making the
+        # newest gateway on a host an accidental second dispatcher.
+        "dispatch_in_gateway": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -6626,30 +6627,248 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
 
-def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
+class ConfigTransactionError(RuntimeError):
+    """A config mutation was rejected before the live file was replaced."""
+
+
+_EXPECTED_HASH_UNSET = object()
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """Parsed config plus the exact on-disk revision used to derive it."""
+
+    data: Dict[str, Any]
+    content_hash: Optional[str]
+
+
+def _config_bytes_hash(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_config_snapshot(config_path: Path) -> ConfigSnapshot:
+    """Read a config revision without conflating missing and malformed files.
+
+    Missing files are represented by ``content_hash=None``. Existing files
+    must be readable YAML mappings; a parse error, scalar/list root, or I/O
+    failure raises :class:`ConfigTransactionError` and therefore cannot be
+    converted into a destructive ``{}`` write by a later mutation.
+    """
+    config_path = Path(config_path)
+    try:
+        with open(config_path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return ConfigSnapshot({}, None)
+    except OSError as exc:
+        raise ConfigTransactionError(
+            f"Refusing to overwrite {config_path}: existing config cannot be read ({exc})"
+        ) from exc
+
+    try:
+        parsed = yaml.safe_load(raw) if raw.strip() else {}
+    except yaml.YAMLError as exc:
+        raise ConfigTransactionError(
+            f"Refusing config mutation: {config_path} is not valid YAML ({exc})"
+        ) from exc
+    if parsed is None:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        raise ConfigTransactionError(
+            f"Refusing config mutation: {config_path} root must be a mapping, "
+            f"got {type(parsed).__name__}"
+        )
+    return ConfigSnapshot(copy.deepcopy(parsed), _config_bytes_hash(raw))
+
+
+@contextmanager
+def _config_write_lock(config_path: Path):
+    """Cross-process lock serializing compare-and-swap config writes."""
+    lock_path = config_path.with_name(f".{config_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _validate_config_candidate(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ConfigTransactionError(
+            f"Refusing config mutation: candidate root must be a mapping, "
+            f"got {type(data).__name__}"
+        )
+    errors = [issue for issue in validate_config_structure(data) if issue.severity == "error"]
+    if errors:
+        detail = "; ".join(issue.message for issue in errors[:5])
+        raise ConfigTransactionError(f"Refusing config mutation: schema validation failed: {detail}")
+    return data
+
+
+def atomic_config_write(
+    config_path: Path,
+    data: Any,
+    *,
+    expected_base_hash: Any = _EXPECTED_HASH_UNSET,
+    **kwargs: Any,
+) -> str:
     """Fail-closed atomic write for ``config.yaml``.
 
-    The single chokepoint every config-update path should use instead of
-    calling :func:`utils.atomic_yaml_write` directly. It runs
-    :func:`require_readable_config_before_write` first, so a full-file
-    replacement can never silently clobber an existing ``config.yaml`` that
-    degraded to an empty dict on read (permission error, broken mount,
-    transient I/O). New-file creation still works when the path is absent.
+    The single chokepoint every full-config update path should use instead of
+    calling :func:`utils.atomic_yaml_write` directly. Existing input must parse
+    as a mapping; the candidate must pass structural validation and semantic
+    readback; optional ``expected_base_hash`` supplies cross-process CAS.
 
-    Root cause this guards: ``read_raw_config()`` returns ``{}`` for BOTH an
-    absent file and an unreadable-but-present file. Callers that read then
-    overwrite can't tell the two apart, so an unreadable config would be
-    replaced with only defaults or the single edited section. Routing every
-    write through this helper enforces the invariant in one place rather than
-    relying on each of ~15 independent write sites to remember the guard.
+    Root cause this guards: legacy readers return ``{}`` for BOTH an absent
+    file and a malformed/unreadable file. The transaction preserves that
+    distinction and rejects stale writers before the live path is touched.
 
     ``kwargs`` are forwarded verbatim to ``atomic_yaml_write``
     (``sort_keys``, ``default_flow_style``, ``extra_content``, ...).
     """
-    from utils import atomic_yaml_write
+    from utils import (
+        _preserve_file_mode,
+        _preserve_file_owner,
+        _restore_file_mode,
+        _restore_file_owner,
+        atomic_replace,
+        atomic_yaml_write,
+    )
 
-    require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    config_path = Path(config_path)
+    candidate = _validate_config_candidate(data)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Serialize and validate a staged file before the live path is touched.
+    fd, staged_name = tempfile.mkstemp(
+        dir=str(config_path.parent), prefix=f".{config_path.stem}_candidate_", suffix=".tmp"
+    )
+    os.close(fd)
+    staged = Path(staged_name)
+    try:
+        atomic_yaml_write(staged, candidate, **kwargs)
+        staged_snapshot = read_config_snapshot(staged)
+        if staged_snapshot.data != candidate:
+            raise ConfigTransactionError(
+                "Refusing config mutation: serialized candidate failed semantic readback"
+            )
+
+        with _config_write_lock(config_path):
+            base = read_config_snapshot(config_path)
+            if (
+                expected_base_hash is not _EXPECTED_HASH_UNSET
+                and base.content_hash != expected_base_hash
+            ):
+                raise ConfigTransactionError(
+                    "Refusing config mutation: config.yaml changed since it was read; "
+                    "reload and retry the edit"
+                )
+            original_mode = _preserve_file_mode(config_path)
+            original_owner = _preserve_file_owner(config_path)
+            real_path = Path(atomic_replace(staged, config_path))
+            _restore_file_owner(real_path, original_owner)
+            _restore_file_mode(real_path, original_mode)
+
+            published = read_config_snapshot(config_path)
+            if published.data != candidate:
+                raise ConfigTransactionError(
+                    "Config publication readback did not match the validated candidate"
+                )
+            return published.content_hash or ""
+    finally:
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_roundtrip_config_write(
+    config_path: Path,
+    document: Any,
+    *,
+    expected_base_hash: Optional[str],
+) -> str:
+    """Publish a pre-mutated ruamel document through the config transaction.
+
+    Used by migrations that must retain comments and scalar style while still
+    receiving schema validation, compare-and-swap protection, atomic replace,
+    and semantic readback.
+    """
+    from ruamel.yaml import YAML
+    from utils import (
+        _preserve_file_mode,
+        _preserve_file_owner,
+        _restore_file_mode,
+        _restore_file_owner,
+        atomic_replace,
+    )
+
+    config_path = Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    fd, staged_name = tempfile.mkstemp(
+        dir=str(config_path.parent), prefix=f".{config_path.stem}_roundtrip_", suffix=".tmp"
+    )
+    staged = Path(staged_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml_rt.dump(document, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        candidate = read_config_snapshot(staged)
+        _validate_config_candidate(candidate.data)
+        with _config_write_lock(config_path):
+            base = read_config_snapshot(config_path)
+            if base.content_hash != expected_base_hash:
+                raise ConfigTransactionError(
+                    "Refusing config mutation: config.yaml changed since it was read; "
+                    "reload and retry the edit"
+                )
+            original_mode = _preserve_file_mode(config_path)
+            original_owner = _preserve_file_owner(config_path)
+            real_path = Path(atomic_replace(staged, config_path))
+            _restore_file_owner(real_path, original_owner)
+            _restore_file_mode(real_path, original_mode)
+            published = read_config_snapshot(config_path)
+            if published.data != candidate.data:
+                raise ConfigTransactionError(
+                    "Config publication readback did not match the validated candidate"
+                )
+            return published.content_hash or ""
+    finally:
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def load_config() -> Dict[str, Any]:
@@ -7027,11 +7246,9 @@ def save_config(
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
                     file=sys.stderr,
                 )
-        from utils import atomic_yaml_write
-
         ensure_hermes_home()
         config_path = get_config_path()
-        require_readable_config_before_write(config_path)
+        base_snapshot = read_config_snapshot(config_path)
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
         # DEFAULT_CONFIG; using the raw dict preserves which paths the
@@ -7086,9 +7303,10 @@ def save_config(
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
+        atomic_config_write(
             config_path,
             normalized,
+            expected_base_hash=base_snapshot.content_hash,
             extra_content="".join(parts) if parts else None,
         )
         _secure_file(config_path)
@@ -8011,14 +8229,8 @@ def set_config_value(key: str, value: str):
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+    snapshot = read_config_snapshot(config_path)
+    user_config = snapshot.data
     
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -8047,8 +8259,12 @@ def set_config_value(key: str, value: str):
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    atomic_config_write(
+        config_path,
+        user_config,
+        expected_base_hash=snapshot.content_hash,
+        sort_keys=False,
+    )
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
