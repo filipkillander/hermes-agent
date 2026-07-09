@@ -2722,6 +2722,12 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Parent environment variables a dispatcher may pass into a Kanban
+        # worker in addition to the fixed runtime/terminal/git-agent baseline.
+        # Secure default is empty: provider credentials must be named
+        # explicitly by the assigned worker profile during .env migration.
+        # Bootstrap and bot tokens should never be listed here.
+        "worker_env_capabilities": [],
         # Profile assigned to the root/orchestration task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the

@@ -7677,6 +7677,82 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_KANBAN_WORKER_BASE_ENV_CAPABILITIES = (
+    # Terminal presentation/runtime.
+    "TERM", "COLORTERM", "SHELL", "COMSPEC", "PATHEXT",
+    "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME",
+    # TLS trust roots (paths only, not bearer credentials).
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+    # Git/SSH agent capabilities. The worker runs as the same OS user; passing
+    # the agent socket preserves normal git operations without copying tokens.
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO", "GPG_TTY",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_ASKPASS", "SSH_ASKPASS",
+    # Non-secret terminal execution policy inherited until the worker profile's
+    # config/.env is loaded in the child.
+    "TERMINAL_ENV", "TERMINAL_CWD", "TERMINAL_TIMEOUT",
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT", "TERMINAL_LIFETIME_SECONDS",
+    "TERMINAL_PERSISTENT_SHELL", "TERMINAL_LOCAL_PERSISTENT",
+    "TERMINAL_CONTAINER_PERSISTENT",
+    # Hermes launcher paths needed on non-default/Windows installations.
+    "HERMES_BIN", "HERMES_GIT_BASH_PATH",
+)
+
+
+def _worker_env_capability_is_forbidden(name: str) -> bool:
+    """Keep vault bootstrap and platform bot identities out of workers."""
+    upper = name.upper()
+    return upper in {"BWS_ACCESS_TOKEN", "OP_SERVICE_ACCOUNT_TOKEN"} or upper.endswith(
+        "_BOT_TOKEN"
+    )
+
+
+def _resolve_worker_env_capabilities(hermes_home: Optional[str]) -> list[str]:
+    """Read the assigned profile's explicit parent-env capability allowlist.
+
+    Invalid shapes/names fail closed. Values are never read or logged here;
+    :func:`build_capability_env` copies only the named variables immediately
+    before ``Popen``. This is a migration bridge for provider credentials, not
+    a global provider list.
+    """
+    if not hermes_home:
+        return []
+    try:
+        from agent.secret_sources.base import is_valid_env_name
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        raw = (
+            kanban_cfg.get("worker_env_capabilities", [])
+            if isinstance(kanban_cfg, dict) else []
+        )
+        if not isinstance(raw, list):
+            return []
+        capabilities: list[str] = []
+        for value in raw:
+            if not isinstance(value, str) or not is_valid_env_name(value):
+                return []
+            if _worker_env_capability_is_forbidden(value):
+                continue
+            if value not in capabilities:
+                capabilities.append(value)
+        return capabilities
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not resolve env capabilities for HERMES_HOME=%r (%s)",
+            hermes_home,
+            exc,
+        )
+        return []
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7704,26 +7780,35 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, `env = dict(os.environ)` copies only the parent's
-    # env, and when the child process starts `hermes -p <name>` the
+    # config. The sanitized child env intentionally does not inherit the
+    # dispatcher's HERMES_HOME; when the child starts `hermes -p <name>` the
     # _apply_profile_override() runs *before* hermes_constants is imported.
     # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    worker_home = os.environ.get("HERMES_HOME")
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        worker_home = resolve_profile_env(profile_arg)
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+
+    from agent.secret_sources.base import build_capability_env
+
+    configured_capabilities = _resolve_worker_env_capabilities(worker_home)
+    env = build_capability_env(
+        (*_KANBAN_WORKER_BASE_ENV_CAPABILITIES, *configured_capabilities)
+    )
+    if worker_home:
+        env["HERMES_HOME"] = worker_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
