@@ -34,6 +34,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -1072,6 +1073,19 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    @staticmethod
+    def _is_verified_loopback_peer(request: "web.Request") -> bool:
+        """Use the TCP peer, never forwarded headers, for local readiness auth."""
+        transport = getattr(request, "transport", None)
+        if transport is None:
+            return False
+        try:
+            peer = transport.get_extra_info("peername")
+            host = peer[0] if isinstance(peer, (tuple, list)) and peer else None
+            return bool(host and ipaddress.ip_address(str(host)).is_loopback)
+        except (ValueError, TypeError, OSError):
+            return False
+
     # ------------------------------------------------------------------
     # Session header helpers
     # ------------------------------------------------------------------
@@ -1378,15 +1392,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         Returns gateway state, connected platforms, PID, and uptime so the
         dashboard can display full status without needing a shared PID file or
-        /proc access.  Requires the same Bearer auth as other API routes.
+        /proc access. Verified loopback TCP peers are authless so a local
+        coordinator need not inherit API_SERVER_KEY; all other peers require
+        the same Bearer auth as API routes.
         """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        if not self._is_verified_loopback_peer(request):
+            auth_err = self._check_auth(request)
+            if auth_err:
+                return auth_err
 
         from gateway.status import (
             derive_gateway_busy,
             derive_gateway_drainable,
+            evaluate_runtime_readiness,
             parse_active_agents,
             read_runtime_status,
         )
@@ -1394,6 +1412,7 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime = read_runtime_status() or {}
         gw_state = runtime.get("gateway_state")
         gw_active = parse_active_agents(runtime.get("active_agents", 0))
+        ready, readiness_failures = evaluate_runtime_readiness(runtime)
         # This endpoint is served BY the gateway process, so it is by definition
         # alive — gateway_running is True. Derive busy/drainable from the same
         # shared contract /api/status uses so the two surfaces never disagree.
@@ -1416,6 +1435,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
+            "runtime_identity": runtime.get("runtime_identity", {}),
+            "ready": ready,
+            "readiness_failures": readiness_failures,
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":

@@ -25,6 +25,18 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _registry_authorizes_dispatcher() -> bool:
+    """Require operator-owned registry authorization for worker spawning."""
+    try:
+        from hermes_cli.runtime_registry import dispatcher_authorized
+        from hermes_constants import get_hermes_home
+
+        return dispatcher_authorized(get_hermes_home())
+    except Exception as exc:
+        logger.warning("kanban dispatcher: runtime registry unavailable (%s); disabled", exc)
+        return False
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -150,10 +162,13 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", False):
             logger.info(
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
+            return
+        if not _registry_authorizes_dispatcher():
+            logger.warning("kanban notifier: profile is not dispatcher-authorized; disabled")
             return
         from gateway.config import Platform as _Platform
         try:
@@ -744,7 +759,7 @@ class GatewayKanbanWatchersMixin:
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
-        Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
+        Gated by explicit config and runtime-registry authorization (default deny).
         When true, the gateway hosts the single dispatcher for this profile:
         no separate `hermes kanban daemon` process needed. When false, the
         loop exits immediately and an external daemon is expected.
@@ -779,10 +794,13 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", False):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
+            return
+        if not _registry_authorizes_dispatcher():
+            logger.warning("kanban dispatcher: profile is not dispatcher-authorized; disabled")
             return
 
         try:
@@ -791,9 +809,8 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
+        # Single-dispatcher backstop. The registry is authoritative, while the
+        # lock also protects against same-profile restart races; concurrent dispatchers double reclaim
         # frequency, double claim-attempt events, and — with
         # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root

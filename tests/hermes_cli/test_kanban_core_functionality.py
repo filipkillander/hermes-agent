@@ -3418,14 +3418,12 @@ def test_legacy_migration_both_columns_already_present(tmp_path):
 # Gateway-embedded dispatcher: config, CLI warnings, daemon deprecation stub
 # ---------------------------------------------------------------------------
 
-def test_config_default_dispatch_in_gateway_is_true():
-    """Default config must enable gateway-embedded dispatch out of the box.
-    Flipping this default to false is a user-visible behaviour change and
-    should require a conscious migration."""
+def test_config_default_dispatch_in_gateway_is_false():
+    """Worker spawning is privileged and must be explicitly authorized."""
     from hermes_cli.config import DEFAULT_CONFIG
     kanban = DEFAULT_CONFIG.get("kanban", {})
-    assert kanban.get("dispatch_in_gateway") is True, (
-        "kanban.dispatch_in_gateway default should be True; got "
+    assert kanban.get("dispatch_in_gateway") is False, (
+        "kanban.dispatch_in_gateway default should be False; got "
         f"{kanban.get('dispatch_in_gateway')!r}"
     )
     interval = kanban.get("dispatch_interval_seconds")
@@ -3441,6 +3439,7 @@ def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
+    monkeypatch.setattr("hermes_cli.runtime_registry.dispatcher_authorized", lambda home: True)
     running, msg = kb_cli._check_dispatcher_presence()
     assert running is True
     # Either empty (if import failed defensively) or includes the pid.
@@ -3469,7 +3468,7 @@ def test_check_dispatcher_presence_warns_when_flag_off(monkeypatch):
     )
     running, msg = kb_cli._check_dispatcher_presence()
     assert running is False
-    assert "dispatch_in_gateway" in msg
+    assert "not authorized" in msg
 
 
 def test_check_dispatcher_presence_silent_on_probe_error(monkeypatch):
@@ -3520,6 +3519,7 @@ def test_cli_create_silent_when_gateway_up(kanban_home, monkeypatch, capsys):
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
+    monkeypatch.setattr("hermes_cli.runtime_registry.dispatcher_authorized", lambda home: True)
     ns = _make_create_ns(title="silent", assignee="worker")
     assert kb_cli._cmd_create(ns) == 0
     captured = capsys.readouterr()
@@ -3684,6 +3684,9 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._registry_authorizes_dispatcher", lambda: True
+    )
     corrupt_db = tmp_path / "kanban.db"
     corrupt_db.write_text("not sqlite", encoding="utf-8")
 
@@ -3778,6 +3781,9 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._registry_authorizes_dispatcher", lambda: True
+    )
     corrupt_db = tmp_path / "kanban.db"
     corrupt_db.write_text("not sqlite", encoding="utf-8")
 

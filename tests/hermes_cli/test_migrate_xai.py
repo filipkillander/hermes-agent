@@ -231,9 +231,8 @@ class TestUnreadableExistingConfig:
     def test_apply_refuses_to_overwrite_unreadable_config(self, trap_config: Path):
         """apply_migration must not clobber an existing config.yaml it can't
         read. It reads the file first (which raises on an unreadable file), and
-        the require_readable_config_before_write guard before the write is a
-        belt-and-suspenders backstop for the read-then-write window. Either way
-        the original bytes must survive."""
+        the transactional snapshot/CAS guard closes the read-then-write window.
+        Either way the original bytes must survive."""
         import os
 
         issues = find_retired_xai_refs(_parse(trap_config))

@@ -19,6 +19,8 @@ def _reset_server_globals():
     server._cfg_cache = None
     server._cfg_mtime = None
     server._cfg_path = None
+    server._cfg_base_hash = None
+    server._cfg_load_error = None
 
 
 def test_save_cfg_writes_to_override_aware_path(tmp_path):

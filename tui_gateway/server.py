@@ -139,6 +139,8 @@ _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
+_cfg_base_hash: str | None = None
+_cfg_load_error: str | None = None
 _session_resume_lock = threading.Lock()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
@@ -1937,10 +1939,8 @@ _INDICATOR_DEFAULT = "kaomoji"
 
 
 def _load_cfg() -> dict:
-    global _cfg_cache, _cfg_mtime, _cfg_path
+    global _cfg_cache, _cfg_mtime, _cfg_path, _cfg_base_hash, _cfg_load_error
     try:
-        import yaml
-
         # Honor a per-session profile override (see session.resume) so a resumed
         # remote profile loads ITS config (model, skills, prompt); otherwise the
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
@@ -1952,11 +1952,10 @@ def _load_cfg() -> dict:
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
                 return _apply_managed(copy.deepcopy(_cfg_cache))
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-        else:
-            data = {}
+        from hermes_cli.config import read_config_snapshot
+
+        snapshot = read_config_snapshot(p)
+        data = snapshot.data
         with _cfg_lock:
             # Cache the RAW user config (no managed overlay) so _save_cfg, which
             # writes _cfg_cache back to disk, never persists managed values into
@@ -1965,9 +1964,15 @@ def _load_cfg() -> dict:
             _cfg_cache = copy.deepcopy(data)
             _cfg_mtime = mtime
             _cfg_path = p
+            _cfg_base_hash = snapshot.content_hash
+            _cfg_load_error = None
         return _apply_managed(data)
-    except Exception:
-        pass
+    except Exception as exc:
+        with _cfg_lock:
+            _cfg_path = p if "p" in locals() else None
+            _cfg_load_error = str(exc)
+            _cfg_base_hash = None
+        logger.warning("Refusing mutable config snapshot: %s", exc)
     return {}
 
 
@@ -1988,7 +1993,7 @@ def _apply_managed(cfg: dict) -> dict:
 
 
 def _save_cfg(cfg: dict):
-    global _cfg_cache, _cfg_mtime, _cfg_path
+    global _cfg_cache, _cfg_mtime, _cfg_path, _cfg_base_hash, _cfg_load_error
 
     from hermes_cli.config import atomic_config_write
     from hermes_constants import get_hermes_home_override
@@ -2002,7 +2007,15 @@ def _save_cfg(cfg: dict):
     override = get_hermes_home_override()
     home = override if isinstance(override, str) and override else _hermes_home
     path = Path(home) / "config.yaml"
-    atomic_config_write(path, cfg)
+    with _cfg_lock:
+        expected_hash = _cfg_base_hash if _cfg_path == path else None
+        load_error = _cfg_load_error if _cfg_path in {None, path} else None
+    if load_error:
+        raise RuntimeError(
+            "Refusing to save config because the last read failed; repair or reload "
+            f"config.yaml first ({load_error})"
+        )
+    published_hash = atomic_config_write(path, cfg, expected_base_hash=expected_hash)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
         _cfg_path = path
@@ -2010,6 +2023,8 @@ def _save_cfg(cfg: dict):
             _cfg_mtime = path.stat().st_mtime
         except Exception:
             _cfg_mtime = None
+        _cfg_base_hash = published_hash
+        _cfg_load_error = None
 
 
 def _cwd_for_session_key(session_key: str) -> str:
