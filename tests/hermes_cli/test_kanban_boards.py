@@ -462,6 +462,78 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_BOARD"] == "default"
         assert env["HERMES_KANBAN_DB"] == str(fresh_home / "kanban.db")
 
+    def test_worker_spawn_env_is_capability_scoped(
+        self, fresh_home, monkeypatch
+    ):
+        """Parent credentials do not cross profiles without explicit config."""
+        captured = {}
+
+        class FakeProc:
+            pid = 24680
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.resolve_profile_env", lambda _name: str(fresh_home)
+        )
+        (fresh_home / "config.yaml").write_text(
+            "kanban:\n"
+            "  worker_env_capabilities:\n"
+            "    - ALLOWED_PROVIDER_API_KEY\n"
+            "    - BWS_ACCESS_TOKEN\n"
+            "    - DISCORD_BOT_TOKEN\n",
+            encoding="utf-8",
+        )
+
+        sentinels = {
+            "BWS_ACCESS_TOKEN": "parent-bws-bootstrap",
+            "DISCORD_BOT_TOKEN": "parent-discord-bot",
+            "TELEGRAM_BOT_TOKEN": "parent-telegram-bot",
+            "OPENROUTER_API_KEY": "parent-unallowed-provider",
+            "ALLOWED_PROVIDER_API_KEY": "parent-allowed-provider",
+        }
+        for name, value in sentinels.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
+        monkeypatch.setenv("TERMINAL_TIMEOUT", "900")
+
+        task = kb.Task(
+            id="t_scoped_env",
+            title="scoped env",
+            body=None,
+            assignee="worker",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock="claim-lock",
+            claim_expires=None,
+            tenant=None,
+        )
+        kb._default_spawn(task, str(fresh_home / "ws"))
+
+        env = captured["env"]
+        assert env["ALLOWED_PROVIDER_API_KEY"] == "parent-allowed-provider"
+        for forbidden in (
+            "BWS_ACCESS_TOKEN", "DISCORD_BOT_TOKEN", "TELEGRAM_BOT_TOKEN",
+            "OPENROUTER_API_KEY",
+        ):
+            assert forbidden not in env
+        assert env["PATH"] == os.environ["PATH"]
+        assert env["HOME"] == os.environ["HOME"]
+        assert env["SSH_AUTH_SOCK"] == "/tmp/fake-agent.sock"
+        assert env["TERMINAL_TIMEOUT"] == "900"
+        assert env["HERMES_HOME"] == str(fresh_home)
+        assert env["HERMES_PROFILE"] == "worker"
+        assert env["HERMES_KANBAN_TASK"] == "t_scoped_env"
+
 
 # ---------------------------------------------------------------------------
 # CLI surface
