@@ -253,7 +253,7 @@ def test_disk_cache_roundtrip_and_no_token_on_disk(monkeypatch, tmp_path):
 
     op.fetch_onepassword_secrets(
         references={"K": "op://V/I/F"}, cache_ttl_seconds=300,
-        binary=fake_op, home_path=tmp_path,
+        binary=fake_op, disk_cache_enabled=True, home_path=tmp_path,
     )
     assert calls["n"] == 1
 
@@ -269,9 +269,21 @@ def test_disk_cache_roundtrip_and_no_token_on_disk(monkeypatch, tmp_path):
     op._CACHE.clear()
     op.fetch_onepassword_secrets(
         references={"K": "op://V/I/F"}, cache_ttl_seconds=300,
-        binary=fake_op, home_path=tmp_path,
+        binary=fake_op, disk_cache_enabled=True, home_path=tmp_path,
     )
     assert calls["n"] == 1  # served from disk, op not re-invoked
+
+
+def test_plaintext_disk_cache_disabled_by_default(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("resolved"))
+
+    op.fetch_onepassword_secrets(
+        references={"K": "op://V/I/F"}, cache_ttl_seconds=300,
+        binary=fake_op, home_path=tmp_path,
+    )
+    assert not op._disk_cache_path(tmp_path).exists()
 
 
 def test_ttl_zero_disables_both_layers(monkeypatch, tmp_path):

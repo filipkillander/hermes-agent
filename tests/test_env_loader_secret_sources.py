@@ -274,3 +274,85 @@ def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypa
 
     # Coerced to the 300s default rather than raising ValueError.
     assert captured["cache_ttl_seconds"] == 300
+
+
+def test_failed_fetch_remains_retryable_until_success(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n  bitwarden:\n    enabled: true\n    project_id: fake\n",
+        encoding="utf-8",
+    )
+    from agent.secret_sources import registry as reg
+    from agent.secret_sources.base import ErrorKind, FetchResult
+
+    calls = {"n": 0}
+
+    def _apply(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            failed = FetchResult(
+                error="sensitive backend diagnostic",
+                error_kind=ErrorKind.NETWORK,
+            )
+            return reg.ApplyReport(sources=[
+                reg.SourceReport("bitwarden", "Bitwarden", failed)
+            ])
+        return reg.ApplyReport()
+
+    monkeypatch.setattr(reg, "apply_all", _apply)
+    key = str(tmp_path.resolve())
+
+    env_loader._apply_external_secret_sources(tmp_path)
+    assert key not in env_loader._APPLIED_HOMES
+    env_loader._apply_external_secret_sources(tmp_path)
+    assert calls["n"] == 2
+    assert key in env_loader._APPLIED_HOMES
+
+
+def test_startup_logging_is_count_only(tmp_path, monkeypatch, capsys):
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n  bitwarden:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    from agent.secret_sources import registry as reg
+    from agent.secret_sources.base import ErrorKind, FetchResult
+
+    result = FetchResult(
+        warnings=["SECRET_NAME had forbidden value super-secret-value"]
+    )
+    source = reg.SourceReport(
+        "bitwarden", "Bitwarden", result,
+        applied=["SECRET_NAME"],
+    )
+    report = reg.ApplyReport(
+        sources=[source],
+        conflicts=["SECRET_NAME conflicts with super-secret-value"],
+    )
+    monkeypatch.setattr(reg, "apply_all", lambda *a, **k: report)
+
+    env_loader._apply_external_secret_sources(tmp_path)
+    stderr = capsys.readouterr().err
+    assert "applied 1 secret" in stderr
+    assert "1 warning suppressed" in stderr
+    assert "1 conflict suppressed" in stderr
+    assert "SECRET_NAME" not in stderr
+    assert "super-secret-value" not in stderr
+
+
+def test_read_only_diagnostic_skips_secret_bootstrap_and_file_repair(
+    tmp_path, monkeypatch
+):
+    (tmp_path / ".env").write_text("DIAGNOSTIC_ONLY=value\n", encoding="utf-8")
+    touched = {"bootstrap": 0, "repair": 0}
+    monkeypatch.setenv("HERMES_SKIP_EXTERNAL_SECRETS", "1")
+    monkeypatch.setenv("HERMES_ENV_LOADER_READ_ONLY", "1")
+    monkeypatch.setattr(
+        env_loader, "_apply_external_secret_sources",
+        lambda *_a, **_k: touched.__setitem__("bootstrap", touched["bootstrap"] + 1),
+    )
+    monkeypatch.setattr(
+        env_loader, "_sanitize_env_file_if_needed",
+        lambda *_a, **_k: touched.__setitem__("repair", touched["repair"] + 1),
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+    assert touched == {"bootstrap": 0, "repair": 0}

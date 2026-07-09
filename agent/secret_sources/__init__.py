@@ -35,6 +35,7 @@ from agent.secret_sources.base import (  # noqa: F401
     ErrorKind,
     FetchResult,
     SecretSource,
+    build_capability_env,
     is_valid_env_name,
     run_secret_cli,
     scrub_ansi,

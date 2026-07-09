@@ -3111,6 +3111,16 @@ DEFAULT_CONFIG = {
             "project_id": "",
             # Seconds to cache fetched secrets in-process.  0 disables.
             "cache_ttl_seconds": 300,
+            # Legacy cross-process cache contains plaintext secret values.
+            # It is disabled by default; prefer one fetch per long-lived
+            # process. Existing operators can opt in temporarily during
+            # migration, then remove old cache/bws_cache.json files separately.
+            "disk_cache_enabled": False,
+            # Optional least-privilege policy.  When allowed_env_vars is set,
+            # every other project key is ignored. Missing required_env_vars
+            # abort the whole source before any environment mutation.
+            "allowed_env_vars": None,
+            "required_env_vars": [],
             # When True, BSM values overwrite existing env vars.  Default
             # True because the point of using BSM is centralized rotation —
             # if .env had the final say, rotating in Bitwarden wouldn't
@@ -3149,9 +3159,12 @@ DEFAULT_CONFIG = {
             # verbatim (PATH is not consulted) — pin this to avoid trusting
             # whatever `op` appears first on PATH.  Empty = resolve via PATH.
             "binary_path": "",
-            # Seconds to cache resolved values in-process and on disk.  0
-            # disables BOTH cache layers (no values are written to disk).
+            # Seconds to cache resolved values in-process.  0 disables.
             "cache_ttl_seconds": 300,
+            # Legacy plaintext cross-process cache; disabled by default.
+            "disk_cache_enabled": False,
+            "allowed_env_vars": None,
+            "required_env_vars": [],
             # When True (default), resolved values overwrite existing env
             # vars so rotating a secret in 1Password takes effect on next
             # start.  Flip to false to let .env / shell exports win locally.

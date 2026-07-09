@@ -316,6 +316,7 @@ def fetch_onepassword_secrets(
     binary_path: str = "",
     use_cache: bool = True,
     cache_ttl_seconds: float = 300,
+    disk_cache_enabled: bool = False,
     home_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
@@ -344,11 +345,12 @@ def fetch_onepassword_secrets(
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return dict(cached.secrets), warnings
-        disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
-        if disk_cached is not None:
-            # Promote into L1 so later fetches in this process skip the disk read.
-            _CACHE[cache_key] = disk_cached
-            return dict(disk_cached.secrets), warnings
+        if disk_cache_enabled:
+            disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
+            if disk_cached is not None:
+                # Promote into L1 so later fetches in this process skip the disk read.
+                _CACHE[cache_key] = disk_cached
+                return dict(disk_cached.secrets), warnings
 
     op = binary or find_op(binary_path)
     if op is None:
@@ -372,7 +374,8 @@ def fetch_onepassword_secrets(
     if use_cache and not read_errors and secrets:
         entry = CachedFetch(secrets=dict(secrets), fetched_at=time.time())
         _CACHE[cache_key] = entry
-        _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
+        if disk_cache_enabled:
+            _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
 
     return secrets, warnings
 
@@ -391,6 +394,7 @@ def apply_onepassword_secrets(
     binary_path: str = "",
     override_existing: bool = True,
     cache_ttl_seconds: float = 300,
+    disk_cache_enabled: bool = False,
     home_path: Optional[Path] = None,
 ) -> FetchResult:
     """Resolve configured ``op://`` references and set them on ``os.environ``.
@@ -452,6 +456,7 @@ def apply_onepassword_secrets(
             token_env=service_account_token_env,
             binary=binary,
             cache_ttl_seconds=cache_ttl_seconds,
+            disk_cache_enabled=disk_cache_enabled,
             home_path=home_path,
         )
     except RuntimeError as exc:
@@ -536,8 +541,20 @@ class OnePasswordSource(SecretSource):
                 "default": "",
             },
             "cache_ttl_seconds": {
-                "description": "Disk+memory cache TTL; 0 disables",
+                "description": "In-memory cache TTL; 0 disables",
                 "default": 300,
+            },
+            "disk_cache_enabled": {
+                "description": "Legacy plaintext cross-process cache (not recommended)",
+                "default": False,
+            },
+            "allowed_env_vars": {
+                "description": "Optional allowlist for resolved environment names",
+                "default": None,
+            },
+            "required_env_vars": {
+                "description": "Required names; missing names abort this source atomically",
+                "default": [],
             },
             "override_existing": {
                 "description": "Resolved values overwrite .env/shell values",
@@ -596,6 +613,7 @@ class OnePasswordSource(SecretSource):
                 ),
                 binary=binary,
                 cache_ttl_seconds=ttl,
+                disk_cache_enabled=bool(cfg.get("disk_cache_enabled", False)),
                 home_path=home_path,
             )
         except RuntimeError as exc:

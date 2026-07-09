@@ -71,6 +71,9 @@ class SourceReport:
     skipped_claimed: List[str] = field(default_factory=list)    # earlier source won
     skipped_protected: List[str] = field(default_factory=list)  # bootstrap-auth guard
     skipped_invalid: List[str] = field(default_factory=list)    # bad env-var name
+    skipped_not_allowed: List[str] = field(default_factory=list)
+    missing_required_count: int = 0
+    policy_error: Optional[str] = None
 
 
 @dataclass
@@ -84,6 +87,16 @@ class ApplyReport:
     @property
     def applied_any(self) -> bool:
         return bool(self.provenance)
+
+    @property
+    def successful(self) -> bool:
+        """Whether every enabled source fetched and passed policy checks.
+
+        An empty report is a successful terminal state: no source was enabled.
+        Loader callers may memoize only this state (or a fully successful
+        report), which leaves transient failures retryable in-process.
+        """
+        return all(sr.result.ok and sr.policy_error is None for sr in self.sources)
 
 
 # ---------------------------------------------------------------------------
@@ -336,11 +349,52 @@ def apply_all(secrets_cfg: dict, home_path: Path,
         except Exception:  # noqa: BLE001
             override = False
 
+        allowed_cfg = cfg.get("allowed_env_vars")
+        required_cfg = cfg.get("required_env_vars", [])
+        allowed: Optional[set[str]] = None
+        if allowed_cfg is not None:
+            if not isinstance(allowed_cfg, list) or not all(
+                isinstance(item, str) and is_valid_env_name(item)
+                for item in allowed_cfg
+            ):
+                sr.policy_error = "invalid allowed_env_vars policy"
+                continue
+            allowed = set(allowed_cfg)
+        if not isinstance(required_cfg, list) or not all(
+            isinstance(item, str) and is_valid_env_name(item)
+            for item in required_cfg
+        ):
+            sr.policy_error = "invalid required_env_vars policy"
+            continue
+        required = set(required_cfg)
+        if allowed is not None and not required.issubset(allowed):
+            sr.policy_error = "required_env_vars must be included in allowed_env_vars"
+            continue
+
+        available = {
+            var for var, value in result.secrets.items()
+            if isinstance(var, str)
+            and isinstance(value, str)
+            and is_valid_env_name(var)
+            and (allowed is None or var in allowed)
+            and var not in protected
+        }
+        missing = required - available
+        if missing:
+            # Fail the entire source before any env mutation.  Counts are safe
+            # to report; names stay inside the in-memory report only.
+            sr.missing_required_count = len(missing)
+            sr.policy_error = "required secrets are missing"
+            continue
+
         for var, value in result.secrets.items():
             if not isinstance(var, str) or not isinstance(value, str):
                 continue
             if not is_valid_env_name(var):
                 sr.skipped_invalid.append(var)
+                continue
+            if allowed is not None and var not in allowed:
+                sr.skipped_not_allowed.append(var)
                 continue
             if var in protected:
                 sr.skipped_protected.append(var)

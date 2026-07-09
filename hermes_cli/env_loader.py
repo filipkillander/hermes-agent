@@ -29,7 +29,9 @@ _WARNED_KEYS: set[str] = set()
 # the .env case and they don't know Bitwarden is wired up).
 _SECRET_SOURCES: dict[str, str] = {}
 
-# HERMES_HOME paths we've already pulled external secrets for during this
+# HERMES_HOME paths whose external-secret bootstrap reached a successful or
+# explicitly terminal state during this process.  Failed attempts are never
+# inserted, so a later call can retry after a transient BWS/Keychain outage.
 # process.  ``load_hermes_dotenv()`` is called at module-import time from
 # several hot modules (cli.py, hermes_cli/main.py, run_agent.py,
 # trajectory_compressor.py, gateway/run.py, ...), so without this guard the
@@ -231,15 +233,17 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
+    read_only = os.getenv("HERMES_ENV_LOADER_READ_ONLY") == "1"
+    skip_external = os.getenv("HERMES_SKIP_EXTERNAL_SECRETS") == "1"
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
     # Fix corrupted .env files before python-dotenv parses them (#8908).
-    if user_env.exists():
+    if user_env.exists() and not read_only:
         _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
+    if project_env_path and project_env_path.exists() and not read_only:
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
@@ -264,13 +268,14 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
-    _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+    if not skip_external:
+        _apply_external_secret_sources(home_path)
+    _apply_managed_env(repair_files=not read_only)
 
     return loaded
 
 
-def _apply_managed_env() -> None:
+def _apply_managed_env(*, repair_files: bool = True) -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell.
 
     Managed scope is machine-global (independent of HERMES_HOME / profile). v1
@@ -298,7 +303,8 @@ def _apply_managed_env() -> None:
     managed_env = managed_dir / ".env"
     if not managed_env.exists():
         return
-    _sanitize_env_file_if_needed(managed_env)
+    if repair_files:
+        _sanitize_env_file_if_needed(managed_env)
     _load_dotenv_with_fallback(managed_env, override=True)
 
 
@@ -328,13 +334,12 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     home_key = str(Path(home_path).resolve())
     if home_key in _APPLIED_HOMES:
         return
-    _APPLIED_HOMES.add(home_key)
-
     try:
         cfg = _load_secrets_config(home_path)
     except Exception:  # noqa: BLE001 — config errors must not block startup
         return
     if not cfg:
+        _APPLIED_HOMES.add(home_key)  # valid config with no secret sources
         return
 
     try:
@@ -346,6 +351,12 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         report = apply_all(cfg, home_path)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
         return
+
+    # Memoize only successful/terminal outcomes.  A timeout, unavailable
+    # bootstrap token, policy failure, or backend error remains retryable on a
+    # later load_hermes_dotenv() call in the same process.
+    if report.successful:
+        _APPLIED_HOMES.add(home_key)
 
     if report.applied_any:
         # Re-run the ASCII sanitization pass: vault values are
@@ -363,16 +374,30 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         if src.applied:
             print(
                 f"  {src.label}: applied {len(src.applied)} "
-                f"secret{'s' if len(src.applied) != 1 else ''} "
-                f"({', '.join(sorted(src.applied))})",
+                f"secret{'s' if len(src.applied) != 1 else ''}",
                 file=sys.stderr,
             )
         if src.result.error:
-            print(f"  {src.label}: {src.result.error}", file=sys.stderr)
-        for warn in src.result.warnings:
-            print(f"  {src.label}: {warn}", file=sys.stderr)
-    for conflict in report.conflicts:
-        print(f"  Secret sources: {conflict}", file=sys.stderr)
+            kind = getattr(src.result.error_kind, "value", None) or "unclassified"
+            print(f"  {src.label}: fetch failed ({kind})", file=sys.stderr)
+        if src.policy_error:
+            detail = (
+                f", missing {src.missing_required_count} required"
+                if src.missing_required_count else ""
+            )
+            print(f"  {src.label}: policy check failed{detail}", file=sys.stderr)
+        if src.result.warnings:
+            print(
+                f"  {src.label}: {len(src.result.warnings)} warning"
+                f"{'s' if len(src.result.warnings) != 1 else ''} suppressed",
+                file=sys.stderr,
+            )
+    if report.conflicts:
+        print(
+            f"  Secret sources: {len(report.conflicts)} conflict"
+            f"{'s' if len(report.conflicts) != 1 else ''} suppressed",
+            file=sys.stderr,
+        )
 
 
 def _load_secrets_config(home_path: Path) -> dict:
@@ -385,12 +410,16 @@ def _load_secrets_config(home_path: Path) -> dict:
     if not config_path.exists():
         return {}
     try:
-        import yaml  # type: ignore
-    except ImportError:
+        import yaml  # type: ignore  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("YAML support unavailable") from exc
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = fast_safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError("config root must be a mapping")
+    secrets = data.get("secrets")
+    if secrets is None:
         return {}
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
-    except Exception:  # noqa: BLE001
-        return {}
-    return data.get("secrets") or {}
+    if not isinstance(secrets, dict):
+        raise ValueError("secrets config must be a mapping")
+    return secrets

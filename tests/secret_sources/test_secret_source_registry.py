@@ -24,6 +24,7 @@ from agent.secret_sources.base import (  # noqa: E402
     ErrorKind,
     FetchResult,
     SecretSource,
+    build_capability_env,
     is_valid_env_name,
     run_secret_cli,
     scrub_ansi,
@@ -245,6 +246,44 @@ class TestApplyAll:
         assert env["K"] == "v"
         broken = [s for s in report.sources if s.name == "broken"][0]
         assert broken.result.error_kind is ErrorKind.NETWORK
+        assert report.successful is False
+
+    def test_allowlist_applies_only_explicit_capabilities(self, tmp_path):
+        reg.register_source(_make_source(secrets={"ALLOWED": "a", "EXTRA": "x"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {"enabled": True, "allowed_env_vars": ["ALLOWED"]}},
+            tmp_path, environ=env,
+        )
+        assert env == {"ALLOWED": "a"}
+        assert report.sources[0].skipped_not_allowed == ["EXTRA"]
+        assert report.successful is True
+
+    def test_missing_required_set_aborts_source_before_any_apply(self, tmp_path):
+        reg.register_source(_make_source(secrets={"PRESENT": "value"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {
+                "enabled": True,
+                "allowed_env_vars": ["PRESENT", "MISSING"],
+                "required_env_vars": ["PRESENT", "MISSING"],
+            }},
+            tmp_path, environ=env,
+        )
+        assert env == {}
+        assert report.sources[0].missing_required_count == 1
+        assert report.sources[0].policy_error
+        assert report.successful is False
+
+    def test_invalid_policy_is_fail_closed(self, tmp_path):
+        reg.register_source(_make_source(secrets={"PRESENT": "value"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {"enabled": True, "allowed_env_vars": "PRESENT"}},
+            tmp_path, environ=env,
+        )
+        assert env == {}
+        assert report.successful is False
 
     def test_raising_fetch_contained_as_internal_error(self, tmp_path):
         def _explode(cfg, home):
@@ -325,6 +364,18 @@ class TestHelpers:
         assert not any(k.endswith(("_API_KEY", "_TOKEN", "_SECRET"))
                        for k in child_env)
         assert "NO_COLOR" in child_env
+
+    def test_build_capability_env_never_inherits_unrequested_secrets(self):
+        parent = {
+            "PATH": "/bin",
+            "WORKER_ALLOWED_TOKEN": "allowed",
+            "LUMI_BOT_TOKEN": "must-not-cross-boundary",
+        }
+        child = build_capability_env(
+            ["WORKER_ALLOWED_TOKEN"], source_env=parent
+        )
+        assert child["WORKER_ALLOWED_TOKEN"] == "allowed"
+        assert "LUMI_BOT_TOKEN" not in child
 
     def test_run_secret_cli_allowlist_passes_named_vars(self, monkeypatch):
         monkeypatch.setenv("MY_AUTH_TOKEN", "tok")
@@ -429,6 +480,34 @@ class TestBitwardenSource:
             {"enabled": True, "project_id": "proj"}, tmp_path
         )
         assert result.error_kind is ErrorKind.AUTH_FAILED
+
+    def test_fake_bws_and_keychain_fixtures_cover_internal_bootstrap(
+        self, tmp_path, monkeypatch, fake_bws_factory, fake_keychain
+    ):
+        import agent.secret_sources.bitwarden as bw
+
+        monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
+        binary = fake_bws_factory([{"key": "WORKER_CAPABILITY", "value": "ok"}])
+        monkeypatch.setattr(bw, "find_bws", lambda **kw: binary)
+        keychain_calls = fake_keychain("fixture-bootstrap-token")
+
+        result = BitwardenSource().fetch(
+            {
+                "enabled": True,
+                "project_id": "fixture-project",
+                "cache_ttl_seconds": 0,
+                "access_token_keychain": {
+                    "enabled": True,
+                    "service": "fixture-service",
+                    "account": "fixture-account",
+                },
+            },
+            tmp_path,
+        )
+        assert result.ok
+        assert result.secrets == {"WORKER_CAPABILITY": "ok"}
+        assert keychain_calls == [("fixture-service", "fixture-account")]
+        assert bw.bws_binary_version(binary) == bw._BWS_VERSION
 
     def test_e2e_through_orchestrator(self, tmp_path, monkeypatch):
         """Full path: registry → BitwardenSource → env, with fetch mocked."""
