@@ -728,8 +728,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     (preserves code-block boundaries, adds part indicators).
     """
     from gateway.config import Platform
+    from gateway.delivery_envelope import prepare_platform_delivery_content
 
     media_files = media_files or []
+
+    # Cron, worker, and no-agent sends can run outside the gateway process and
+    # therefore never reach a live adapter. Normalize before standalone
+    # chunking so every chunk derives from the same deterministic document.
+    if platform in {Platform.DISCORD, Platform.TELEGRAM} and (message.strip() or not media_files):
+        message = prepare_platform_delivery_content(
+            message, surface=platform.value, config=pconfig
+        )
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
