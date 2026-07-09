@@ -12,7 +12,11 @@ from hermes_cli.config import (
     read_config_snapshot,
 )
 from hermes_cli.restart_coordinator import RestartCoordinator, RestartRejected
-from hermes_cli.runtime_registry import RegistryError, load_runtime_registry
+from hermes_cli.runtime_registry import (
+    RegistryError,
+    credential_fingerprint,
+    load_runtime_registry,
+)
 
 
 def _registry_file(tmp_path: Path, *, dispatcher: bool = True) -> Path:
@@ -114,6 +118,7 @@ def test_readiness_rejects_wrong_profile_even_when_running():
             "port": 8642,
             "registry_revision": "r1",
             "registry_verified": True,
+            "secret_readiness": {"state": "ready", "ready": True},
             "required_platforms": [],
         },
         "platforms": {},
@@ -157,12 +162,76 @@ def _health_payload(profile, registry, pid, config_revision, active_agents=0):
             "port": profile.port,
             "registry_revision": registry.revision,
             "registry_verified": True,
+            "secret_readiness": {"state": "ready", "ready": True},
             "required_platforms": list(profile.required_platforms),
             "allowed_platforms": list(profile.allowed_platforms),
             "config_revision": config_revision,
             "code_revision": profile.release_revision,
         },
     }
+
+
+def test_readiness_fails_closed_when_external_secrets_are_not_ready():
+    payload = {
+        "gateway_state": "running",
+        "runtime_identity": {
+            "profile": "lumi",
+            "role": "external_gateway",
+            "service_label": "ai.hermes.gateway-lumi",
+            "port": 8642,
+            "registry_revision": "r1",
+            "registry_verified": True,
+            "secret_readiness": {
+                "state": "degraded",
+                "ready": False,
+                "failed_sources": 1,
+            },
+            "required_platforms": [],
+            "allowed_platforms": [],
+        },
+        "platforms": {},
+    }
+    ready, failures = evaluate_runtime_readiness(payload)
+    assert ready is False
+    assert "secret_sources_not_ready" in failures
+
+
+def test_keyed_bot_fingerprint_and_readiness_mismatch(tmp_path):
+    key_path = tmp_path / "fingerprint.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o600)
+    expected = credential_fingerprint("bot-token-a", key_path=key_path)
+    other = credential_fingerprint("bot-token-b", key_path=key_path)
+    assert expected and expected.startswith("hmac-sha256:")
+    assert expected != other
+    assert "bot-token" not in expected
+
+    payload = {
+        "gateway_state": "running",
+        "runtime_identity": {
+            "profile": "lumi",
+            "role": "external_gateway",
+            "registry_verified": True,
+            "secret_readiness": {"state": "ready", "ready": True},
+            "required_platforms": ["telegram"],
+            "allowed_platforms": ["telegram"],
+            "bot_fingerprints": {"telegram": expected},
+        },
+        "platforms": {
+            "telegram": {
+                "state": "connected",
+                "credential_fingerprint": other,
+            }
+        },
+    }
+    ready, failures = evaluate_runtime_readiness(payload)
+    assert ready is False
+    assert "bot_fingerprint_mismatch:telegram" in failures
+
+    payload["platforms"]["telegram"]["credential_fingerprint"] = expected
+    ready, failures = evaluate_runtime_readiness(payload)
+    assert ready is True
+    assert failures == []
 
 
 def test_restart_coordinator_proves_identity_and_stability(tmp_path):

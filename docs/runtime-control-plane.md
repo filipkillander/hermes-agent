@@ -21,6 +21,8 @@ profiles:
     dispatcher: true
     allowed_platforms: [telegram, discord]
     required_platforms: [telegram]
+    bot_fingerprints:
+      telegram: hmac-sha256:<64 lowercase hex>
     release_revision: release-2026.07.10
   coder:
     role: internal_worker
@@ -40,7 +42,9 @@ Secure defaults are deliberate:
 
 `/health/detailed` returns `runtime_identity`, `ready`, and
 `readiness_failures`. Readiness requires a registry-verified external gateway,
-`gateway_state=running`, and every required platform connected. Operators must
+`gateway_state=running`, successful count-only external-secret bootstrap, every
+required platform connected, and every configured bot fingerprint matching.
+Operators must
 compare profile, service label, port, registry revision, config revision, and
 optionally release revision to their expected values; HTTP 200 alone is only
 liveness.
@@ -55,8 +59,8 @@ python -m hermes_cli.restart_coordinator primary
 
 The coordinator locks per profile, validates config, proves service PID = port
 owner = health PID, defers active work, records at most two attempts per 30
-minutes, delegates restart to launchd, and requires three stable postflight
-probes (the production default is six), with bounded exponential backoff for
+minutes, delegates restart to launchd, and requires six stable postflight
+probes, with bounded exponential backoff for
 failed probes. It never signals a PID or kills a process found only by port. If a
 listener cannot prove the configured identity, the operation is rejected for
 operator investigation.
@@ -66,10 +70,13 @@ loopback (`127.0.0.1` or `::1`); forwarded headers are ignored. Non-loopback
 peers still require the API bearer. The local coordinator therefore does not
 inherit `API_SERVER_KEY` or another gateway credential.
 
-Bot fingerprints and secret-source readiness are intentionally schema hooks in
-this G1 control plane, not fabricated signals. G2 must supply keyed bot
-fingerprints and count-only secret-source readiness from the isolated loader;
-only then should operators add `bot_fingerprints` and make those checks hard
-readiness gates. Until that wiring exists, identity readiness covers registry,
-profile, role, service, port, config/release revision, allowed platforms, and
-required platform connection state without reading or logging credentials.
+Secret-source readiness is exported as state plus counts for enabled, applied,
+failed, and missing-required items. Secret names and values never enter runtime
+status. A failed fetch/policy remains retryable inside the process but makes
+readiness fail closed.
+
+Bot identity uses keyed HMAC-SHA256. The local key defaults to
+`$HERMES_ROOT/control-plane/bot-fingerprint.key`, must contain at least 32 bytes,
+and must be mode 0600. Registry generation and gateway runtime use the same
+key. If the key is missing or too open, no fingerprint is emitted and readiness
+fails closed; raw tokens and ordinary token hashes are never persisted.

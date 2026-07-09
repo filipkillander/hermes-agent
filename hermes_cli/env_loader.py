@@ -40,6 +40,11 @@ _SECRET_SOURCES: dict[str, str] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
+# Count-only readiness for lifecycle/control-plane probes. Values and secret
+# names never enter this structure. Keyed by resolved HERMES_HOME so a
+# multi-profile process cannot report one profile's bootstrap state as another.
+_SECRET_READINESS: dict[str, dict[str, int | str | bool]] = {}
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -65,6 +70,45 @@ def reset_secret_source_cache() -> None:
     that want to refresh after a config change.
     """
     _APPLIED_HOMES.clear()
+    _SECRET_READINESS.clear()
+
+
+def get_external_secret_readiness(
+    hermes_home: str | Path | None = None,
+) -> dict[str, int | str | bool]:
+    """Return non-secret, count-only bootstrap readiness for one profile."""
+    home = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    state = _SECRET_READINESS.get(str(home.resolve()))
+    if state is None:
+        return {
+            "state": "not_observed",
+            "ready": False,
+            "enabled_sources": 0,
+            "applied_count": 0,
+            "failed_sources": 0,
+            "missing_required_count": 0,
+        }
+    return dict(state)
+
+
+def _record_secret_readiness(
+    home_path: Path,
+    *,
+    state: str,
+    ready: bool,
+    enabled_sources: int = 0,
+    applied_count: int = 0,
+    failed_sources: int = 0,
+    missing_required_count: int = 0,
+) -> None:
+    _SECRET_READINESS[str(Path(home_path).resolve())] = {
+        "state": state,
+        "ready": ready,
+        "enabled_sources": max(0, int(enabled_sources)),
+        "applied_count": max(0, int(applied_count)),
+        "failed_sources": max(0, int(failed_sources)),
+        "missing_required_count": max(0, int(missing_required_count)),
+    }
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -337,20 +381,47 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     try:
         cfg = _load_secrets_config(home_path)
     except Exception:  # noqa: BLE001 — config errors must not block startup
+        _record_secret_readiness(
+            home_path, state="config_error", ready=False, failed_sources=1
+        )
         return
     if not cfg:
         _APPLIED_HOMES.add(home_key)  # valid config with no secret sources
+        _record_secret_readiness(home_path, state="disabled", ready=True)
         return
 
     try:
         from agent.secret_sources.registry import apply_all
     except ImportError:
+        _record_secret_readiness(
+            home_path, state="loader_unavailable", ready=False, failed_sources=1
+        )
         return
 
     try:
         report = apply_all(cfg, home_path)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
+        _record_secret_readiness(
+            home_path, state="loader_error", ready=False, failed_sources=1
+        )
         return
+
+    failed_sources = sum(
+        1
+        for source in report.sources
+        if not source.result.ok or source.policy_error is not None
+    )
+    _record_secret_readiness(
+        home_path,
+        state="ready" if report.successful else "degraded",
+        ready=report.successful,
+        enabled_sources=len(report.sources),
+        applied_count=sum(len(source.applied) for source in report.sources),
+        failed_sources=failed_sources,
+        missing_required_count=sum(
+            int(source.missing_required_count) for source in report.sources
+        ),
+    )
 
     # Memoize only successful/terminal outcomes.  A timeout, unavailable
     # bootstrap token, policy failure, or backend error remains retryable on a

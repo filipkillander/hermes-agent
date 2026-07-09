@@ -779,6 +779,7 @@ def write_runtime_status(
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
+    credential_fingerprint: Any = _UNSET,
     served_profiles: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
@@ -820,6 +821,11 @@ def write_runtime_status(
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
+        if credential_fingerprint is not _UNSET:
+            if credential_fingerprint is None:
+                platform_payload.pop("credential_fingerprint", None)
+            else:
+                platform_payload["credential_fingerprint"] = credential_fingerprint
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
 
@@ -851,6 +857,9 @@ def evaluate_runtime_readiness(
         failures.append("registry_unverified")
     if identity.get("role") != "external_gateway":
         failures.append("wrong_runtime_role")
+    secret_readiness = identity.get("secret_readiness")
+    if not isinstance(secret_readiness, dict) or secret_readiness.get("ready") is not True:
+        failures.append("secret_sources_not_ready")
     comparisons = (
         (expected_profile, identity.get("profile"), "profile_mismatch"),
         (expected_service_label, identity.get("service_label"), "service_label_mismatch"),
@@ -872,6 +881,15 @@ def evaluate_runtime_readiness(
         state = platforms.get(platform, {})
         if not isinstance(state, dict) or state.get("state") != "connected":
             failures.append(f"required_platform_disconnected:{platform}")
+    expected_fingerprints = identity.get("bot_fingerprints") or {}
+    if not isinstance(expected_fingerprints, dict):
+        failures.append("invalid_bot_fingerprint_policy")
+    else:
+        for platform, expected in expected_fingerprints.items():
+            state = platforms.get(platform, {})
+            actual = state.get("credential_fingerprint") if isinstance(state, dict) else None
+            if actual != expected:
+                failures.append(f"bot_fingerprint_mismatch:{platform}")
     return not failures, failures
 
 
