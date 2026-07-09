@@ -1841,7 +1841,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        # Create the coroutine inside the worker. If submit()
+                        # itself rejects during shutdown, no abandoned
+                        # coroutine object is left to emit a RuntimeWarning.
+                        def _run_standalone_delivery():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                )
+                            )
+
+                        future = pool.submit(_run_standalone_delivery)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

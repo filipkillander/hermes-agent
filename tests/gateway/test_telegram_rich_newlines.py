@@ -1,7 +1,7 @@
 """Tests for rich-message newline normalization (issue #46070).
 
 When Bot API 10.1 ``sendRichMessage`` is available, slash-command responses
-are sent through the rich path with RAW markdown.  Standard Markdown treats
+are sent through the rich path with delivery-envelope markdown. Standard Markdown treats
 a lone ``\\n`` as a soft line break (renders as whitespace), so multi-line
 command output collapses into a single paragraph on Telegram.
 
@@ -119,14 +119,14 @@ class TestRichMessageNewlineNormalization:
 
 
 class TestRichMessageTableProtection:
-    """Hard-break injection must not corrupt GFM tables (rendered natively)."""
+    """Envelope-rendered table bullets retain deterministic hard breaks."""
 
-    def test_table_rows_keep_bare_newlines(self, adapter):
-        """Table block newlines must stay bare — no '  \\n' inside the table."""
+    def test_table_rows_are_rendered_before_newline_normalization(self, adapter):
         content = "| Col A | Col B |\n|-------|-------|\n| 1 | 2 |\n| 3 | 4 |"
         md = adapter._rich_message_payload(content)["markdown"]
-        assert "  \n" not in md
-        assert md == content
+        assert "|-------|" not in md
+        assert "**1**  \n• Col B: 2" in md
+        assert "**3**  \n• Col B: 4" in md
 
     def test_text_around_table_still_gets_hard_breaks(self, adapter):
         """Prose lines outside the table keep getting hard breaks."""
@@ -141,9 +141,7 @@ class TestRichMessageTableProtection:
         md = adapter._rich_message_payload(content)["markdown"]
         # Prose-to-prose newline becomes a hard break.
         assert "Intro line one  \nIntro line two" in md
-        # Table rows stay bare.
-        assert "| H1 | H2 |\n|----|----|\n| a | b |" in md
-        # Prose lines around the table still hard-break; only the table's own
-        # header/delimiter/data-row newlines stay bare.
-        assert "Intro line two  \n| H1 | H2 |" in md
-        assert "| a | b |  \nOutro line" in md
+        # The delivery envelope removes pipe-table syntax before rich render.
+        assert "|----|" not in md
+        assert "Intro line two  \n**a**" in md
+        assert "• H2: b  \nOutro line" in md

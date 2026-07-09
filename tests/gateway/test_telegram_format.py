@@ -463,23 +463,18 @@ class TestFormatMessageSpoiler:
 
 
 class TestFormatMessageBlockquote:
-    def test_blockquote_converted(self, adapter):
+    def test_blockquote_marker_removed_by_delivery_envelope(self, adapter):
         result = adapter.format_message("> This is a quote")
-        assert "> This is a quote" in result
-        # > must NOT be escaped
-        assert "\\>" not in result
+        assert result == "This is a quote"
 
     def test_blockquote_with_special_chars(self, adapter):
         result = adapter.format_message("> Hello (world)!")
-        assert "> Hello \\(world\\)\\!" in result
-        assert "\\>" not in result
+        assert result == "Hello \\(world\\)\\!"
 
     def test_blockquote_multiline(self, adapter):
         text = "> Line one\n> Line two"
         result = adapter.format_message(text)
-        assert "> Line one" in result
-        assert "> Line two" in result
-        assert "\\>" not in result
+        assert result == "Line one\nLine two"
 
     def test_blockquote_in_code_not_converted(self, adapter):
         result = adapter.format_message("```\n> not a quote\n```")
@@ -487,8 +482,7 @@ class TestFormatMessageBlockquote:
 
     def test_nested_blockquote(self, adapter):
         result = adapter.format_message(">> Nested quote")
-        assert ">> Nested quote" in result
-        assert "\\>" not in result
+        assert result == "Nested quote"
 
     def test_gt_in_middle_of_line_still_escaped(self, adapter):
         """Only > at line start is a blockquote; mid-line > should be escaped."""
@@ -512,9 +506,8 @@ class TestFormatMessageBlockquote:
     def test_regular_blockquote_with_pipes_escaped(self, adapter):
         """Regular blockquote ending with || should escape the pipes."""
         result = adapter.format_message("> not expandable||")
-        assert "> not expandable" in result
+        assert result.startswith("not expandable")
         assert "\\|" in result
-        assert "\\>" not in result
 
 
 # =========================================================================
