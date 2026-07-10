@@ -63,6 +63,30 @@ def test_config_compare_and_swap_rejects_stale_writer(tmp_path):
     assert "second" in path.read_text(encoding="utf-8")
 
 
+def test_atomic_config_default_sentinel_survives_module_reload(tmp_path):
+    """An imported writer must not mistake its old default for an expected hash."""
+    import subprocess
+    import sys
+    import textwrap
+
+    path = tmp_path / "config.yaml"
+    path.write_text("model: before\n", encoding="utf-8")
+
+    code = textwrap.dedent(
+        f"""
+        import importlib
+        from pathlib import Path
+        import hermes_cli.config as config_module
+        old_writer = config_module.atomic_config_write
+        importlib.reload(config_module)
+        old_writer(Path({str(path)!r}), {{"model": "after"}})
+        """
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+    assert path.read_text(encoding="utf-8") == "model: after\n"
+
+
 def test_config_candidate_schema_fails_before_publish(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text("model: valid\n", encoding="utf-8")

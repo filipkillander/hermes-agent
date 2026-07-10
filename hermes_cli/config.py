@@ -6658,7 +6658,12 @@ class ConfigTransactionError(RuntimeError):
     """A config mutation was rejected before the live file was replaced."""
 
 
-_EXPECTED_HASH_UNSET = object()
+# This sentinel must survive ``importlib.reload(hermes_cli.config)``.  Gateway
+# modules retain imported function objects across such reloads in tests and
+# plugin refreshes; an ``object()`` identity sentinel then becomes stale and
+# accidentally enables CAS with the stale object as the expected hash.  A
+# value outside the valid hash domain (SHA-256 hex or None) is reload-stable.
+_EXPECTED_HASH_UNSET = "__HERMES_CONFIG_HASH_UNSET__"
 
 
 @dataclass(frozen=True)
@@ -6808,7 +6813,7 @@ def atomic_config_write(
         with _config_write_lock(config_path):
             base = read_config_snapshot(config_path)
             if (
-                expected_base_hash is not _EXPECTED_HASH_UNSET
+                expected_base_hash != _EXPECTED_HASH_UNSET
                 and base.content_hash != expected_base_hash
             ):
                 raise ConfigTransactionError(
