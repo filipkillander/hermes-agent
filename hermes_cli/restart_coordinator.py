@@ -76,6 +76,30 @@ class LaunchdServiceDriver:
 
 def listening_pids(port: int) -> set[int]:
     """Return every PID listening on a TCP port; inability to inspect is fatal."""
+    if sys.platform == "darwin":
+        proc = subprocess.run(
+            [
+                "/usr/sbin/lsof",
+                "-nP",
+                "-a",
+                f"-iTCP:{port}",
+                "-sTCP:LISTEN",
+                "-t",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if proc.returncode == 1 and not proc.stdout.strip():
+            return set()
+        if proc.returncode != 0:
+            raise RestartRejected(f"Cannot prove owner of port {port} with lsof")
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if any(not line.isdigit() for line in lines):
+            raise RestartRejected(f"Port {port} ownership output is invalid")
+        return {int(line) for line in lines}
     try:
         conns = psutil.net_connections(kind="tcp")
     except (psutil.AccessDenied, psutil.Error) as exc:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -295,6 +296,61 @@ def test_restart_coordinator_proves_identity_and_stability(tmp_path):
     assert result.new_pid == 102
     assert result.stable_probes == 3
     assert driver.restart_calls == 1
+
+
+def test_macos_listener_probe_uses_fixed_lsof_and_parses_all_pids(monkeypatch):
+    from hermes_cli import restart_coordinator as module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "101\n202\n101\n", "")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert module.listening_pids(8643) == {101, 202}
+    argv, kwargs = calls[0]
+    assert argv == [
+        "/usr/sbin/lsof",
+        "-nP",
+        "-a",
+        "-iTCP:8643",
+        "-sTCP:LISTEN",
+        "-t",
+    ]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["timeout"] == 10
+
+
+def test_macos_listener_probe_fails_closed_on_invalid_output(monkeypatch):
+    from hermes_cli import restart_coordinator as module
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "not-a-pid\n", ""
+        ),
+    )
+
+    with pytest.raises(RestartRejected, match="ownership output is invalid"):
+        module.listening_pids(8643)
+
+
+def test_macos_listener_probe_treats_lsof_no_match_as_empty(monkeypatch):
+    from hermes_cli import restart_coordinator as module
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", ""),
+    )
+
+    assert module.listening_pids(8643) == set()
 
 
 def test_restart_coordinator_allows_only_preflight_release_transition(tmp_path):
