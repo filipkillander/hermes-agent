@@ -50,5 +50,7 @@ def test_version_and_help_do_not_invoke_bws_or_write_cache(tmp_path, argv):
         timeout=20,
     )
     assert proc.returncode == 0, proc.stderr
+    if argv in (["--version"], ["version"]):
+        assert f"Install directory: {Path(__file__).resolve().parents[1]}" in proc.stdout
     assert not marker.exists()
     assert not (home / "cache" / "bws_cache.json").exists()

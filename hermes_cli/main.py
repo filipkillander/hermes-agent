@@ -64,6 +64,10 @@ except ModuleNotFoundError:
 import os
 import sys
 
+# The version fast path runs before pathlib and the normal PROJECT_ROOT setup.
+# Keep its install-root lookup dependency-free and side-effect-free.
+_FAST_PROJECT_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
+
 
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
@@ -245,7 +249,7 @@ def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
     print(f"Hermes Agent v{__version__} ({__release_date__})")
-    print(f"Install directory: {PROJECT_ROOT}")
+    print(f"Install directory: {_FAST_PROJECT_ROOT}")
 
     print(f"Python: {sys.version.split()[0]}")
 
