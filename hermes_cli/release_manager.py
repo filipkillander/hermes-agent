@@ -36,6 +36,7 @@ _FORBIDDEN_NAMES = {
     "secrets.json",
 }
 _FORBIDDEN_PREFIXES = ("client_secret_",)
+_SECRET_FILE_SUFFIXES = {"", ".json", ".yaml", ".yml", ".toml", ".ini", ".txt"}
 _FORBIDDEN_DIRS = {".git", "backups", "cache", "logs", "sessions"}
 _MANIFEST = ".hermes-release.json"
 _SNAPSHOT_MANIFEST = "manifest.json"
@@ -74,9 +75,10 @@ def _forbidden_path(path: str | PurePosixPath) -> bool:
         return True
     name = parts[-1]
     lower = name.lower()
-    return lower in _FORBIDDEN_NAMES or any(
-        lower.startswith(prefix) for prefix in _FORBIDDEN_PREFIXES
+    prefixed_secret_file = any(lower.startswith(prefix) for prefix in _FORBIDDEN_PREFIXES) and (
+        PurePosixPath(lower).suffix in _SECRET_FILE_SUFFIXES
     )
+    return lower in _FORBIDDEN_NAMES or prefixed_secret_file
 
 
 def _sha256_file(path: Path) -> str:
