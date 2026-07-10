@@ -14,6 +14,7 @@ from gateway.channel_directory import (
     load_directory,
     _apply_channel_aliases,
     _build_from_sessions,
+    _build_from_sessions_db,
     _build_slack,
 )
 
@@ -279,6 +280,45 @@ class TestBuildFromSessions:
         assert "Coaching Chat" in names
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
+
+    def test_state_db_is_profile_scoped_and_read_only(self, tmp_path, monkeypatch):
+        state_path = tmp_path / "state.db"
+        state_path.touch()
+        captured = {}
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                captured.update(db_path=db_path, read_only=read_only)
+
+            def list_gateway_sessions(self, *, platform, active_only):
+                assert platform == "telegram"
+                assert active_only is False
+                return [{
+                    "origin_json": json.dumps({
+                        "chat_id": "profile-chat",
+                        "chat_name": "Profile Chat",
+                    }),
+                    "chat_type": "group",
+                }]
+
+            def close(self):
+                captured["closed"] = True
+
+        monkeypatch.setattr("hermes_state.SessionDB", FakeSessionDB)
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions_db("telegram")
+
+        assert captured == {
+            "db_path": state_path,
+            "read_only": True,
+            "closed": True,
+        }
+        assert entries == [{
+            "id": "profile-chat",
+            "name": "Profile Chat",
+            "type": "group",
+            "thread_id": None,
+        }]
 
 
 class TestFormatDirectoryForDisplay:
