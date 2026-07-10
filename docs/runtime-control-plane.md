@@ -65,6 +65,19 @@ failed probes. It never signals a PID or kills a process found only by port. If 
 listener cannot prove the configured identity, the operation is rejected for
 operator investigation.
 
+An intentional current/previous promotion or rollback changes the desired
+`release_revision` before restarting the still-old process. Use the narrow
+transition gate for that one operation:
+
+```text
+python -m hermes_cli.restart_coordinator primary --allow-release-transition
+```
+
+The flag ignores only `code_revision_mismatch` during preflight. Profile,
+registry, config, service/PID/port identity, secret/platform readiness, and
+active-work checks remain strict. Postflight always requires the desired
+registry revision, so a release that fails to activate cannot pass promotion.
+
 `/health/detailed` is secret-free and authless only when the actual TCP peer is
 loopback (`127.0.0.1` or `::1`); forwarded headers are ignored. Non-loopback
 peers still require the API bearer. The local coordinator therefore does not

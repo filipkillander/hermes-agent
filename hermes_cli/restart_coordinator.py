@@ -260,6 +260,8 @@ class RestartCoordinator:
         profile: ProfileRuntime,
         payload: dict[str, Any],
         config_revision: str,
+        *,
+        allow_code_revision_mismatch: bool = False,
     ) -> tuple[bool, list[str]]:
         ready, failures = evaluate_runtime_readiness(
             payload,
@@ -273,9 +275,25 @@ class RestartCoordinator:
             failures.append("config_revision_mismatch")
         if profile.release_revision and identity.get("code_revision") != profile.release_revision:
             failures.append("code_revision_mismatch")
+        if allow_code_revision_mismatch:
+            # Promotion/rollback preflight is expected to observe the OLD
+            # release. This narrow exception never applies to postflight and
+            # cannot suppress any other identity/readiness failure.
+            failures = [failure for failure in failures if failure != "code_revision_mismatch"]
         return not failures and ready, failures
 
-    def restart(self, profile_name: str) -> RestartResult:
+    def restart(
+        self,
+        profile_name: str,
+        *,
+        allow_release_transition: bool = False,
+    ) -> RestartResult:
+        """Restart one registry-owned gateway.
+
+        ``allow_release_transition`` permits only the expected old-vs-desired
+        code revision mismatch during preflight. Postflight always requires the
+        registry's desired release revision.
+        """
         profile = self.registry.require(profile_name)
         if not profile.restartable or profile.port is None or not profile.service_label or not profile.health_url:
             raise RestartRejected(f"Profile {profile_name} is not an authorized restartable gateway")
@@ -297,7 +315,12 @@ class RestartCoordinator:
 
             before = self.health_probe(profile.health_url, 3.0)
             if before is not None:
-                identity_ok, failures = self._validate_identity(profile, before, config_revision)
+                identity_ok, failures = self._validate_identity(
+                    profile,
+                    before,
+                    config_revision,
+                    allow_code_revision_mismatch=allow_release_transition,
+                )
                 if not identity_ok:
                     raise RestartRejected(f"Existing listener has wrong identity: {', '.join(failures)}")
                 health_pid = before.get("pid")
@@ -370,10 +393,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Identity-aware Hermes restart coordinator")
     parser.add_argument("profile", help="profile id from runtime-registry.yaml")
     parser.add_argument("--registry", type=Path, default=None)
+    parser.add_argument(
+        "--allow-release-transition",
+        action="store_true",
+        help=(
+            "allow only a preflight code-revision mismatch for an intentional "
+            "promotion/rollback; postflight remains strict"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         registry = load_runtime_registry(args.registry, required=True)
-        result = RestartCoordinator(registry).restart(args.profile)
+        result = RestartCoordinator(registry).restart(
+            args.profile,
+            allow_release_transition=args.allow_release_transition,
+        )
     except Exception as exc:
         print(f"restart rejected: {exc}", file=sys.stderr)
         return 2
