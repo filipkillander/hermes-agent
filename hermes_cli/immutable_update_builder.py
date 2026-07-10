@@ -82,6 +82,11 @@ for path in root.glob("lib/python*/site-packages/*.pth"):
         candidate = pathlib.Path(line)
         if candidate.is_absolute():
             candidate.resolve().relative_to(root)
+
+hermes_cli = importlib.import_module("hermes_cli")
+dashboard = pathlib.Path(hermes_cli.__file__).resolve().parent / "web_dist" / "index.html"
+if not dashboard.is_file() or dashboard.stat().st_size == 0:
+    raise SystemExit(21)
 """
 
 
@@ -445,6 +450,9 @@ class ImmutableUpdateBuilder:
             uv = uv_path or (Path(found) if (found := shutil.which("uv")) else None)
             if uv is None or not uv.is_file():
                 raise UpdateBuildError("uv_unavailable", "stage")
+            npm = Path(found) if (found := shutil.which("npm")) else None
+            if npm is None or not npm.is_file():
+                raise UpdateBuildError("npm_unavailable", "stage")
             build_command = [
                 sys.executable,
                 "-m",
@@ -452,6 +460,8 @@ class ImmutableUpdateBuilder:
                 "_stage-build",
                 "--uv",
                 str(uv.resolve()),
+                "--npm",
+                str(npm.resolve()),
                 "--final-release",
                 str(self.manager.release_path(release_id)),
             ]
@@ -485,13 +495,68 @@ class ImmutableUpdateBuilder:
             return status
 
 
-def _stage_build(uv: Path, final_release: Path) -> int:
+def _stage_build(uv: Path, npm: Path, final_release: Path) -> int:
     """Build and validate inside release-manager staging; never promote."""
     cwd = Path.cwd().resolve()
     if cwd.parent.name != "releases" or not cwd.name.startswith(".staging-") or (cwd / ".git").exists():
         raise UpdateBuildError("not_release_staging", "stage_build")
     with tempfile.TemporaryDirectory(prefix="hermes-build-home-") as raw_home:
         home = Path(raw_home)
+        npm_install = _run_digest(
+            [
+                str(npm),
+                "ci",
+                "--workspace",
+                "web",
+                "--include-workspace-root",
+                "--ignore-scripts",
+            ],
+            cwd=cwd,
+            home=home,
+            timeout=_BUILD_TIMEOUT,
+        )
+        if npm_install.returncode:
+            print(
+                json.dumps(
+                    {
+                        "state": "failed",
+                        "phase": "dashboard_dependencies",
+                        "output_sha256": npm_install.output_sha256,
+                        "output_bytes": npm_install.output_bytes,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 1
+        dashboard_build = _run_digest(
+            [str(npm), "run", "build", "--workspace", "web"],
+            cwd=cwd,
+            home=home,
+            timeout=_BUILD_TIMEOUT,
+        )
+        if dashboard_build.returncode:
+            print(
+                json.dumps(
+                    {
+                        "state": "failed",
+                        "phase": "dashboard_build",
+                        "output_sha256": dashboard_build.output_sha256,
+                        "output_bytes": dashboard_build.output_bytes,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 1
+        dashboard_index = cwd / "hermes_cli" / "web_dist" / "index.html"
+        if not dashboard_index.is_file() or dashboard_index.stat().st_size == 0:
+            raise UpdateBuildError("dashboard_assets_missing", "stage_build")
+        for dependency_dir in (
+            cwd / "node_modules",
+            cwd / "web" / "node_modules",
+            cwd / "apps" / "shared" / "node_modules",
+        ):
+            if dependency_dir.exists() or dependency_dir.is_symlink():
+                shutil.rmtree(dependency_dir, ignore_errors=False)
         result = _run_digest(
             [
                 str(uv),
@@ -531,6 +596,10 @@ def _stage_build(uv: Path, final_release: Path) -> int:
         "phase": "import_probe",
         "dependency_output_sha256": result.output_sha256,
         "dependency_output_bytes": result.output_bytes,
+        "dashboard_install_output_sha256": npm_install.output_sha256,
+        "dashboard_install_output_bytes": npm_install.output_bytes,
+        "dashboard_build_output_sha256": dashboard_build.output_sha256,
+        "dashboard_build_output_bytes": dashboard_build.output_bytes,
         "import_output_sha256": probe.output_sha256,
         "import_output_bytes": probe.output_bytes,
         "relocated_script_count": relocated_scripts,
@@ -553,6 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     internal = subparsers.add_parser("_stage-build", help=argparse.SUPPRESS)
     internal.add_argument("--uv", required=True)
+    internal.add_argument("--npm", required=True)
     internal.add_argument("--final-release", required=True)
     return parser
 
@@ -563,6 +633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return _stage_build(
                 Path(args.uv).resolve(),
+                Path(args.npm).resolve(),
                 Path(args.final_release).resolve(),
             )
         except (OSError, UpdateBuildError):
