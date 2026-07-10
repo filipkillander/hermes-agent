@@ -737,6 +737,83 @@ class TestLoadGatewayConfig:
         assert os.environ.get("DISCORD_BOT_TOKEN") == explicit
         assert config.platforms[Platform.DISCORD].token == explicit
 
+    def test_bridges_telegram_profile_token_env_from_platform_config(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    token_env: TELEGRAM_IGOR_BOT_TOKEN\n",
+            encoding="utf-8",
+        )
+        token = "123456789:profile-specific-token"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_IGOR_BOT_TOKEN", token)
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+        config = load_gateway_config()
+
+        assert os.environ.get("TELEGRAM_BOT_TOKEN") == token
+        assert config.platforms[Platform.TELEGRAM].token == token
+        assert config.platforms[Platform.TELEGRAM].enabled is True
+
+    def test_telegram_token_env_does_not_overwrite_explicit_env(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  token_env: TELEGRAM_IGOR_BOT_TOKEN\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:explicit")
+        monkeypatch.setenv("TELEGRAM_IGOR_BOT_TOKEN", "123:profile")
+
+        config = load_gateway_config()
+
+        assert os.environ.get("TELEGRAM_BOT_TOKEN") == "123:explicit"
+        assert config.platforms[Platform.TELEGRAM].token == "123:explicit"
+
+    def test_bridges_profile_scoped_email_env_names(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  email:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      address_env: EMAIL_IGOR_ADDRESS\n"
+            "      password_env: EMAIL_IGOR_PASSWORD\n"
+            "      imap_host_env: EMAIL_IGOR_IMAP_HOST\n"
+            "      smtp_host_env: EMAIL_IGOR_SMTP_HOST\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("EMAIL_IGOR_ADDRESS", "igor@example.invalid")
+        monkeypatch.setenv("EMAIL_IGOR_PASSWORD", "profile-password")
+        monkeypatch.setenv("EMAIL_IGOR_IMAP_HOST", "imap.example.invalid")
+        monkeypatch.setenv("EMAIL_IGOR_SMTP_HOST", "smtp.example.invalid")
+        for name in (
+            "EMAIL_ADDRESS",
+            "EMAIL_PASSWORD",
+            "EMAIL_IMAP_HOST",
+            "EMAIL_SMTP_HOST",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        config = load_gateway_config()
+
+        assert os.environ.get("EMAIL_ADDRESS") == "igor@example.invalid"
+        assert os.environ.get("EMAIL_PASSWORD") == "profile-password"
+        assert os.environ.get("EMAIL_IMAP_HOST") == "imap.example.invalid"
+        assert os.environ.get("EMAIL_SMTP_HOST") == "smtp.example.invalid"
+        assert config.platforms[Platform.EMAIL].enabled is True
+
     def test_bridges_discord_allow_from_from_config_yaml(self, tmp_path, monkeypatch):
         """discord.allow_from should populate DISCORD_ALLOWED_USERS for auth."""
         hermes_home = tmp_path / ".hermes"

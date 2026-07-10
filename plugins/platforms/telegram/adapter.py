@@ -8713,6 +8713,25 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     import json as _json
     extras: dict = {}
 
+    platforms_cfg = yaml_cfg.get("platforms")
+    platform_extra_cfg = {}
+    if isinstance(platforms_cfg, dict):
+        telegram_platform_cfg = platforms_cfg.get("telegram")
+        if isinstance(telegram_platform_cfg, dict):
+            candidate_extra = telegram_platform_cfg.get("extra")
+            if isinstance(candidate_extra, dict):
+                platform_extra_cfg = candidate_extra
+    token_env_cfg = (
+        telegram_cfg["token_env"] if "token_env" in telegram_cfg
+        else platform_extra_cfg.get("token_env")
+    )
+    if token_env_cfg is not None and not os.getenv("TELEGRAM_BOT_TOKEN"):
+        token_env_name = str(token_env_cfg).strip()
+        if token_env_name:
+            token_value = os.getenv(token_env_name)
+            if token_value:
+                os.environ["TELEGRAM_BOT_TOKEN"] = token_value
+
     if "disable_topic_auto_rename" in telegram_cfg:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
 
