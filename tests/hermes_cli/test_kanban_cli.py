@@ -20,6 +20,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kc, "_delegation_allowed", lambda _target: True)
     kb.init_db()
     return home
 

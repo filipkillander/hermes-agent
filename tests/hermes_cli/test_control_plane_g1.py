@@ -47,6 +47,7 @@ profiles:
     domain: general
     can_delegate_to: [workers]
     can_create_boards: true
+    default_board: lumi
 {release_line}  coder:
     role: internal_worker
     home: {tmp_path / 'profiles' / 'coder'}
@@ -147,6 +148,7 @@ def test_registry_validates_unique_ownership_and_secure_worker_defaults(tmp_path
     domain: smart_home
     can_delegate_to: []
     can_create_boards: false
+    default_board: spark
 """
     duplicate.write_text(text, encoding="utf-8")
     with pytest.raises(RegistryError, match="Port 8642"):
@@ -170,6 +172,7 @@ profiles:
     domain: general
     can_delegate_to: [igor, spark, workers]
     can_create_boards: true
+    default_board: lumi
   igor:
     role: external_gateway
     home: {profiles / 'igor'}
@@ -178,6 +181,7 @@ profiles:
     domain: general
     can_delegate_to: [spark, workers]
     can_create_boards: false
+    default_board: igor
   spark:
     role: external_gateway
     home: {profiles / 'spark'}
@@ -186,6 +190,7 @@ profiles:
     domain: smart_home
     can_delegate_to: []
     can_create_boards: false
+    default_board: home-automation
   coder:
     role: internal_worker
     home: {profiles / 'coder'}

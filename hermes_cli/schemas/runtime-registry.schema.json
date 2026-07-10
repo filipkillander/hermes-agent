@@ -32,11 +32,12 @@
         ,"domain": {"enum": ["general", "smart_home", "worker"]}
         ,"can_delegate_to": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}}
         ,"can_create_boards": {"type": "boolean"}
+        ,"default_board": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}
       },
       "allOf": [
         {
           "if": {"properties": {"role": {"const": "external_gateway"}}},
-          "then": {"required": ["service_label", "port"]}
+          "then": {"required": ["service_label", "port", "default_board"]}
         },
         {
           "if": {"properties": {"role": {"const": "internal_worker"}}},
@@ -52,6 +53,7 @@
               ,"domain": {"const": "worker"}
               ,"can_delegate_to": {"maxItems": 0}
               ,"can_create_boards": {"const": false}
+              ,"default_board": false
             }
           }
         }

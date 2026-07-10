@@ -27,6 +27,7 @@ profiles:
     domain: general
     can_delegate_to: [assistant, workers]
     can_create_boards: true
+    default_board: primary
   assistant:
     role: external_gateway
     home: /absolute/path/to/profiles/assistant
@@ -35,6 +36,7 @@ profiles:
     domain: smart_home
     can_delegate_to: []
     can_create_boards: false
+    default_board: home-automation
   coder:
     role: internal_worker
     home: /absolute/path/to/profiles/coder
@@ -50,6 +52,8 @@ Secure defaults are deliberate:
   fingerprints, or the dispatcher.
 - Ports and service labels are unique; at most one dispatcher is allowed.
 - Delegation and board-management authority is explicit and defaults closed.
+- Every external gateway has an identity-scoped `default_board`; the stable
+  launcher refuses stale mappings and exports it as `HERMES_KANBAN_BOARD`.
 - Bot fingerprints, when used, must be keyed HMAC-SHA256 fingerprints. Raw
   tokens and ordinary token hashes do not belong in this file.
 

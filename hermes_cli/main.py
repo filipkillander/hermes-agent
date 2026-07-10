@@ -14753,10 +14753,15 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        # Console-script wrappers translate main()'s return value into the
+        # process exit status. Preserve the historical success semantics for
+        # handlers returning None or other values, while propagating explicit
+        # integer command results (for example Kanban authority denial = 2).
+        return result if type(result) is int else None
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

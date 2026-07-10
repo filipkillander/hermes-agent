@@ -20,6 +20,12 @@ def _authority_root(tmp_path: Path) -> tuple[Path, Path]:
     for name in ("lumi", "igor", "spark", "coder", "review"):
         (profiles / name).mkdir(parents=True)
         (profiles / name / "config.yaml").write_text("model: test\n", encoding="utf-8")
+    for board in ("lumi", "igor", "home-automation"):
+        board_dir = root / "kanban" / "boards" / board
+        board_dir.mkdir(parents=True)
+        (board_dir / "board.json").write_text(
+            json.dumps({"slug": board}), encoding="utf-8"
+        )
     registry = root / "runtime-registry.yaml"
     registry.write_text(
         f"""schema_version: 2
@@ -32,6 +38,7 @@ profiles:
     domain: general
     can_delegate_to: [igor, spark, workers]
     can_create_boards: true
+    default_board: lumi
   igor:
     role: external_gateway
     home: {profiles / 'igor'}
@@ -40,6 +47,7 @@ profiles:
     domain: general
     can_delegate_to: [spark, workers]
     can_create_boards: false
+    default_board: igor
   spark:
     role: external_gateway
     home: {profiles / 'spark'}
@@ -48,6 +56,7 @@ profiles:
     domain: smart_home
     can_delegate_to: []
     can_create_boards: false
+    default_board: home-automation
   coder:
     role: internal_worker
     home: {profiles / 'coder'}
@@ -89,8 +98,23 @@ def test_cli_denies_igor_board_create_before_filesystem_write(tmp_path):
         text=True,
         timeout=30,
     )
+    assert result.returncode == 2, result.stderr
     assert "denies board management" in result.stderr
     assert not (root / "kanban" / "boards" / "forbidden").exists()
+
+
+def test_cli_allows_lumi_board_create_with_success_exit(tmp_path):
+    root, registry = _authority_root(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "boards", "create", "allowed"],
+        cwd=REPO,
+        env=_env(root, registry, "lumi"),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (root / "kanban" / "boards" / "allowed" / "board.json").is_file()
 
 
 def test_dashboard_denies_igor_and_allows_lumi_before_board_write(tmp_path, monkeypatch):
@@ -172,3 +196,22 @@ def test_dispatcher_denies_igor_to_lumi_before_claim_or_spawn(tmp_path, monkeypa
     assert result.skipped_unauthorized == [(task_id, "lumi")]
     assert task.status == "ready"
     assert task.claim_lock is None
+
+
+def test_registry_defaults_are_profile_scoped_without_global_pointer_write(tmp_path, monkeypatch):
+    root, registry = _authority_root(tmp_path)
+    pointer = root / "kanban" / "current"
+    pointer.write_text("igor\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_RUNTIME_REGISTRY", str(registry))
+    from hermes_cli import kanban_db as kb
+
+    expected = {
+        "lumi": "lumi",
+        "igor": "igor",
+        "spark": "home-automation",
+    }
+    for profile, board in expected.items():
+        monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / profile))
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        assert kb.get_current_board() == board
+    assert pointer.read_text(encoding="utf-8") == "igor\n"

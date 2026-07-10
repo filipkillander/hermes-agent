@@ -29,6 +29,7 @@ _SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ROLES = frozenset({"external_gateway", "internal_worker"})
 _DOMAINS = frozenset({"general", "smart_home", "worker"})
 _DELEGATION_GROUPS = frozenset({"workers"})
+_BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class RegistryError(RuntimeError):
@@ -51,6 +52,7 @@ class ProfileRuntime:
     domain: str = "general"
     can_delegate_to: tuple[str, ...] = ()
     can_create_boards: bool = False
+    default_board: Optional[str] = None
 
     @property
     def restartable(self) -> bool:
@@ -152,6 +154,7 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
         "allowed_platforms", "required_platforms", "bot_fingerprints",
         "release_revision",
         "domain", "can_delegate_to", "can_create_boards",
+        "default_board",
     }
     unknown = set(raw) - allowed_keys
     if unknown:
@@ -206,21 +209,28 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
     can_create_boards = raw.get("can_create_boards")
     if not isinstance(can_create_boards, bool):
         raise RegistryError(f"profiles.{name}.can_create_boards must be boolean")
+    default_board = raw.get("default_board")
+    if default_board is not None and (
+        not isinstance(default_board, str) or not _BOARD_RE.fullmatch(default_board)
+    ):
+        raise RegistryError(f"profiles.{name}.default_board is invalid")
 
     if role == "internal_worker" and any((label, port, raw.get("health_url"), dispatcher, allowed, fingerprints)):
         raise RegistryError(
             f"profiles.{name}: internal_worker may not own a service, port, dispatcher, platform, or bot identity"
         )
     if role == "internal_worker" and (
-        domain != "worker" or can_delegate_to or can_create_boards
+        domain != "worker" or can_delegate_to or can_create_boards or default_board is not None
     ):
         raise RegistryError(
-            f"profiles.{name}: internal_worker must use domain=worker and may not delegate or create boards"
+            f"profiles.{name}: internal_worker must use domain=worker and may not delegate, create, or default boards"
         )
     if role == "external_gateway" and domain == "worker":
         raise RegistryError(f"profiles.{name}: external_gateway may not use domain=worker")
     if role == "external_gateway" and not all((label, port)):
         raise RegistryError(f"profiles.{name}: external_gateway requires service_label and port")
+    if role == "external_gateway" and default_board is None:
+        raise RegistryError(f"profiles.{name}: external_gateway requires default_board")
 
     return ProfileRuntime(
         name=name,
@@ -237,6 +247,7 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
         domain=domain,
         can_delegate_to=can_delegate_to,
         can_create_boards=can_create_boards,
+        default_board=default_board,
     )
 
 
@@ -387,6 +398,31 @@ def delegation_authorized(home: Path, target: str) -> bool:
         )
     except (RegistryError, OSError):
         return False
+
+
+def default_board_for_home(home: Path, *, required: bool = False) -> Optional[str]:
+    """Resolve a registered profile's board without consulting global state.
+
+    Missing registries may fall through for standalone/community installs.
+    Once a registry is present, invalid identity or a stale board mapping is a
+    hard error so an external gateway cannot silently drift to another board.
+    """
+    registry = load_runtime_registry(required=required)
+    if registry.revision == "missing":
+        return None
+    profile = registry.require(profile_name_for_home(Path(home)))
+    if profile.home.resolve() != Path(home).resolve():
+        raise RegistryError(f"Profile home {home} does not match runtime registry")
+    if profile.default_board is None:
+        return None
+    slug = profile.default_board
+    if slug != "default":
+        metadata = registry.path.parent / "kanban" / "boards" / slug / "board.json"
+        if not metadata.is_file():
+            raise RegistryError(
+                f"profiles.{profile.name}.default_board {slug!r} does not exist"
+            )
+    return slug
 
 
 def runtime_identity(home: Optional[Path] = None) -> dict[str, Any]:
