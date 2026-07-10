@@ -23,6 +23,17 @@ class DisconnectedAdapters(dict):
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
+    # Embedded dispatch/notifier ownership is privileged and fails closed in
+    # production. These notifier behavior tests intentionally exercise an
+    # authorized owner, so grant both halves of the control-plane contract.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._registry_authorizes_dispatcher",
+        lambda: True,
+    )
     real_sleep = asyncio.sleep
 
     async def fake_sleep(delay):
