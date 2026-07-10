@@ -315,10 +315,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     keychain_present = False
     if keychain_enabled and keychain_service and keychain_account:
         try:
-            keychain_present = bw.macos_keychain_generic_password_exists(
-                keychain_service,
-                keychain_account,
-            )
+            if keychain_cfg.get("helper_path"):
+                keychain_present = bw.macos_keychain_generic_password_exists(
+                    keychain_service,
+                    keychain_account,
+                    access_token_keychain=keychain_cfg,
+                )
+            else:
+                keychain_present = bw.macos_keychain_generic_password_exists(
+                    keychain_service,
+                    keychain_account,
+                )
         except Exception:  # noqa: BLE001 — status should stay diagnostic-only
             keychain_present = False
 
