@@ -34,7 +34,7 @@ def _runtime(tmp_path: Path, profile: str = "spark") -> tuple[Path, Path]:
     (links / "current").symlink_to(release)
     (root / "profiles" / profile).mkdir(parents=True)
     (root / "profiles" / profile / "config.yaml").write_text("model: test\n", encoding="utf-8")
-    (root / "runtime-registry.yaml").write_text("schema_version: 1\nprofiles: {}\n", encoding="utf-8")
+    (root / "runtime-registry.yaml").write_text("schema_version: 2\nprofiles: {}\n", encoding="utf-8")
     key = root / "control-plane/bot-fingerprint.key"
     key.parent.mkdir(parents=True)
     key.write_bytes(b"k" * 32)

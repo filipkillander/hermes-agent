@@ -15,7 +15,9 @@ from hermes_cli.config import (
 from hermes_cli.restart_coordinator import RestartCoordinator, RestartRejected
 from hermes_cli.runtime_registry import (
     RegistryError,
+    board_creation_authorized,
     credential_fingerprint,
+    delegation_authorized,
     load_runtime_registry,
 )
 
@@ -32,7 +34,7 @@ def _registry_file(
     registry = tmp_path / "runtime-registry.yaml"
     release_line = f"    release_revision: {release_revision}\n" if release_revision else ""
     registry.write_text(
-        f"""schema_version: 1
+        f"""schema_version: 2
 profiles:
   lumi:
     role: external_gateway
@@ -42,9 +44,15 @@ profiles:
     dispatcher: {str(dispatcher).lower()}
     allowed_platforms: [telegram]
     required_platforms: [telegram]
+    domain: general
+    can_delegate_to: [workers]
+    can_create_boards: true
 {release_line}  coder:
     role: internal_worker
     home: {tmp_path / 'profiles' / 'coder'}
+    domain: worker
+    can_delegate_to: []
+    can_create_boards: false
 """,
         encoding="utf-8",
     )
@@ -125,6 +133,9 @@ def test_registry_validates_unique_ownership_and_secure_worker_defaults(tmp_path
     assert registry.require("lumi").dispatcher is True
     assert registry.require("coder").dispatcher is False
     assert registry.require("coder").allowed_platforms == ()
+    assert registry.require("lumi").can_create_boards is True
+    assert registry.require("lumi").can_delegate_to == ("workers",)
+    assert registry.require("coder").domain == "worker"
 
     duplicate = _registry_file(tmp_path)
     text = duplicate.read_text(encoding="utf-8")
@@ -133,10 +144,89 @@ def test_registry_validates_unique_ownership_and_secure_worker_defaults(tmp_path
     home: {tmp_path / 'profiles' / 'spark'}
     service_label: ai.hermes.gateway-spark
     port: 8642
+    domain: smart_home
+    can_delegate_to: []
+    can_create_boards: false
 """
     duplicate.write_text(text, encoding="utf-8")
     with pytest.raises(RegistryError, match="Port 8642"):
         load_runtime_registry(duplicate)
+
+
+def test_registry_v2_authority_matrix_is_fail_closed(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profiles = root / "profiles"
+    for name in ("lumi", "igor", "spark", "coder", "review"):
+        (profiles / name).mkdir(parents=True, exist_ok=True)
+    registry_path = root / "runtime-registry.yaml"
+    registry_path.write_text(
+        f"""schema_version: 2
+profiles:
+  lumi:
+    role: external_gateway
+    home: {profiles / 'lumi'}
+    service_label: ai.hermes.gateway-lumi
+    port: 8642
+    domain: general
+    can_delegate_to: [igor, spark, workers]
+    can_create_boards: true
+  igor:
+    role: external_gateway
+    home: {profiles / 'igor'}
+    service_label: ai.hermes.gateway-igor
+    port: 8644
+    domain: general
+    can_delegate_to: [spark, workers]
+    can_create_boards: false
+  spark:
+    role: external_gateway
+    home: {profiles / 'spark'}
+    service_label: ai.hermes.gateway-spark
+    port: 8643
+    domain: smart_home
+    can_delegate_to: []
+    can_create_boards: false
+  coder:
+    role: internal_worker
+    home: {profiles / 'coder'}
+    domain: worker
+    can_delegate_to: []
+    can_create_boards: false
+  review:
+    role: internal_worker
+    home: {profiles / 'review'}
+    domain: worker
+    can_delegate_to: []
+    can_create_boards: false
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_RUNTIME_REGISTRY", str(registry_path))
+
+    assert board_creation_authorized(profiles / "lumi") is True
+    assert board_creation_authorized(profiles / "igor") is False
+    assert board_creation_authorized(profiles / "spark") is False
+    assert delegation_authorized(profiles / "lumi", "igor") is True
+    assert delegation_authorized(profiles / "lumi", "spark") is True
+    assert delegation_authorized(profiles / "lumi", "coder") is True
+    assert delegation_authorized(profiles / "igor", "spark") is True
+    assert delegation_authorized(profiles / "igor", "review") is True
+    assert delegation_authorized(profiles / "igor", "lumi") is False
+    assert delegation_authorized(profiles / "spark", "workers") is False
+    assert delegation_authorized(profiles / "spark", "coder") is False
+    assert delegation_authorized(profiles / "lumi", "missing") is False
+
+
+def test_registry_v2_rejects_unknown_delegation_target(tmp_path):
+    path = _registry_file(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "can_delegate_to: [workers]", "can_delegate_to: [ghost]"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RegistryError, match="unknown profile 'ghost'"):
+        load_runtime_registry(path)
 
 
 def test_registry_identity_revision_excludes_only_release_intent(tmp_path):

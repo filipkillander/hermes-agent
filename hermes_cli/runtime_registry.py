@@ -23,10 +23,12 @@ import yaml
 from hermes_constants import get_default_hermes_root
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ROLES = frozenset({"external_gateway", "internal_worker"})
+_DOMAINS = frozenset({"general", "smart_home", "worker"})
+_DELEGATION_GROUPS = frozenset({"workers"})
 
 
 class RegistryError(RuntimeError):
@@ -46,6 +48,9 @@ class ProfileRuntime:
     required_platforms: tuple[str, ...] = ()
     bot_fingerprints: Mapping[str, str] = field(default_factory=dict)
     release_revision: Optional[str] = None
+    domain: str = "general"
+    can_delegate_to: tuple[str, ...] = ()
+    can_create_boards: bool = False
 
     @property
     def restartable(self) -> bool:
@@ -146,6 +151,7 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
         "role", "home", "service_label", "port", "health_url", "dispatcher",
         "allowed_platforms", "required_platforms", "bot_fingerprints",
         "release_revision",
+        "domain", "can_delegate_to", "can_create_boards",
     }
     unknown = set(raw) - allowed_keys
     if unknown:
@@ -191,10 +197,28 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
     ):
         raise RegistryError(f"profiles.{name}.release_revision is invalid")
 
+    domain = raw.get("domain")
+    if domain not in _DOMAINS:
+        raise RegistryError(f"profiles.{name}.domain must be one of {sorted(_DOMAINS)}")
+    can_delegate_to = _as_string_list(
+        raw.get("can_delegate_to"), f"profiles.{name}.can_delegate_to"
+    )
+    can_create_boards = raw.get("can_create_boards")
+    if not isinstance(can_create_boards, bool):
+        raise RegistryError(f"profiles.{name}.can_create_boards must be boolean")
+
     if role == "internal_worker" and any((label, port, raw.get("health_url"), dispatcher, allowed, fingerprints)):
         raise RegistryError(
             f"profiles.{name}: internal_worker may not own a service, port, dispatcher, platform, or bot identity"
         )
+    if role == "internal_worker" and (
+        domain != "worker" or can_delegate_to or can_create_boards
+    ):
+        raise RegistryError(
+            f"profiles.{name}: internal_worker must use domain=worker and may not delegate or create boards"
+        )
+    if role == "external_gateway" and domain == "worker":
+        raise RegistryError(f"profiles.{name}: external_gateway may not use domain=worker")
     if role == "external_gateway" and not all((label, port)):
         raise RegistryError(f"profiles.{name}: external_gateway requires service_label and port")
 
@@ -210,6 +234,9 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
         required_platforms=required,
         bot_fingerprints={str(k).lower(): str(v) for k, v in fingerprints.items()},
         release_revision=release_revision,
+        domain=domain,
+        can_delegate_to=can_delegate_to,
+        can_create_boards=can_create_boards,
     )
 
 
@@ -290,6 +317,16 @@ def load_runtime_registry(path: Optional[Path] = None, *, required: bool = True)
             dispatchers.append(name)
     if len(dispatchers) > 1:
         raise RegistryError(f"Only one profile may own the dispatcher, got {dispatchers}")
+    for name, profile in profiles.items():
+        for target in profile.can_delegate_to:
+            if target in _DELEGATION_GROUPS:
+                continue
+            if target not in profiles:
+                raise RegistryError(
+                    f"profiles.{name}.can_delegate_to references unknown profile {target!r}"
+                )
+            if target == name:
+                raise RegistryError(f"profiles.{name}.can_delegate_to may not include itself")
     return RuntimeRegistry(
         path=path,
         revision=_identity_revision(doc),
@@ -309,6 +346,46 @@ def dispatcher_authorized(home: Path) -> bool:
         profile = registry.require(profile_name_for_home(home))
         return profile.role == "external_gateway" and profile.dispatcher
     except RegistryError:
+        return False
+
+
+def board_creation_authorized(home: Path) -> bool:
+    """Return true only when the operator registry grants board creation."""
+    try:
+        registry = load_runtime_registry(required=True)
+        profile = registry.require(profile_name_for_home(Path(home)))
+        return profile.home.resolve() == Path(home).resolve() and profile.can_create_boards
+    except (RegistryError, OSError):
+        return False
+
+
+def delegation_authorized(home: Path, target: str) -> bool:
+    """Authorize a profile-to-profile (or local worker-group) delegation.
+
+    ``workers`` is a closed registry group: it grants local ``delegate_task``
+    spawning and assignment to profiles whose registry role is
+    ``internal_worker``. Unknown targets always deny.
+    """
+    try:
+        registry = load_runtime_registry(required=True)
+        source = registry.require(profile_name_for_home(Path(home)))
+        if source.home.resolve() != Path(home).resolve():
+            return False
+        normalized = str(target or "").strip().lower()
+        if not normalized:
+            return False
+        if normalized == "workers":
+            return "workers" in source.can_delegate_to
+        target_profile = registry.get(normalized)
+        if target_profile is None:
+            return False
+        if normalized in source.can_delegate_to:
+            return True
+        return (
+            "workers" in source.can_delegate_to
+            and target_profile.role == "internal_worker"
+        )
+    except (RegistryError, OSError):
         return False
 
 
@@ -339,6 +416,9 @@ def runtime_identity(home: Optional[Path] = None) -> dict[str, Any]:
             "allowed_platforms": list(profile.allowed_platforms),
             "required_platforms": list(profile.required_platforms),
             "bot_fingerprints": dict(profile.bot_fingerprints),
+            "domain": profile.domain,
+            "can_delegate_to": list(profile.can_delegate_to),
+            "can_create_boards": profile.can_create_boards,
             "config_revision": config_revision,
             "code_revision": os.environ.get("HERMES_RELEASE_REVISION") or profile.release_revision,
             "registry_revision": registry.revision,

@@ -10,7 +10,7 @@ The default path is `$HERMES_ROOT/runtime-registry.yaml`. Override it with
 `hermes_cli/schemas/runtime-registry.schema.json`.
 
 ```yaml
-schema_version: 1
+schema_version: 2
 profiles:
   primary:
     role: external_gateway
@@ -24,9 +24,23 @@ profiles:
     bot_fingerprints:
       telegram: hmac-sha256:<64 lowercase hex>
     release_revision: release-2026.07.10
+    domain: general
+    can_delegate_to: [assistant, workers]
+    can_create_boards: true
+  assistant:
+    role: external_gateway
+    home: /absolute/path/to/profiles/assistant
+    service_label: ai.hermes.gateway-assistant
+    port: 8643
+    domain: smart_home
+    can_delegate_to: []
+    can_create_boards: false
   coder:
     role: internal_worker
     home: /absolute/path/to/profiles/coder
+    domain: worker
+    can_delegate_to: []
+    can_create_boards: false
 ```
 
 Secure defaults are deliberate:
@@ -35,8 +49,31 @@ Secure defaults are deliberate:
 - Internal workers cannot own service labels, ports, platforms, bot
   fingerprints, or the dispatcher.
 - Ports and service labels are unique; at most one dispatcher is allowed.
+- Delegation and board-management authority is explicit and defaults closed.
 - Bot fingerprints, when used, must be keyed HMAC-SHA256 fingerprints. Raw
   tokens and ordinary token hashes do not belong in this file.
+
+## Schema v1 → v2 cutover
+
+The registry reader is fail-closed and accepts exactly one schema version.
+Upgrade code and data in this order; reversing the first two steps takes every
+registry-gated capability offline:
+
+1. Build and fully test an immutable candidate whose Python understands v2,
+   while the live operator registry remains v1.
+2. Promote that candidate through the normal release transaction. Use the
+   candidate Python for preflight; do not ask the old current Python to parse
+   v2 data.
+3. Atomically replace `runtime-registry.yaml` with the validated v2 document.
+4. Verify the new registry revision and authority matrix using the promoted
+   release Python, then restart each affected gateway through the identity-aware
+   coordinator so postflight proves the same registry revision.
+5. On failure, restore the byte-for-byte v1 registry snapshot before rolling
+   the release pointer back. Never leave v2 data behind a v1 current pointer.
+
+The live registry must never be written to v2 before the v2-capable candidate
+is current. Registry mutation and gateway restart are separate owner-approved
+operations; a release build alone does neither.
 
 ## Readiness contract
 

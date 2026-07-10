@@ -44,6 +44,36 @@ _STATUS_ICONS = {
 }
 
 
+def _delegation_allowed(target: Optional[str]) -> bool:
+    if not target:
+        return True  # unassigning / triage without an assignee is not delegation
+    try:
+        from hermes_cli.runtime_registry import delegation_authorized
+        from hermes_constants import get_hermes_home
+
+        return delegation_authorized(get_hermes_home(), target)
+    except Exception:
+        return False
+
+
+def _board_management_allowed() -> bool:
+    try:
+        from hermes_cli.runtime_registry import board_creation_authorized
+        from hermes_constants import get_hermes_home
+
+        return board_creation_authorized(get_hermes_home())
+    except Exception:
+        return False
+
+
+def _deny_delegation(target: Optional[str], surface: str = "kanban") -> int:
+    print(
+        f"{surface}: runtime-registry denies delegation to {target!r} for the active profile",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _fmt_ts(ts: Optional[int]) -> str:
     if not ts:
         return ""
@@ -898,6 +928,31 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    # Authority gates run before init_db/connect can create a SQLite file or
+    # schema. Handler-level checks remain as defense in depth for direct calls.
+    if action in {"create", "assign", "reassign"}:
+        target = (
+            getattr(args, "assignee", None)
+            if action == "create"
+            else getattr(args, "profile", None)
+        )
+        if isinstance(target, str) and target.lower() in {"none", "-", "null"}:
+            target = None
+        if not _delegation_allowed(target):
+            return _deny_delegation(target, f"kanban {action}")
+    elif action == "swarm":
+        try:
+            workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
+        except ValueError:
+            workers = []  # normal handler reports the syntax error
+        targets = [worker.profile for worker in workers]
+        targets.extend([getattr(args, "verifier", None), getattr(args, "synthesizer", None)])
+        denied = next((target for target in targets if target and not _delegation_allowed(target)), None)
+        if denied is not None:
+            return _deny_delegation(denied, "kanban swarm")
+    elif action == "decompose" and not _delegation_allowed("workers"):
+        return _deny_delegation("workers", "kanban decompose")
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -1021,6 +1076,16 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     can still run ``boards create`` / ``boards list``.
     """
     sub = getattr(args, "boards_action", None) or "list"
+    mutating = {
+        "create", "new", "rm", "remove", "delete", "switch", "use",
+        "rename", "set-default-workdir",
+    }
+    if sub in mutating and not _board_management_allowed():
+        print(
+            "kanban boards: runtime-registry denies board management for the active profile",
+            file=sys.stderr,
+        )
+        return 2
     if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
     if sub in {"create", "new"}:
@@ -1307,6 +1372,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    if not _delegation_allowed(args.assignee):
+        return _deny_delegation(args.assignee)
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1381,6 +1448,10 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
+    targets = [worker.profile for worker in workers] + [args.verifier, args.synthesizer]
+    denied = next((target for target in targets if not _delegation_allowed(target)), None)
+    if denied is not None:
+        return _deny_delegation(denied, "kanban swarm")
     with kb.connect_closing() as conn:
         created = ks.create_swarm(
             conn,
@@ -1621,6 +1692,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    if not _delegation_allowed(profile):
+        return _deny_delegation(profile, "kanban assign")
     with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
@@ -1648,6 +1721,8 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    if not _delegation_allowed(profile):
+        return _deny_delegation(profile, "kanban reassign")
     with kb.connect_closing() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,

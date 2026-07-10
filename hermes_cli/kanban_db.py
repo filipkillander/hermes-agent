@@ -5710,6 +5710,10 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_unauthorized: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks denied by runtime-registry authority before claim/workspace/process
+    writes, as ``(task_id, assignee)`` pairs. These require operator routing
+    correction; the dispatcher must never retry them as a process spawn."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -7137,6 +7141,20 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+
+    def _authority_allows(target: str) -> bool:
+        # Custom spawn functions are test/operator injection points and do not
+        # create Hermes profile processes. The real dispatcher always uses the
+        # default spawner and must pass the registry gate.
+        if spawn_fn is not None:
+            return True
+        try:
+            from hermes_cli.runtime_registry import delegation_authorized
+            from hermes_constants import get_hermes_home
+
+            return delegation_authorized(get_hermes_home(), target)
+        except Exception:
+            return False
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -7153,6 +7171,9 @@ def _dispatch_once_locked(
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
             if _default_assignee and _default_assignee_resolved:
+                if not _authority_allows(_default_assignee):
+                    result.skipped_unauthorized.append((row["id"], _default_assignee))
+                    continue
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.
@@ -7206,6 +7227,9 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        if not _authority_allows(row_assignee):
+            result.skipped_unauthorized.append((row["id"], row_assignee))
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -7340,6 +7364,9 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        if not _authority_allows(row["assignee"]):
+            result.skipped_unauthorized.append((row["id"], row["assignee"]))
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))

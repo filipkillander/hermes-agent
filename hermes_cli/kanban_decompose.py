@@ -268,6 +268,16 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _delegation_allowed(target: str) -> bool:
+    try:
+        from hermes_cli.runtime_registry import delegation_authorized
+        from hermes_constants import get_hermes_home
+
+        return delegation_authorized(get_hermes_home(), target)
+    except Exception:
+        return False
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -370,6 +380,11 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
+        if assignee_val and not _delegation_allowed(assignee_val):
+            return DecomposeOutcome(
+                task_id, False,
+                f"runtime-registry denies delegation to {assignee_val!r}",
+            )
         with kb.connect_closing() as conn:
             ok = kb.specify_triage_task(
                 conn,
@@ -437,6 +452,15 @@ def decompose_task(
             "assignee": chosen,
             "parents": clean_parents,
         })
+
+    denied = next(
+        (child["assignee"] for child in children if not _delegation_allowed(child["assignee"])),
+        None,
+    )
+    if denied is not None:
+        return DecomposeOutcome(
+            task_id, False, f"runtime-registry denies delegation to {denied!r}",
+        )
 
     try:
         with kb.connect_closing() as conn:
