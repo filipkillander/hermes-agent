@@ -70,7 +70,6 @@ class DeliveryEnvelope:
 
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
-_BLOCKQUOTE_RE = re.compile(r"^\s{0,3}>+\s?")
 _HORIZONTAL_RULE_RE = re.compile(r"^\s{0,3}(?:\*\s*){3,}$|^\s{0,3}(?:-\s*){3,}$|^\s{0,3}(?:_\s*){3,}$")
 
 
@@ -148,7 +147,6 @@ def _render_prose(prose: str) -> str:
     for line in prose.splitlines():
         if _HORIZONTAL_RULE_RE.fullmatch(line):
             continue
-        line = _BLOCKQUOTE_RE.sub("", line)
         rendered.append(_semantic_heading(line).rstrip())
     text = "\n".join(rendered)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -186,7 +184,6 @@ def _render_lkg(content: str) -> str:
             ending = prose_line[len(bare):]
             if _HORIZONTAL_RULE_RE.fullmatch(bare):
                 continue
-            bare = _BLOCKQUOTE_RE.sub("", bare)
             out.append(_semantic_heading(bare).rstrip() + ending)
 
     for line in content.splitlines(keepends=True):

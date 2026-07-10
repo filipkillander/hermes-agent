@@ -36,7 +36,7 @@ def test_golden_chat_rendering(surface):
     prose_before_fence = rendered.split("```md", 1)[0]
 
     assert rendered.startswith("**Status**")
-    assert "quoted prose" in rendered and "> quoted prose" not in rendered
+    assert "> quoted prose" in rendered
     assert "\n---\n" not in prose_before_fence
     assert "**Lumi**" in rendered
     assert "https://example.test/a?x=1&y=2" in rendered
