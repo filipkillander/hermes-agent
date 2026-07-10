@@ -13,6 +13,7 @@ Environment variables:
     EMAIL_PASSWORD      — Email password or app-specific password
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
+    EMAIL_ALLOWED_DOMAINS — Comma-separated authenticated sender domains
 """
 
 import asyncio
@@ -47,6 +48,40 @@ from gateway.config import Platform, PlatformConfig
 from utils import env_int, env_bool
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_domain(value: str) -> str:
+    """Return a lower-case ASCII domain or an empty string when invalid."""
+    candidate = (value or "").strip().lower().lstrip("@").rstrip(".")
+    if not candidate or "@" in candidate or any(ch.isspace() for ch in candidate):
+        return ""
+    try:
+        normalized = candidate.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if not normalized or any(not label for label in normalized.split(".")):
+        return ""
+    return normalized
+
+
+def _sender_is_allowlisted(sender_addr: str, users_raw: str, domains_raw: str) -> bool:
+    """Match an exact address or an authenticated domain/subdomain boundary."""
+    sender = (sender_addr or "").strip().lower()
+    allowed_users = {addr.strip().lower() for addr in users_raw.split(",") if addr.strip()}
+    if sender in allowed_users:
+        return True
+    if sender.count("@") != 1:
+        return False
+    sender_domain = _normalize_domain(sender.rsplit("@", 1)[1])
+    allowed_domains = {
+        domain
+        for raw in domains_raw.split(",")
+        if (domain := _normalize_domain(raw))
+    }
+    return any(
+        sender_domain == domain or sender_domain.endswith(f".{domain}")
+        for domain in allowed_domains
+    )
 # Automated sender patterns — emails from these are silently ignored
 _NOREPLY_PATTERNS = (
     "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
@@ -899,6 +934,7 @@ class EmailAdapter(BasePlatformAdapter):
         """
         return bool(
             os.getenv("EMAIL_ALLOWED_USERS", "").strip()
+            or os.getenv("EMAIL_ALLOWED_DOMAINS", "").strip()
             or os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
         )
 
@@ -921,19 +957,19 @@ class EmailAdapter(BasePlatformAdapter):
         # a race between dispatch and authorization can result in the adapter
         # sending a reply even though the handler returned None.
         allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
-        if not allowed_raw:
+        allowed_domains_raw = os.getenv("EMAIL_ALLOWED_DOMAINS", "").strip()
+        if not allowed_raw and not allowed_domains_raw:
             if os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
                 os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"}
             ):
                 logger.debug(
-                    "[Email] Dropping sender at dispatch — EMAIL_ALLOWED_USERS is unset "
+                    "[Email] Dropping sender at dispatch — email allowlists are unset "
                     "and open access is not opted in: %s",
                     sender_addr,
                 )
                 return
         else:
-            allowed = {addr.strip().lower() for addr in allowed_raw.split(",") if addr.strip()}
-            if sender_addr.lower() not in allowed:
+            if not _sender_is_allowlisted(sender_addr, allowed_raw, allowed_domains_raw):
                 logger.debug("[Email] Dropping non-allowlisted sender at dispatch: %s", sender_addr)
                 return
 
@@ -1398,6 +1434,7 @@ def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
         "smtp_port_env": "EMAIL_SMTP_PORT",
         "smtp_security_env": "EMAIL_SMTP_SECURITY",
         "allowed_users_env": "EMAIL_ALLOWED_USERS",
+        "allowed_domains_env": "EMAIL_ALLOWED_DOMAINS",
         "home_address_env": "EMAIL_HOME_ADDRESS",
     }
     for config_key, canonical_env in mappings.items():
@@ -1412,6 +1449,20 @@ def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
             value = os.getenv(source_name)
             if value:
                 os.environ[canonical_env] = value
+
+    # Sender domains are authorization policy, not credentials. Keep them as
+    # explicit profile configuration so every restart gets the same contract.
+    allowed_domains = email_cfg.get(
+        "allowed_domains",
+        extra.get("allowed_domains", nested.get("allowed_domains", nested_extra.get("allowed_domains"))),
+    )
+    if allowed_domains is not None and not os.getenv("EMAIL_ALLOWED_DOMAINS"):
+        if isinstance(allowed_domains, list):
+            value = ",".join(str(item).strip() for item in allowed_domains if str(item).strip())
+        else:
+            value = str(allowed_domains).strip()
+        if value:
+            os.environ["EMAIL_ALLOWED_DOMAINS"] = value
 
 
 def register(ctx) -> None:
