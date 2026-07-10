@@ -25,6 +25,28 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def authorized_test_registry(monkeypatch):
+    """Give legacy dashboard tests explicit registry-v2 authority.
+
+    The dashboard suite uses synthetic assignees and temporary homes. The
+    production helpers remain fail-closed; dedicated authority tests cover
+    denial paths against real registry documents.
+    """
+    from hermes_cli import runtime_registry
+
+    monkeypatch.setattr(
+        runtime_registry,
+        "delegation_authorized",
+        lambda _home, _target: True,
+    )
+    monkeypatch.setattr(
+        runtime_registry,
+        "board_creation_authorized",
+        lambda _home: True,
+    )
+
+
 def _load_plugin_router():
     """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
     repo_root = Path(__file__).resolve().parents[2]

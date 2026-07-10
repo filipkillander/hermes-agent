@@ -15,8 +15,16 @@ def all_assignees_spawnable(monkeypatch):
     those tasks into ``skipped_nonspawnable`` instead of spawning, which
     would break tests that assert spawn behavior.
     """
-    from hermes_cli import profiles
+    from hermes_cli import profiles, runtime_registry
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    # Registry v2 is a separate fail-closed gate from profile discovery.
+    # These dispatcher tests intentionally use arbitrary synthetic assignees,
+    # so grant only the delegation decision at the fixture boundary.
+    monkeypatch.setattr(
+        runtime_registry,
+        "delegation_authorized",
+        lambda _home, _target: True,
+    )
 
 
 @pytest.fixture(autouse=True)
