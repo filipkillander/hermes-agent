@@ -21,7 +21,7 @@ from gateway.config import PlatformConfig
 TABLE = "| Name | URL |\n|---|---|\n| Lumi | https://example.test/a?x=1&y=2 |"
 
 
-@pytest.mark.parametrize("surface", ["discord", "telegram"])
+@pytest.mark.parametrize("surface", ["discord", "telegram", "raycast_extension"])
 def test_golden_chat_rendering(surface):
     source = (
         "# Status\n\n"
@@ -163,6 +163,11 @@ def test_never_returns_empty_output(source):
 def test_non_chat_surfaces_are_unchanged():
     source = f"# Mail\n\n---\n{TABLE}"
     assert prepare_delivery_content(source, surface="email") == source
+
+
+def test_chrome_rich_markdown_is_not_compacted_by_delivery_envelope():
+    source = f"# Chrome\n\n> quote\n\n{TABLE}"
+    assert prepare_delivery_content(source, surface="chrome_extension") == source
 
 
 def test_fuzz_like_determinism_and_invariants():

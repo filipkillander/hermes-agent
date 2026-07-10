@@ -26,7 +26,7 @@ from typing import Any, Iterable
 from gateway.platforms.helpers import convert_table_to_bullets
 
 
-CHAT_SURFACES = frozenset({"discord", "telegram"})
+CHAT_SURFACES = frozenset({"discord", "telegram", "raycast_extension"})
 
 
 class DeliveryMode(str, Enum):
