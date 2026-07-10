@@ -54,8 +54,10 @@ retention command. It only:
    environment;
 5. revalidates the ref and worktree, then stages with
    `uv sync --frozen --no-dev --no-editable --extra messaging`;
-6. verifies the sealed manifest, size, write modes, non-editable imports, and
-   messaging imports.
+6. rewrites uv-generated absolute staging shebangs to the final release path
+   before the manifest is sealed;
+7. verifies the sealed manifest, size, write modes, non-editable imports,
+   messaging imports, and the installed `hermes --help` entrypoint.
 
 It writes only states, counts, commit/digest values, and output byte counts to
 `$HERMES_HOME/release-status/immutable-update-builder.json` (mode 0600). Raw
@@ -77,6 +79,34 @@ python -m hermes_cli.immutable_update_builder build RELEASE_ID \
 Staging is not promotion. A staged release cannot affect a running gateway;
 the canary/restart coordinator and atomic promotion remain separately approved
 operations.
+
+## Registry identity versus release intent
+
+`RuntimeRegistry.revision` is a canonical hash of the ownership boundary:
+profile homes, roles, labels, ports, platform allowlists/requirements,
+dispatcher ownership, and keyed bot fingerprints. Per-profile
+`release_revision` is deliberately excluded from that one hash because it is
+validated independently as `code_revision`.
+
+This separation is required for safe promotion and rollback. Changing only
+the desired release must not make the still-running, otherwise correctly
+identified process fail the registry-identity preflight. Any change to a
+label, port, home, role, platform boundary, dispatcher, or bot fingerprint
+still changes the registry identity and blocks mutation until an explicit
+bootstrap has established the new boundary.
+
+## macOS Keychain bootstrap helper
+
+Headless macOS profiles may set
+`secrets.bitwarden.access_token_keychain.helper_path` to a private, regular,
+owner-executable helper. Hermes verifies that the path is absolute, is not a
+symlink, belongs to the current user, and has no group/other permission bits.
+The helper's stderr is never copied into a secret-source error.
+
+The helper binary is a small Keychain trust anchor. Replacing or rebuilding it
+requires coordinated BWS token rotation; it must not be rewritten by normal
+Hermes release staging. Profile Keychain account names are versioned so a
+failed rotation cannot overwrite the last working bootstrap.
 
 ## Secret-free rollback snapshot
 
