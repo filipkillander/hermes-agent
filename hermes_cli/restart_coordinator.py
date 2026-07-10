@@ -286,6 +286,7 @@ class RestartCoordinator:
         config_revision: str,
         *,
         allow_code_revision_mismatch: bool = False,
+        allow_config_revision_mismatch: bool = False,
     ) -> tuple[bool, list[str]]:
         failures: list[str] = []
         identity = payload.get("runtime_identity") if isinstance(payload.get("runtime_identity"), dict) else {}
@@ -310,6 +311,10 @@ class RestartCoordinator:
             # release. This narrow exception never applies to postflight and
             # cannot suppress any other identity failure.
             failures = [failure for failure in failures if failure != "code_revision_mismatch"]
+        if allow_config_revision_mismatch:
+            # An owner-approved config change is expected to differ from the
+            # running process during preflight only. Postflight remains strict.
+            failures = [failure for failure in failures if failure != "config_revision_mismatch"]
         return not failures, failures
 
     def _validate_readiness(
@@ -340,12 +345,13 @@ class RestartCoordinator:
         profile_name: str,
         *,
         allow_release_transition: bool = False,
+        allow_config_transition: bool = False,
     ) -> RestartResult:
         """Restart one registry-owned gateway.
 
-        ``allow_release_transition`` permits only the expected old-vs-desired
-        code revision mismatch during preflight. Postflight always requires the
-        registry's desired release revision.
+        Transition flags permit only the expected old-vs-desired revision
+        mismatch during preflight. Postflight always requires both the current
+        config and the registry's desired release revision.
         """
         profile = self.registry.require(profile_name)
         if not profile.restartable or profile.port is None or not profile.service_label or not profile.health_url:
@@ -373,6 +379,7 @@ class RestartCoordinator:
                     before,
                     config_revision,
                     allow_code_revision_mismatch=allow_release_transition,
+                    allow_config_revision_mismatch=allow_config_transition,
                 )
                 if not identity_ok:
                     raise RestartRejected(f"Existing listener has wrong identity: {', '.join(failures)}")
@@ -458,12 +465,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             "promotion/rollback; postflight remains strict"
         ),
     )
+    parser.add_argument(
+        "--allow-config-transition",
+        action="store_true",
+        help=(
+            "allow only a preflight config-revision mismatch for an intentional "
+            "owner-approved config change; postflight remains strict"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         registry = load_runtime_registry(args.registry, required=True)
         result = RestartCoordinator(registry).restart(
             args.profile,
             allow_release_transition=args.allow_release_transition,
+            allow_config_transition=args.allow_config_transition,
         )
     except Exception as exc:
         print(f"restart rejected: {exc}", file=sys.stderr)

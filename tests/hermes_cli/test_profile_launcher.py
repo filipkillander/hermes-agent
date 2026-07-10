@@ -23,8 +23,7 @@ def _runtime(tmp_path: Path, profile: str = "spark") -> tuple[Path, Path]:
     release = root / "releases" / "r1"
     python = release / ".venv/bin/python"
     python.parent.mkdir(parents=True)
-    python.write_text("#!/bin/sh\n", encoding="utf-8")
-    python.chmod(0o755)
+    python.symlink_to(Path(sys.executable).resolve())
     (release / ".hermes-release.json").write_text(
         json.dumps({"release_id": "r1", "commit": "a" * 40}),
         encoding="utf-8",
@@ -166,3 +165,35 @@ def test_check_mode_is_side_effect_free_and_non_secret(tmp_path: Path) -> None:
     assert payload["profile"] == "spark"
     assert payload["service"] == "gateway"
     assert "token" not in result.stdout.lower()
+
+
+def test_ensure_release_python_reexecs_with_selected_profile_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, release = _runtime(tmp_path)
+    monkeypatch.setattr(launcher.sys, "executable", "/usr/bin/python3")
+    called: dict[str, object] = {}
+
+    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        called.update(path=path, argv=argv, env=env)
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(launcher.os, "execve", fake_execve)
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        launcher._ensure_release_python("spark", root)
+    assert called["path"] == str(release / ".venv/bin/python")
+    assert called["argv"][0] == str(release / ".venv/bin/python")
+    assert "PYTHONPATH" not in called["env"]
+
+
+def test_ensure_release_python_skips_reexec_when_already_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, release = _runtime(tmp_path)
+    monkeypatch.setattr(launcher.sys, "executable", str(release / ".venv/bin/python"))
+    monkeypatch.setattr(
+        launcher.os,
+        "execve",
+        lambda *_args: pytest.fail("unexpected re-exec"),
+    )
+    launcher._ensure_release_python("spark", root)

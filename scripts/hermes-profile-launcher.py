@@ -12,9 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-import yaml
-
-
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -51,6 +48,8 @@ def _private_key_is_valid(path: Path) -> bool:
 
 
 def _registered_default_board(registry: Path, profile: str, profile_home: Path) -> str:
+    import yaml
+
     try:
         document = yaml.safe_load(registry.read_text(encoding="utf-8"))
         entry = document["profiles"][profile]
@@ -72,6 +71,28 @@ def _registered_default_board(registry: Path, profile: str, profile_home: Path) 
     ).is_file():
         raise LaunchRejected("runtime registry default_board does not exist")
     return board
+
+
+def _ensure_release_python(profile: str, root: Path) -> None:
+    """Re-exec through the selected immutable release before optional imports."""
+    if not _PROFILE_RE.fullmatch(profile):
+        raise LaunchRejected("invalid profile id")
+    root = root.expanduser().resolve()
+    current = root / "runtime-links" / profile / "current"
+    if not current.is_symlink():
+        raise LaunchRejected("profile has no immutable current release")
+    release = current.resolve(strict=True)
+    if not _inside(release, (root / "releases").resolve()):
+        raise LaunchRejected("current release escapes the release root")
+    python = release / ".venv" / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise LaunchRejected("release Python environment is missing")
+    if Path(sys.executable).resolve() == python.resolve():
+        return
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    os.execve(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
 
 def resolve_launch(
@@ -174,6 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args, service_args = build_parser().parse_known_args(argv)
     root = args.root or Path(os.environ.get("HERMES_ROOT", Path.home() / ".hermes"))
     try:
+        _ensure_release_python(args.profile, root)
         spec = resolve_launch(
             args.profile,
             root,

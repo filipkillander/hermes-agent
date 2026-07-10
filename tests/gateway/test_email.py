@@ -562,12 +562,61 @@ class TestDispatchMessage(unittest.TestCase):
             self.assertEqual(len(captured_events), 1)
             self.assertEqual(captured_events[0].source.chat_id, "admin@test.com")
 
+    def test_authenticated_sender_from_allowlisted_domain_proceeds(self):
+        """Authenticated exact domains and subdomains are accepted safely."""
+        import asyncio
+        with patch.dict(os.environ, {
+            "EMAIL_ALLOWED_USERS": "",
+            "EMAIL_ALLOWED_DOMAINS": "@filipkillander.com, kmrstudios.se",
+        }):
+            adapter = self._make_adapter()
+            captured_events = []
+
+            async def mock_handler(event):
+                captured_events.append(event)
+                return None
+
+            adapter._message_handler = mock_handler
+            msg_data = {
+                "uid": b"domain-1", "sender_addr": "person@team.kmrstudios.se",
+                "sender_name": "Person", "subject": "Hej", "message_id": "<domain@test>",
+                "in_reply_to": "", "body": "Hej", "attachments": [], "date": "",
+                "sender_authenticated": True, "auth_reason": "dmarc=pass",
+            }
+            asyncio.run(adapter._dispatch_message(msg_data))
+            self.assertEqual(len(captured_events), 1)
+
+    def test_domain_allowlist_rejects_suffix_confusion_and_spoofing(self):
+        """Sibling suffixes and unauthenticated forged From addresses fail closed."""
+        import asyncio
+        with patch.dict(os.environ, {
+            "EMAIL_ALLOWED_USERS": "",
+            "EMAIL_ALLOWED_DOMAINS": "kmrstudios.se",
+            "EMAIL_TRUST_FROM_HEADER": "",
+            "EMAIL_ALLOW_ALL_USERS": "",
+            "GATEWAY_ALLOW_ALL_USERS": "",
+        }):
+            adapter = self._make_adapter()
+            adapter._message_handler = MagicMock()
+            base = {
+                "uid": b"domain-2", "sender_name": "Person", "subject": "Hej",
+                "message_id": "<domain2@test>", "in_reply_to": "", "body": "Hej",
+                "attachments": [], "date": "", "auth_reason": "dmarc=pass",
+            }
+            asyncio.run(adapter._dispatch_message({
+                **base, "sender_addr": "person@evilkmrstudios.se", "sender_authenticated": True,
+            }))
+            asyncio.run(adapter._dispatch_message({
+                **base, "sender_addr": "person@kmrstudios.se", "sender_authenticated": False,
+            }))
+            adapter._message_handler.assert_not_called()
+
     def test_empty_allowlist_denies_without_optin(self):
         """No allowlist and no allow-all opt-in → adapter fails closed (2.6)."""
         import asyncio
         with patch.dict(os.environ, {}, clear=False):
             # No allowlist, and explicitly no allow-all opt-in.
-            for k in ("EMAIL_ALLOWED_USERS", "EMAIL_ALLOW_ALL_USERS",
+            for k in ("EMAIL_ALLOWED_USERS", "EMAIL_ALLOWED_DOMAINS", "EMAIL_ALLOW_ALL_USERS",
                       "GATEWAY_ALLOW_ALL_USERS"):
                 os.environ.pop(k, None)
 
