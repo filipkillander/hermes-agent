@@ -56,6 +56,38 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _require_board_management_authority() -> None:
+    try:
+        from hermes_cli.runtime_registry import board_creation_authorized
+        from hermes_constants import get_hermes_home
+
+        allowed = board_creation_authorized(get_hermes_home())
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="runtime-registry denies board management for the active profile",
+        )
+
+
+def _require_delegation_authority(target: Optional[str]) -> None:
+    if not target:
+        return
+    try:
+        from hermes_cli.runtime_registry import delegation_authorized
+        from hermes_constants import get_hermes_home
+
+        allowed = delegation_authorized(get_hermes_home(), target)
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"runtime-registry denies delegation to {target!r} for the active profile",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Auth helper — WebSocket only (HTTP routes live behind the dashboard's
 # existing plugin-bypass; this is documented above).
@@ -596,6 +628,7 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+    _require_delegation_authority(payload.assignee)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -820,6 +853,7 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+    _require_delegation_authority(payload.assignee)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1168,6 +1202,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
+    _require_delegation_authority(payload.assignee)
     results: list[dict] = []
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1661,6 +1696,7 @@ def reassign_task_endpoint(
     smarter model after the assigned profile keeps hallucinating).
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
     """
+    _require_delegation_authority(payload.profile)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -2025,6 +2061,7 @@ def list_boards(include_archived: bool = Query(False)):
 @router.post("/boards")
 def create_board_endpoint(payload: CreateBoardBody):
     """Create a new board. Idempotent — ``slug`` collision returns existing."""
+    _require_board_management_authority()
     try:
         meta = kanban_db.create_board(
             payload.slug,
@@ -2046,6 +2083,7 @@ def create_board_endpoint(payload: CreateBoardBody):
 @router.patch("/boards/{slug}")
 def rename_board(slug: str, payload: RenameBoardBody):
     """Update a board's display metadata (slug is immutable — create a new one to rename the directory)."""
+    _require_board_management_authority()
     try:
         normed = kanban_db._normalize_board_slug(slug)
     except ValueError as exc:
@@ -2065,6 +2103,7 @@ def rename_board(slug: str, payload: RenameBoardBody):
 @router.delete("/boards/{slug}")
 def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
     """Archive (default) or hard-delete a board."""
+    _require_board_management_authority()
     try:
         res = kanban_db.remove_board(slug, archive=not delete)
     except ValueError as exc:
@@ -2080,6 +2119,7 @@ def switch_board(slug: str):
     endpoint is for ``/kanban boards switch`` parity so gateway slash
     commands and the CLI share the same current-board pointer.
     """
+    _require_board_management_authority()
     try:
         normed = kanban_db._normalize_board_slug(slug)
     except ValueError as exc:

@@ -333,6 +333,23 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
+def _require_delegation_authority(target: str, tool_name: str) -> Optional[str]:
+    """Fail before opening a board DB when the registry denies routing."""
+    try:
+        from hermes_cli.runtime_registry import delegation_authorized
+        from hermes_constants import get_hermes_home
+
+        allowed = delegation_authorized(get_hermes_home(), target)
+    except Exception:
+        allowed = False
+    if allowed:
+        return None
+    return tool_error(
+        f"{tool_name}: runtime-registry denies delegation to {target!r} "
+        "for the active profile"
+    )
+
+
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
@@ -846,6 +863,9 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    authority_error = _require_delegation_authority(str(assignee), "kanban_create")
+    if authority_error:
+        return authority_error
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")

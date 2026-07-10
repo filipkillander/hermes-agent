@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "profiles"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "profiles": {
       "type": "object",
       "propertyNames": {"pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
@@ -17,7 +17,7 @@
     "profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["role", "home"],
+      "required": ["role", "home", "domain", "can_delegate_to", "can_create_boards"],
       "properties": {
         "role": {"enum": ["external_gateway", "internal_worker"]},
         "home": {"type": "string", "pattern": "^/"},
@@ -29,6 +29,9 @@
         "required_platforms": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "bot_fingerprints": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}},
         "release_revision": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{7,128}$"}
+        ,"domain": {"enum": ["general", "smart_home", "worker"]}
+        ,"can_delegate_to": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}}
+        ,"can_create_boards": {"type": "boolean"}
       },
       "allOf": [
         {
@@ -46,6 +49,9 @@
               "allowed_platforms": {"maxItems": 0},
               "required_platforms": {"maxItems": 0},
               "bot_fingerprints": {"maxProperties": 0}
+              ,"domain": {"const": "worker"}
+              ,"can_delegate_to": {"maxItems": 0}
+              ,"can_create_boards": {"const": false}
             }
           }
         }

@@ -2392,6 +2392,22 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    # Registry authority is checked before child construction can allocate a
+    # terminal or start a process. ``workers`` is the closed internal-worker
+    # group in runtime-registry v2; Spark has no such grant and therefore
+    # cannot become an orchestrator even if a stale config exposes this tool.
+    try:
+        from hermes_cli.runtime_registry import delegation_authorized
+        from hermes_constants import get_hermes_home
+
+        delegation_allowed = delegation_authorized(get_hermes_home(), "workers")
+    except Exception:
+        delegation_allowed = False
+    if not delegation_allowed:
+        return tool_error(
+            "delegate_task: runtime-registry denies worker delegation for the active profile"
+        )
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
