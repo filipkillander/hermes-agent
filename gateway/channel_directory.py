@@ -293,7 +293,16 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+
+        # SessionDB.DEFAULT_DB_PATH is resolved at hermes_state import time and
+        # can therefore belong to another/live profile after HERMES_HOME or a
+        # context override changes. Channel discovery must follow the current
+        # profile explicitly and is SELECT-only; never create or migrate a DB
+        # as a side effect of refreshing the directory.
+        db_path = get_hermes_home() / "state.db"
+        if not db_path.exists():
+            return []
+        db = SessionDB(db_path=db_path, read_only=True)
         try:
             lister = getattr(db, "list_gateway_sessions", None)
             if not callable(lister):
