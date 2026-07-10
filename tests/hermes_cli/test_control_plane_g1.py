@@ -19,11 +19,17 @@ from hermes_cli.runtime_registry import (
 )
 
 
-def _registry_file(tmp_path: Path, *, dispatcher: bool = True) -> Path:
+def _registry_file(
+    tmp_path: Path,
+    *,
+    dispatcher: bool = True,
+    release_revision: str | None = None,
+) -> Path:
     home = tmp_path / "profiles" / "lumi"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text("model: test/model\n", encoding="utf-8")
     registry = tmp_path / "runtime-registry.yaml"
+    release_line = f"    release_revision: {release_revision}\n" if release_revision else ""
     registry.write_text(
         f"""schema_version: 1
 profiles:
@@ -35,7 +41,7 @@ profiles:
     dispatcher: {str(dispatcher).lower()}
     allowed_platforms: [telegram]
     required_platforms: [telegram]
-  coder:
+{release_line}  coder:
     role: internal_worker
     home: {tmp_path / 'profiles' / 'coder'}
 """,
@@ -171,7 +177,15 @@ class _Driver:
         self.current_pid += 1
 
 
-def _health_payload(profile, registry, pid, config_revision, active_agents=0):
+def _health_payload(
+    profile,
+    registry,
+    pid,
+    config_revision,
+    active_agents=0,
+    *,
+    code_revision=None,
+):
     return {
         "status": "ok",
         "gateway_state": "running",
@@ -190,7 +204,9 @@ def _health_payload(profile, registry, pid, config_revision, active_agents=0):
             "required_platforms": list(profile.required_platforms),
             "allowed_platforms": list(profile.allowed_platforms),
             "config_revision": config_revision,
-            "code_revision": profile.release_revision,
+            "code_revision": (
+                profile.release_revision if code_revision is None else code_revision
+            ),
         },
     }
 
@@ -279,6 +295,175 @@ def test_restart_coordinator_proves_identity_and_stability(tmp_path):
     assert result.new_pid == 102
     assert result.stable_probes == 3
     assert driver.restart_calls == 1
+
+
+def test_restart_coordinator_allows_only_preflight_release_transition(tmp_path):
+    registry = load_runtime_registry(
+        _registry_file(tmp_path, release_revision="release-new")
+    )
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+
+    def health(url, timeout):
+        code_revision = "release-old" if driver.restart_calls == 0 else "release-new"
+        return _health_payload(
+            profile,
+            registry,
+            driver.current_pid,
+            revision,
+            code_revision=code_revision,
+        )
+
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=health,
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+        stable_probes=1,
+        sleeper=lambda seconds: None,
+    )
+    result = coordinator.restart("lumi", allow_release_transition=True)
+    assert result.old_pid == 101
+    assert result.new_pid == 102
+    assert driver.restart_calls == 1
+
+
+def test_release_transition_is_opt_in(tmp_path):
+    registry = load_runtime_registry(
+        _registry_file(tmp_path, release_revision="release-new")
+    )
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=lambda url, timeout: _health_payload(
+            profile,
+            registry,
+            driver.current_pid,
+            revision,
+            code_revision="release-old",
+        ),
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+    )
+
+    with pytest.raises(RestartRejected, match="code_revision_mismatch"):
+        coordinator.restart("lumi")
+    assert driver.restart_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value", "failure"),
+    [
+        ("profile", "ops", "profile_mismatch"),
+        ("registry_revision", "wrong-registry", "registry_revision_mismatch"),
+        ("config_revision", "wrong-config", "config_revision_mismatch"),
+    ],
+)
+def test_release_transition_keeps_other_preflight_identity_checks(
+    tmp_path, field, wrong_value, failure
+):
+    registry = load_runtime_registry(
+        _registry_file(tmp_path, release_revision="release-new")
+    )
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+    payload = _health_payload(
+        profile,
+        registry,
+        driver.current_pid,
+        revision,
+        code_revision="release-old",
+    )
+    payload["runtime_identity"][field] = wrong_value
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=lambda url, timeout: payload,
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+    )
+
+    with pytest.raises(RestartRejected, match=failure):
+        coordinator.restart("lumi", allow_release_transition=True)
+    assert driver.restart_calls == 0
+
+
+def test_release_transition_postflight_enforces_desired_revision(tmp_path):
+    registry = load_runtime_registry(
+        _registry_file(tmp_path, release_revision="release-new")
+    )
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=lambda url, timeout: _health_payload(
+            profile,
+            registry,
+            driver.current_pid,
+            revision,
+            code_revision="release-old",
+        ),
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+        clock=lambda: now[0],
+        sleeper=sleep,
+        stable_probes=1,
+        postflight_timeout=1,
+    )
+
+    with pytest.raises(RestartRejected, match="code_revision_mismatch"):
+        coordinator.restart("lumi", allow_release_transition=True)
+    assert driver.restart_calls == 1
+
+
+def test_restart_coordinator_cli_forwards_release_transition_flag(monkeypatch, tmp_path):
+    from hermes_cli import restart_coordinator as module
+
+    calls = {}
+    registry = object()
+
+    class FakeCoordinator:
+        def __init__(self, received_registry):
+            assert received_registry is registry
+
+        def restart(self, profile, *, allow_release_transition):
+            calls.update(
+                profile=profile,
+                allow_release_transition=allow_release_transition,
+            )
+            return module.RestartResult(
+                profile=profile,
+                old_pid=1,
+                new_pid=2,
+                config_revision="config-revision",
+                stable_probes=6,
+            )
+
+    monkeypatch.setattr(module, "load_runtime_registry", lambda *args, **kwargs: registry)
+    monkeypatch.setattr(module, "RestartCoordinator", FakeCoordinator)
+
+    assert module.main(["lumi", "--allow-release-transition"]) == 0
+    assert calls == {
+        "profile": "lumi",
+        "allow_release_transition": True,
+    }
 
 
 def test_restart_coordinator_never_kills_unknown_port_owner(tmp_path):
