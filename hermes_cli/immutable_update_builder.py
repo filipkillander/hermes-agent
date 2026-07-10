@@ -91,25 +91,45 @@ if not dashboard.is_file() or dashboard.stat().st_size == 0:
 
 
 def _relocate_venv_shebangs(staging: Path, final_release: Path) -> int:
-    """Rewrite uv-generated absolute staging shebangs before sealing."""
+    """Rewrite the two uv launcher formats without touching script bodies."""
     staging = staging.resolve()
     final_release = final_release.resolve()
     if final_release.parent != staging.parent or final_release.name.startswith(".staging-"):
         raise UpdateBuildError("invalid_final_release_path", "stage_build")
-    prefix = ("#!" + str(staging)).encode("utf-8")
-    replacement = ("#!" + str(final_release)).encode("utf-8")
+    staging_bytes = str(staging).encode("utf-8")
+    final_bytes = str(final_release).encode("utf-8")
+    shebang_prefix = b"#!" + staging_bytes + b"/"
+    shebang_replacement = b"#!" + final_bytes + b"/"
+    trampoline = (
+        b"#!/bin/sh\n'''exec' '"
+        + staging_bytes
+        + b"/.venv/bin/python' \"$0\" \"$@\"\n"
+    )
+    trampoline_replacement = (
+        b"#!/bin/sh\n'''exec' '"
+        + final_bytes
+        + b"/.venv/bin/python' \"$0\" \"$@\"\n"
+    )
     changed = 0
     bin_dir = staging / ".venv" / "bin"
     for path in sorted(bin_dir.iterdir()):
         if path.is_symlink() or not path.is_file():
             continue
         payload = path.read_bytes()
-        if not payload.startswith(prefix):
+        if payload.startswith(shebang_prefix):
+            newline = payload.find(b"\n")
+            if newline < 0:
+                raise UpdateBuildError("invalid_venv_shebang", "stage_build")
+            payload = (
+                shebang_replacement
+                + payload[len(shebang_prefix):newline]
+                + payload[newline:]
+            )
+        elif payload.startswith(trampoline):
+            payload = trampoline_replacement + payload[len(trampoline):]
+        else:
             continue
-        newline = payload.find(b"\n")
-        if newline < 0:
-            raise UpdateBuildError("invalid_venv_shebang", "stage_build")
-        path.write_bytes(replacement + payload[len(prefix):newline] + payload[newline:])
+        path.write_bytes(payload)
         changed += 1
     return changed
 

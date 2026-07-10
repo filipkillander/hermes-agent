@@ -259,3 +259,39 @@ def test_relocate_venv_shebangs_targets_final_release(tmp_path: Path) -> None:
         f"#!{final}/.venv/bin/python\n"
     )
     assert untouched.read_text(encoding="utf-8") == "#!/bin/sh\nexit 0\n"
+
+
+def test_relocate_venv_shebangs_handles_uv_shell_trampoline(tmp_path: Path) -> None:
+    staging = tmp_path / "releases" / ".staging-release-with-a-long-path"
+    bin_dir = staging / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    final = staging.parent / "release"
+    script = bin_dir / "hermes"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"'''exec' '{staging}/.venv/bin/python' \"$0\" \"$@\"\n"
+        "' '''\n"
+        "print('ok')\n",
+        encoding="utf-8",
+    )
+
+    assert _relocate_venv_shebangs(staging, final) == 1
+    assert script.read_text(encoding="utf-8") == (
+        "#!/bin/sh\n"
+        f"'''exec' '{final}/.venv/bin/python' \"$0\" \"$@\"\n"
+        "' '''\n"
+        "print('ok')\n"
+    )
+
+
+def test_relocate_venv_shebangs_does_not_replace_script_body(tmp_path: Path) -> None:
+    staging = tmp_path / "releases" / ".staging-release-uuid"
+    bin_dir = staging / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    final = staging.parent / "release"
+    script = bin_dir / "other"
+    original = f"#!/bin/sh\necho '{staging}/.venv/bin/python'\n"
+    script.write_text(original, encoding="utf-8")
+
+    assert _relocate_venv_shebangs(staging, final) == 0
+    assert script.read_text(encoding="utf-8") == original
