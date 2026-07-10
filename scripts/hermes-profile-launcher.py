@@ -84,7 +84,7 @@ def resolve_launch(
 ) -> LaunchSpec:
     if not _PROFILE_RE.fullmatch(profile):
         raise LaunchRejected("invalid profile id")
-    if service not in {"gateway", "dashboard"}:
+    if service not in {"gateway", "dashboard", "cli"}:
         raise LaunchRejected("invalid service")
     if service == "gateway" and service_args:
         raise LaunchRejected("gateway does not accept launcher passthrough arguments")
@@ -151,7 +151,12 @@ def resolve_launch(
         }
     )
     env.pop("PYTHONPATH", None)
-    command = ("gateway", "run") if service == "gateway" else ("dashboard", *service_args)
+    if service == "gateway":
+        command = ("gateway", "run")
+    elif service == "dashboard":
+        command = ("dashboard", *service_args)
+    else:
+        command = tuple(service_args)
     argv = (str(python), "-m", "hermes_cli.main", "--profile", profile, *command)
     return LaunchSpec(profile, service, release, release_id, commit, python, argv, env)
 
@@ -159,7 +164,7 @@ def resolve_launch(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile")
-    parser.add_argument("service", nargs="?", choices=("gateway", "dashboard"), default="gateway")
+    parser.add_argument("service", nargs="?", choices=("gateway", "dashboard", "cli"), default="gateway")
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--check", action="store_true")
     return parser
