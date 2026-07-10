@@ -576,6 +576,69 @@ def test_read_macos_keychain_generic_password_uses_security_without_shell(monkey
     assert kwargs["capture_output"] is True
 
 
+def test_read_macos_keychain_generic_password_uses_private_helper(monkeypatch, tmp_path):
+    helper = tmp_path / "keychain-helper"
+    helper.write_text("helper")
+    helper.chmod(0o700)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return mock.Mock(returncode=0, stdout="0.helper\n", stderr="")
+
+    monkeypatch.setattr(bw.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    token = bw.read_macos_keychain_generic_password(
+        "ai.hermes.bitwarden.bws",
+        "lumi-runtime-v1",
+        access_token_keychain={"helper_path": str(helper)},
+    )
+
+    assert token == "0.helper"
+    cmd, kwargs = calls[0]
+    assert cmd == [str(helper), "read", "lumi-runtime-v1"]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["capture_output"] is True
+
+
+def test_keychain_helper_rejects_group_readable_file(tmp_path):
+    helper = tmp_path / "keychain-helper"
+    helper.write_text("helper")
+    helper.chmod(0o750)
+
+    with pytest.raises(RuntimeError, match="permissions are unsafe"):
+        bw.read_macos_keychain_generic_password(
+            "ai.hermes.bitwarden.bws",
+            "lumi-runtime-v1",
+            access_token_keychain={"helper_path": str(helper)},
+        )
+
+
+def test_keychain_helper_never_includes_stderr_in_error(monkeypatch, tmp_path):
+    helper = tmp_path / "keychain-helper"
+    helper.write_text("helper")
+    helper.chmod(0o700)
+    monkeypatch.setattr(bw.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        bw.subprocess,
+        "run",
+        lambda *_args, **_kwargs: mock.Mock(
+            returncode=2,
+            stdout="",
+            stderr="0.secret-must-not-escape",
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        bw.read_macos_keychain_generic_password(
+            "ai.hermes.bitwarden.bws",
+            "lumi-runtime-v1",
+            access_token_keychain={"helper_path": str(helper)},
+        )
+    assert "secret-must-not-escape" not in str(exc.value)
+
+
 def test_apply_uses_keychain_when_env_token_missing(monkeypatch, tmp_path):
     monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
     monkeypatch.setattr(

@@ -532,12 +532,53 @@ def _keychain_cfg_field(access_token_keychain: Any, field: str) -> str:
     return str(access_token_keychain.get(field, "") or "").strip()
 
 
-def macos_keychain_generic_password_exists(service: str, account: str) -> bool:
+def _validated_keychain_helper(access_token_keychain: Any) -> Optional[Path]:
+    """Return a private, executable helper path or None for legacy security(1)."""
+    raw = _keychain_cfg_field(access_token_keychain, "helper_path")
+    if not raw:
+        return None
+    helper = Path(raw)
+    if not helper.is_absolute() or helper.is_symlink() or not helper.is_file():
+        raise RuntimeError("macOS Keychain helper path is not a regular absolute file")
+    stat = helper.stat()
+    if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+        raise RuntimeError("macOS Keychain helper ownership or permissions are unsafe")
+    if not os.access(helper, os.X_OK):
+        raise RuntimeError("macOS Keychain helper is not executable")
+    return helper
+
+
+def _run_keychain_helper(
+    helper: Path,
+    action: str,
+    account: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 — config path is validated above
+        [str(helper), action, account],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def macos_keychain_generic_password_exists(
+    service: str,
+    account: str,
+    *,
+    access_token_keychain: Any = None,
+) -> bool:
     """Return whether a generic password exists without reading its value."""
     service = (service or "").strip()
     account = (account or "").strip()
     if not service or not account or platform.system() != "Darwin":
         return False
+    try:
+        helper = _validated_keychain_helper(access_token_keychain)
+    except RuntimeError:
+        return False
+    if helper is not None:
+        return _run_keychain_helper(helper, "exists", account).returncode == 0
     proc = subprocess.run(  # noqa: S603 — fixed system binary, no shell
         [
             "/usr/bin/security",
@@ -555,7 +596,12 @@ def macos_keychain_generic_password_exists(service: str, account: str) -> bool:
     return proc.returncode == 0
 
 
-def read_macos_keychain_generic_password(service: str, account: str) -> str:
+def read_macos_keychain_generic_password(
+    service: str,
+    account: str,
+    *,
+    access_token_keychain: Any = None,
+) -> str:
     """Read a macOS generic password value without logging or shell expansion."""
     service = (service or "").strip()
     account = (account or "").strip()
@@ -563,6 +609,22 @@ def read_macos_keychain_generic_password(service: str, account: str) -> str:
         raise RuntimeError("macOS Keychain token source is only available on Darwin")
     if not service or not account:
         raise RuntimeError("macOS Keychain service/account is incomplete")
+
+    helper = _validated_keychain_helper(access_token_keychain)
+    if helper is not None:
+        if service != "ai.hermes.bitwarden.bws":
+            raise RuntimeError("macOS Keychain helper requires the Hermes BWS service")
+        proc = _run_keychain_helper(helper, "read", account)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"macOS Keychain item {service}/{account} could not be read by helper"
+            )
+        token = proc.stdout.rstrip("\r\n")
+        if not token:
+            raise RuntimeError(
+                f"macOS Keychain item {service}/{account} returned an empty token"
+            )
+        return token
 
     proc = subprocess.run(  # noqa: S603 — fixed system binary, no shell
         [
@@ -611,7 +673,14 @@ def resolve_access_token(
 
     service = _keychain_cfg_field(access_token_keychain, "service")
     account = _keychain_cfg_field(access_token_keychain, "account")
-    token = read_macos_keychain_generic_password(service, account)
+    if _keychain_cfg_field(access_token_keychain, "helper_path"):
+        token = read_macos_keychain_generic_password(
+            service,
+            account,
+            access_token_keychain=access_token_keychain,
+        )
+    else:
+        token = read_macos_keychain_generic_password(service, account)
     return token, f"macos-keychain:{service}/{account}"
 
 # ---------------------------------------------------------------------------
