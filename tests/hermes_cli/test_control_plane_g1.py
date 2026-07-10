@@ -331,6 +331,62 @@ def test_restart_coordinator_allows_only_preflight_release_transition(tmp_path):
     assert driver.restart_calls == 1
 
 
+def test_restart_coordinator_allows_identified_degraded_gateway_to_heal(tmp_path):
+    registry = load_runtime_registry(_registry_file(tmp_path))
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+
+    def health(url, timeout):
+        payload = _health_payload(
+            profile,
+            registry,
+            driver.current_pid,
+            revision,
+        )
+        if driver.restart_calls == 0:
+            payload["platforms"]["telegram"]["state"] = "disconnected"
+        return payload
+
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=health,
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+        stable_probes=1,
+        sleeper=lambda seconds: None,
+    )
+
+    result = coordinator.restart("lumi")
+    assert result.new_pid == 102
+    assert driver.restart_calls == 1
+
+
+def test_restart_coordinator_rejects_wrong_identity_even_when_degraded(tmp_path):
+    registry = load_runtime_registry(_registry_file(tmp_path))
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+    payload = _health_payload(profile, registry, driver.current_pid, revision)
+    payload["platforms"]["telegram"]["state"] = "disconnected"
+    payload["runtime_identity"]["profile"] = "spark"
+
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=lambda url, timeout: payload,
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+    )
+
+    with pytest.raises(RestartRejected, match="profile_mismatch"):
+        coordinator.restart("lumi")
+    assert driver.restart_calls == 0
+
+
 def test_release_transition_is_opt_in(tmp_path):
     registry = load_runtime_registry(
         _registry_file(tmp_path, release_revision="release-new")
