@@ -443,6 +443,13 @@ def get_current_board() -> str:
                 return normed
         except ValueError:
             pass
+    # Registered external profiles have an operator-owned default. This is
+    # identity-scoped and deliberately precedes the legacy global pointer.
+    from hermes_cli.runtime_registry import default_board_for_home
+    from hermes_constants import get_hermes_home
+    registered_default = default_board_for_home(get_hermes_home(), required=False)
+    if registered_default:
+        return registered_default
     try:
         f = current_board_path()
         if f.exists():

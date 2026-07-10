@@ -12,8 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import yaml
+
 
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class LaunchRejected(RuntimeError):
@@ -45,6 +48,30 @@ def _private_key_is_valid(path: Path) -> bool:
         return path.is_file() and path.stat().st_size >= 32 and not (path.stat().st_mode & 0o077)
     except OSError:
         return False
+
+
+def _registered_default_board(registry: Path, profile: str, profile_home: Path) -> str:
+    try:
+        document = yaml.safe_load(registry.read_text(encoding="utf-8"))
+        entry = document["profiles"][profile]
+    except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
+        raise LaunchRejected("runtime registry profile is missing or invalid") from exc
+    if document.get("schema_version") != 2 or entry.get("role") != "external_gateway":
+        raise LaunchRejected("runtime registry profile is not an external gateway")
+    try:
+        registered_home = Path(entry["home"]).resolve()
+    except (KeyError, TypeError, OSError) as exc:
+        raise LaunchRejected("runtime registry profile home is invalid") from exc
+    if registered_home != profile_home.resolve():
+        raise LaunchRejected("runtime registry profile home mismatch")
+    board = entry.get("default_board")
+    if not isinstance(board, str) or not _BOARD_RE.fullmatch(board):
+        raise LaunchRejected("runtime registry default_board is missing or invalid")
+    if board != "default" and not (
+        registry.parent / "kanban" / "boards" / board / "board.json"
+    ).is_file():
+        raise LaunchRejected("runtime registry default_board does not exist")
+    return board
 
 
 def resolve_launch(
@@ -91,6 +118,7 @@ def resolve_launch(
     profile_home = root / "profiles" / profile
     if not (profile_home / "config.yaml").is_file():
         raise LaunchRejected("profile config is missing")
+    default_board = _registered_default_board(registry, profile, profile_home)
 
     python = release / ".venv" / "bin" / "python"
     if not python.is_file() or not os.access(python, os.X_OK):
@@ -116,6 +144,7 @@ def resolve_launch(
             "HERMES_RELEASE_REVISION": commit,
             "HERMES_RUNTIME_REGISTRY": str(registry),
             "HERMES_BOT_FINGERPRINT_KEY_FILE": str(fingerprint_key),
+            "HERMES_KANBAN_BOARD": default_board,
             "VIRTUAL_ENV": str(release / ".venv"),
             "PYTHONNOUSERSITE": "1",
             "PATH": os.pathsep.join([*release_bins, *clean_path]),

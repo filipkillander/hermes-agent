@@ -34,7 +34,25 @@ def _runtime(tmp_path: Path, profile: str = "spark") -> tuple[Path, Path]:
     (links / "current").symlink_to(release)
     (root / "profiles" / profile).mkdir(parents=True)
     (root / "profiles" / profile / "config.yaml").write_text("model: test\n", encoding="utf-8")
-    (root / "runtime-registry.yaml").write_text("schema_version: 2\nprofiles: {}\n", encoding="utf-8")
+    board = "home-automation" if profile == "spark" else profile
+    board_dir = root / "kanban" / "boards" / board
+    board_dir.mkdir(parents=True)
+    (board_dir / "board.json").write_text(json.dumps({"slug": board}), encoding="utf-8")
+    (root / "runtime-registry.yaml").write_text(
+        f"""schema_version: 2
+profiles:
+  {profile}:
+    role: external_gateway
+    home: {root / 'profiles' / profile}
+    service_label: ai.hermes.gateway-{profile}
+    port: 8643
+    domain: smart_home
+    can_delegate_to: []
+    can_create_boards: false
+    default_board: {board}
+""",
+        encoding="utf-8",
+    )
     key = root / "control-plane/bot-fingerprint.key"
     key.parent.mkdir(parents=True)
     key.write_bytes(b"k" * 32)
@@ -54,6 +72,7 @@ def test_resolve_launch_pins_profile_release_and_clean_path(tmp_path: Path) -> N
     assert spec.env["HERMES_RELEASE_REVISION"] == "a" * 40
     assert spec.env["HERMES_RUNTIME_REGISTRY"] == str(root / "runtime-registry.yaml")
     assert spec.env["HERMES_BOT_FINGERPRINT_KEY_FILE"].endswith("bot-fingerprint.key")
+    assert spec.env["HERMES_KANBAN_BOARD"] == "home-automation"
     assert "hermes-agent" not in spec.env["PATH"]
     assert spec.env["PATH"].startswith(str(release / ".venv/bin"))
     assert "PYTHONPATH" not in spec.env
@@ -91,6 +110,13 @@ def test_gateway_rejects_passthrough_arguments(tmp_path: Path) -> None:
             {"PATH": "/usr/bin:/bin"},
             service_args=("--replace",),
         )
+
+
+def test_launcher_rejects_stale_default_board(tmp_path: Path) -> None:
+    root, _ = _runtime(tmp_path)
+    (root / "kanban/boards/home-automation/board.json").unlink()
+    with pytest.raises(launcher.LaunchRejected, match="default_board does not exist"):
+        launcher.resolve_launch("spark", root, {"PATH": "/usr/bin"})
 
 
 @pytest.mark.parametrize("failure", ["missing-link", "outside-link", "open-key", "missing-venv"])
