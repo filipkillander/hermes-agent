@@ -255,13 +255,44 @@ class RestartCoordinator:
             raise RestartRejected(f"Config is missing for {profile.name}")
         return snapshot.content_hash
 
-    def _validate_identity(
+    def _validate_runtime_identity(
         self,
         profile: ProfileRuntime,
         payload: dict[str, Any],
         config_revision: str,
         *,
         allow_code_revision_mismatch: bool = False,
+    ) -> tuple[bool, list[str]]:
+        failures: list[str] = []
+        identity = payload.get("runtime_identity") if isinstance(payload.get("runtime_identity"), dict) else {}
+        if identity.get("profile") != profile.name:
+            failures.append("profile_mismatch")
+        if identity.get("role") != profile.role:
+            failures.append("role_mismatch")
+        if identity.get("service_label") != profile.service_label:
+            failures.append("service_label_mismatch")
+        if identity.get("port") != profile.port:
+            failures.append("port_mismatch")
+        if identity.get("registry_revision") != self.registry.revision:
+            failures.append("registry_revision_mismatch")
+        if identity.get("registry_verified") is not True:
+            failures.append("registry_not_verified")
+        if identity.get("config_revision") != config_revision:
+            failures.append("config_revision_mismatch")
+        if profile.release_revision and identity.get("code_revision") != profile.release_revision:
+            failures.append("code_revision_mismatch")
+        if allow_code_revision_mismatch:
+            # Promotion/rollback preflight is expected to observe the OLD
+            # release. This narrow exception never applies to postflight and
+            # cannot suppress any other identity failure.
+            failures = [failure for failure in failures if failure != "code_revision_mismatch"]
+        return not failures, failures
+
+    def _validate_readiness(
+        self,
+        profile: ProfileRuntime,
+        payload: dict[str, Any],
+        config_revision: str,
     ) -> tuple[bool, list[str]]:
         ready, failures = evaluate_runtime_readiness(
             payload,
@@ -270,17 +301,15 @@ class RestartCoordinator:
             expected_port=profile.port,
             expected_registry_revision=self.registry.revision,
         )
-        identity = payload.get("runtime_identity") if isinstance(payload.get("runtime_identity"), dict) else {}
-        if identity.get("config_revision") != config_revision:
-            failures.append("config_revision_mismatch")
-        if profile.release_revision and identity.get("code_revision") != profile.release_revision:
-            failures.append("code_revision_mismatch")
-        if allow_code_revision_mismatch:
-            # Promotion/rollback preflight is expected to observe the OLD
-            # release. This narrow exception never applies to postflight and
-            # cannot suppress any other identity/readiness failure.
-            failures = [failure for failure in failures if failure != "code_revision_mismatch"]
-        return not failures and ready, failures
+        identity_ok, identity_failures = self._validate_runtime_identity(
+            profile,
+            payload,
+            config_revision,
+        )
+        for failure in identity_failures:
+            if failure not in failures:
+                failures.append(failure)
+        return ready and identity_ok and not failures, failures
 
     def restart(
         self,
@@ -315,7 +344,7 @@ class RestartCoordinator:
 
             before = self.health_probe(profile.health_url, 3.0)
             if before is not None:
-                identity_ok, failures = self._validate_identity(
+                identity_ok, failures = self._validate_runtime_identity(
                     profile,
                     before,
                     config_revision,
@@ -348,7 +377,11 @@ class RestartCoordinator:
                 payload = self.health_probe(profile.health_url, 3.0)
                 owners = self.port_probe(profile.port)
                 if payload is not None and service_pid is not None:
-                    valid, failures = self._validate_identity(profile, payload, config_revision)
+                    valid, failures = self._validate_readiness(
+                        profile,
+                        payload,
+                        config_revision,
+                    )
                     pid_matches = (
                         payload.get("pid") == service_pid
                         and owners == {service_pid}
