@@ -20,6 +20,16 @@ def _setup_sessions(tmp_path, sessions_data):
 
 
 class TestFindSessionId:
+    def setup_method(self):
+        # These tests exercise the legacy sessions.json fallback.  Do not let
+        # a developer's live state.db satisfy the primary lookup first.
+        self._db_patch = patch("hermes_state.SessionDB")
+        db_cls = self._db_patch.start()
+        db_cls.return_value.find_session_by_origin.return_value = None
+
+    def teardown_method(self):
+        self._db_patch.stop()
+
     def test_finds_matching_session(self, tmp_path):
         sessions_dir, index_file = _setup_sessions(tmp_path, {
             "agent:main:telegram:dm": {
@@ -152,6 +162,15 @@ class TestFindSessionId:
 
 
 class TestMirrorToSession:
+    def setup_method(self):
+        # Keep fallback tests hermetic from a live profile's state.db.
+        self._db_patch = patch("hermes_state.SessionDB")
+        db_cls = self._db_patch.start()
+        db_cls.return_value.find_session_by_origin.return_value = None
+
+    def teardown_method(self):
+        self._db_patch.stop()
+
     def test_successful_mirror(self, tmp_path):
         sessions_dir, index_file = _setup_sessions(tmp_path, {
             "s1": {

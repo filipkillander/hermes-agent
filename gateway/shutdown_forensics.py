@@ -220,25 +220,47 @@ def spawn_async_diagnostic(
     except OSError:
         return None
 
-    # Inline shell so we don't have to ship a helper script.  bash -c is
-    # available on every POSIX target we support; on Windows we just skip
-    # the snapshot (the platform doesn't ship ps anyway).
+    # Windows does not provide the POSIX process tools used by this diagnostic.
     if sys.platform == "win32":
         return None
 
-    script = (
-        f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
-        "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
-        "echo '=== end ==='"
-    )
+    # Run a tiny Python helper rather than relying on GNU ``timeout`` or GNU
+    # ``ps`` flags.  macOS ships neither, which previously made shutdown
+    # forensics silently return None on every Mac gateway.  The helper owns
+    # the bounded subprocess calls and writes only to the inherited fd.
+    helper = r"""
+import datetime
+import subprocess
+import sys
+
+signal_name, parent_pid, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])
+
+def emit(argv, *, lines=60):
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=max(0.2, timeout_s),
+            check=False,
+        )
+        output = (result.stdout or result.stderr or "").splitlines()
+        print("\n".join(output[:lines]), flush=True)
+    except Exception as exc:
+        print(f"diagnostic command unavailable: {type(exc).__name__}", flush=True)
+
+print(f"=== shutdown diagnostic @ {signal_name} ===")
+print("--- date ---")
+print(datetime.datetime.now(datetime.timezone.utc).isoformat())
+print("--- processes ---")
+if sys.platform == "darwin":
+    emit(["/bin/ps", "-axo", "pid,ppid,%cpu,%mem,state,command", "-r"])
+else:
+    emit(["ps", "auxf", "--sort=-pcpu"])
+print("--- parent process ---")
+emit(["/bin/ps" if sys.platform == "darwin" else "ps", "-p", parent_pid, "-o", "pid=,ppid=,state=,command="], lines=10)
+print("=== end ===")
+"""
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
@@ -255,7 +277,14 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [
+                sys.executable,
+                "-c",
+                helper,
+                str(signal_name)[:80],
+                str(os.getpid()),
+                f"{max(0.2, timeout_seconds):.3f}",
+            ],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
