@@ -62,6 +62,13 @@ def test_stage_rejects_tracked_forbidden_entries(tmp_path: Path, name: str) -> N
         manager.stage(repo, "r1")
 
 
+def test_stage_allows_legitimate_client_secret_source_module(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, {"package/client_secret_create_params.py": "class Params: pass\n"})
+    manager = ImmutableReleaseManager(tmp_path / "home")
+    release = manager.stage(repo, "r1")
+    assert (release / "package/client_secret_create_params.py").is_file()
+
+
 def test_verify_detects_release_tampering(tmp_path: Path) -> None:
     manager = ImmutableReleaseManager(tmp_path / "home")
     release = manager.stage(_repo(tmp_path), "r1")
