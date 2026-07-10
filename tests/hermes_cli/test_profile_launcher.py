@@ -101,6 +101,21 @@ def test_dashboard_launch_uses_same_pinned_release(tmp_path: Path) -> None:
     )
 
 
+def test_cli_launch_uses_profile_release_and_passes_inner_arguments(tmp_path: Path) -> None:
+    root, release = _runtime(tmp_path, profile="igor")
+    spec = launcher.resolve_launch(
+        "igor",
+        root,
+        {"PATH": "/usr/bin:/bin"},
+        service="cli",
+        service_args=("kanban", "boards", "list"),
+    )
+    assert spec.service == "cli"
+    assert spec.release == release
+    assert spec.env["HERMES_KANBAN_BOARD"] == "igor"
+    assert spec.argv[-5:] == ("--profile", "igor", "kanban", "boards", "list")
+
+
 def test_gateway_rejects_passthrough_arguments(tmp_path: Path) -> None:
     root, _ = _runtime(tmp_path)
     with pytest.raises(launcher.LaunchRejected, match="passthrough"):
