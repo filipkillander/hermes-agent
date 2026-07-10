@@ -1380,6 +1380,32 @@ def _build_adapter(config):
     return EmailAdapter(config)
 
 
+def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
+    """Bridge explicit profile-scoped email env names to canonical EMAIL_* names."""
+    extra = email_cfg.get("extra") if isinstance(email_cfg.get("extra"), dict) else {}
+    mappings = {
+        "address_env": "EMAIL_ADDRESS",
+        "password_env": "EMAIL_PASSWORD",
+        "imap_host_env": "EMAIL_IMAP_HOST",
+        "imap_port_env": "EMAIL_IMAP_PORT",
+        "imap_security_env": "EMAIL_IMAP_SECURITY",
+        "smtp_host_env": "EMAIL_SMTP_HOST",
+        "smtp_port_env": "EMAIL_SMTP_PORT",
+        "smtp_security_env": "EMAIL_SMTP_SECURITY",
+        "allowed_users_env": "EMAIL_ALLOWED_USERS",
+        "home_address_env": "EMAIL_HOME_ADDRESS",
+    }
+    for config_key, canonical_env in mappings.items():
+        source = email_cfg.get(config_key, extra.get(config_key))
+        if source is None or os.getenv(canonical_env):
+            continue
+        source_name = str(source).strip()
+        if source_name:
+            value = os.getenv(source_name)
+            if value:
+                os.environ[canonical_env] = value
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1388,6 +1414,7 @@ def register(ctx) -> None:
         adapter_factory=_build_adapter,
         check_fn=check_email_requirements,
         is_connected=_is_connected,
+        apply_yaml_config_fn=_apply_yaml_config,
         required_env=["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST"],
         install_hint="Email uses the Python stdlib (smtplib/imaplib) — no extra deps",
         allowed_users_env="EMAIL_ALLOWED_USERS",
