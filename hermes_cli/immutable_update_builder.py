@@ -85,6 +85,30 @@ for path in root.glob("lib/python*/site-packages/*.pth"):
 """
 
 
+def _relocate_venv_shebangs(staging: Path, final_release: Path) -> int:
+    """Rewrite uv-generated absolute staging shebangs before sealing."""
+    staging = staging.resolve()
+    final_release = final_release.resolve()
+    if final_release.parent != staging.parent or final_release.name.startswith(".staging-"):
+        raise UpdateBuildError("invalid_final_release_path", "stage_build")
+    prefix = ("#!" + str(staging)).encode("utf-8")
+    replacement = ("#!" + str(final_release)).encode("utf-8")
+    changed = 0
+    bin_dir = staging / ".venv" / "bin"
+    for path in sorted(bin_dir.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            continue
+        payload = path.read_bytes()
+        if not payload.startswith(prefix):
+            continue
+        newline = payload.find(b"\n")
+        if newline < 0:
+            raise UpdateBuildError("invalid_venv_shebang", "stage_build")
+        path.write_bytes(replacement + payload[len(prefix):newline] + payload[newline:])
+        changed += 1
+    return changed
+
+
 class UpdateBuildError(RuntimeError):
     """A sanitized build failure whose message never contains command output."""
 
@@ -363,12 +387,27 @@ class ImmutableUpdateBuilder:
                 output_sha256=probe.output_sha256,
                 output_bytes=probe.output_bytes,
             )
+        cli_probe = _run_digest(
+            [str(release / ".venv" / "bin" / "hermes"), "--help"],
+            cwd=release,
+            home=release,
+            timeout=120.0,
+        )
+        if cli_probe.returncode:
+            raise UpdateBuildError(
+                "release_cli_probe_failed",
+                "verify",
+                output_sha256=cli_probe.output_sha256,
+                output_bytes=cli_probe.output_bytes,
+            )
         return {
             "file_count": len(files),
             "size_bytes": size_bytes,
             "manifest_sha256": _sha256_file(release / ".hermes-release.json"),
             "import_output_sha256": probe.output_sha256,
             "import_output_bytes": probe.output_bytes,
+            "cli_output_sha256": cli_probe.output_sha256,
+            "cli_output_bytes": cli_probe.output_bytes,
         }
 
     def build(
@@ -413,6 +452,8 @@ class ImmutableUpdateBuilder:
                 "_stage-build",
                 "--uv",
                 str(uv.resolve()),
+                "--final-release",
+                str(self.manager.release_path(release_id)),
             ]
             try:
                 self.manager.stage(
@@ -444,7 +485,7 @@ class ImmutableUpdateBuilder:
             return status
 
 
-def _stage_build(uv: Path) -> int:
+def _stage_build(uv: Path, final_release: Path) -> int:
     """Build and validate inside release-manager staging; never promote."""
     cwd = Path.cwd().resolve()
     if cwd.parent.name != "releases" or not cwd.name.startswith(".staging-") or (cwd / ".git").exists():
@@ -478,6 +519,7 @@ def _stage_build(uv: Path) -> int:
                 )
             )
             return 1
+        relocated_scripts = _relocate_venv_shebangs(cwd, final_release)
         probe = _run_digest(
             [str(cwd / ".venv" / "bin" / "python"), "-I", "-c", _IMPORT_PROBE],
             cwd=cwd,
@@ -491,6 +533,7 @@ def _stage_build(uv: Path) -> int:
         "dependency_output_bytes": result.output_bytes,
         "import_output_sha256": probe.output_sha256,
         "import_output_bytes": probe.output_bytes,
+        "relocated_script_count": relocated_scripts,
     }
     print(json.dumps(record, sort_keys=True))
     return 0 if probe.returncode == 0 else 1
@@ -510,6 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     internal = subparsers.add_parser("_stage-build", help=argparse.SUPPRESS)
     internal.add_argument("--uv", required=True)
+    internal.add_argument("--final-release", required=True)
     return parser
 
 
@@ -517,7 +561,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "_stage-build":
         try:
-            return _stage_build(Path(args.uv).resolve())
+            return _stage_build(
+                Path(args.uv).resolve(),
+                Path(args.final_release).resolve(),
+            )
         except (OSError, UpdateBuildError):
             print(json.dumps({"state": "failed", "phase": "stage_build"}, sort_keys=True))
             return 1
