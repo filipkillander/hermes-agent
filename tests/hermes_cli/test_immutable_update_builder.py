@@ -13,6 +13,7 @@ from hermes_cli.immutable_update_builder import (
     ImmutableUpdateBuilder,
     UpdateBuildError,
     _harness_sha256,
+    _relocate_venv_shebangs,
     _stage_build,
 )
 
@@ -219,7 +220,7 @@ def test_stage_build_emits_digest_not_raw_tool_output(
     uv.chmod(0o700)
     monkeypatch.chdir(staging)
 
-    assert _stage_build(uv) == 0
+    assert _stage_build(uv, staging.parent / "test") == 0
     rendered = capsys.readouterr().out
     assert "raw-output-must-not-survive" not in rendered
     record = json.loads(rendered)
@@ -229,4 +230,21 @@ def test_stage_build_emits_digest_not_raw_tool_output(
 
 def test_stage_build_refuses_non_staging_worktree(tmp_path: Path) -> None:
     with pytest.raises(UpdateBuildError, match="not_release_staging"):
-        _stage_build(tmp_path / "uv")
+        _stage_build(tmp_path / "uv", tmp_path / "release")
+
+
+def test_relocate_venv_shebangs_targets_final_release(tmp_path: Path) -> None:
+    staging = tmp_path / "releases" / ".staging-release-uuid"
+    bin_dir = staging / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    final = staging.parent / "release"
+    script = bin_dir / "hermes"
+    script.write_text(f"#!{staging}/.venv/bin/python\nprint('ok')\n", encoding="utf-8")
+    untouched = bin_dir / "other"
+    untouched.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    assert _relocate_venv_shebangs(staging, final) == 1
+    assert script.read_text(encoding="utf-8").startswith(
+        f"#!{final}/.venv/bin/python\n"
+    )
+    assert untouched.read_text(encoding="utf-8") == "#!/bin/sh\nexit 0\n"
