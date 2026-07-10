@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -212,6 +213,30 @@ def _parse_profile(name: str, raw: Any) -> ProfileRuntime:
     )
 
 
+def _identity_revision(doc: Mapping[str, Any]) -> str:
+    """Hash stable ownership identity while release intent is checked separately."""
+    identity_doc: dict[str, Any] = {
+        "schema_version": doc.get("schema_version"),
+        "profiles": {},
+    }
+    profiles = doc.get("profiles")
+    if isinstance(profiles, dict):
+        for name, raw in profiles.items():
+            if isinstance(raw, dict):
+                identity_doc["profiles"][name] = {
+                    key: value for key, value in raw.items() if key != "release_revision"
+                }
+            else:
+                identity_doc["profiles"][name] = raw
+    payload = json.dumps(
+        identity_doc,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def load_runtime_registry(path: Optional[Path] = None, *, required: bool = True) -> RuntimeRegistry:
     path = Path(path or default_registry_path())
     try:
@@ -267,7 +292,7 @@ def load_runtime_registry(path: Optional[Path] = None, *, required: bool = True)
         raise RegistryError(f"Only one profile may own the dispatcher, got {dispatchers}")
     return RuntimeRegistry(
         path=path,
-        revision=hashlib.sha256(raw_bytes).hexdigest(),
+        revision=_identity_revision(doc),
         profiles=profiles,
     )
 

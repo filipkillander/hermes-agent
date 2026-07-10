@@ -139,6 +139,25 @@ def test_registry_validates_unique_ownership_and_secure_worker_defaults(tmp_path
         load_runtime_registry(duplicate)
 
 
+def test_registry_identity_revision_excludes_only_release_intent(tmp_path):
+    first = _registry_file(tmp_path, release_revision="release-one")
+    revision_one = load_runtime_registry(first).revision
+
+    text = first.read_text(encoding="utf-8").replace(
+        "release_revision: release-one",
+        "release_revision: release-two",
+    )
+    first.write_text(text, encoding="utf-8")
+    revision_two = load_runtime_registry(first).revision
+    assert revision_two == revision_one
+
+    first.write_text(
+        text.replace("ai.hermes.gateway-lumi", "ai.hermes.gateway-lumi-v2"),
+        encoding="utf-8",
+    )
+    assert load_runtime_registry(first).revision != revision_one
+
+
 def test_readiness_rejects_wrong_profile_even_when_running():
     payload = {
         "gateway_state": "running",
