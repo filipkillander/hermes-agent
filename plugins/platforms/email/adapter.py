@@ -1383,6 +1383,11 @@ def _build_adapter(config):
 def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
     """Bridge explicit profile-scoped email env names to canonical EMAIL_* names."""
     extra = email_cfg.get("extra") if isinstance(email_cfg.get("extra"), dict) else {}
+    nested = {}
+    platforms = _yaml_cfg.get("platforms")
+    if isinstance(platforms, dict) and isinstance(platforms.get("email"), dict):
+        nested = platforms["email"]
+    nested_extra = nested.get("extra") if isinstance(nested.get("extra"), dict) else {}
     mappings = {
         "address_env": "EMAIL_ADDRESS",
         "password_env": "EMAIL_PASSWORD",
@@ -1396,7 +1401,10 @@ def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
         "home_address_env": "EMAIL_HOME_ADDRESS",
     }
     for config_key, canonical_env in mappings.items():
-        source = email_cfg.get(config_key, extra.get(config_key))
+        source = email_cfg.get(
+            config_key,
+            extra.get(config_key, nested.get(config_key, nested_extra.get(config_key))),
+        )
         if source is None or os.getenv(canonical_env):
             continue
         source_name = str(source).strip()
