@@ -60,6 +60,39 @@ def test_resolve_launch_pins_profile_release_and_clean_path(tmp_path: Path) -> N
     assert spec.argv[-3:] == ("spark", "gateway", "run")
 
 
+def test_dashboard_launch_uses_same_pinned_release(tmp_path: Path) -> None:
+    root, release = _runtime(tmp_path, profile="lumi")
+    spec = launcher.resolve_launch(
+        "lumi",
+        root,
+        {"PATH": "/usr/bin:/bin"},
+        service="dashboard",
+        service_args=("--host", "127.0.0.1", "--port", "9119", "--no-open", "--skip-build"),
+    )
+    assert spec.service == "dashboard"
+    assert spec.release == release
+    assert spec.argv[-7:] == (
+        "dashboard",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9119",
+        "--no-open",
+        "--skip-build",
+    )
+
+
+def test_gateway_rejects_passthrough_arguments(tmp_path: Path) -> None:
+    root, _ = _runtime(tmp_path)
+    with pytest.raises(launcher.LaunchRejected, match="passthrough"):
+        launcher.resolve_launch(
+            "spark",
+            root,
+            {"PATH": "/usr/bin:/bin"},
+            service_args=("--replace",),
+        )
+
+
 @pytest.mark.parametrize("failure", ["missing-link", "outside-link", "open-key", "missing-venv"])
 def test_launcher_fails_closed_on_invalid_runtime(tmp_path: Path, failure: str) -> None:
     root, release = _runtime(tmp_path)
@@ -90,4 +123,5 @@ def test_check_mode_is_side_effect_free_and_non_secret(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["profile"] == "spark"
+    assert payload["service"] == "gateway"
     assert "token" not in result.stdout.lower()
