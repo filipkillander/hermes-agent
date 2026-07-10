@@ -23,6 +23,9 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Decomposer unit tests exercise graph/assignee behaviour with synthetic
+    # profiles. Registry-v2 enforcement itself has dedicated fail-closed tests.
+    monkeypatch.setattr(decomp, "_delegation_allowed", lambda _target: True)
     kb.init_db()
     return home
 
