@@ -39,6 +39,45 @@ Staging rejects tracked `.env`, `auth.json`, `bws_cache.json`,
 larger than the configured budget fails before it receives a public release
 name.
 
+## Inactive update build phase
+
+`hermes_cli.immutable_update_builder` is the fail-closed build half of a future
+automatic updater. It has no promotion, rollback, restart, scheduling, or
+retention command. It only:
+
+1. takes a global non-blocking build lock;
+2. requires a clean repository root whose `HEAD`, explicit ref, and explicit
+   full expected commit are identical;
+3. compares that commit with the verified `current` manifests for the named
+   profiles;
+4. runs the fixed repository `scripts/run_tests.sh` focus harness in a clean
+   environment;
+5. revalidates the ref and worktree, then stages with
+   `uv sync --frozen --no-dev --no-editable --extra messaging`;
+6. verifies the sealed manifest, size, write modes, non-editable imports, and
+   messaging imports.
+
+It writes only states, counts, commit/digest values, and output byte counts to
+`$HERMES_HOME/release-status/immutable-update-builder.json` (mode 0600). Raw
+test/build output, environment values, file paths, and credential names are not
+persisted. A matching current commit is a successful no-op.
+
+The command below is documentation only; no job invokes it until a separate
+rollout approves and installs a scheduler:
+
+```bash
+python -m hermes_cli.immutable_update_builder build RELEASE_ID \
+  --home /Users/ai/.hermes \
+  --source /path/to/clean/integration-worktree \
+  --ref refs/heads/codex/hermes-self-healing \
+  --expected-commit FULL_40_CHARACTER_COMMIT \
+  --profile spark --profile igor --profile lumi
+```
+
+Staging is not promotion. A staged release cannot affect a running gateway;
+the canary/restart coordinator and atomic promotion remain separately approved
+operations.
+
 ## Secret-free rollback snapshot
 
 Only explicit regular files below `HERMES_HOME` may be included. Secret-store
