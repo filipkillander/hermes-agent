@@ -23,6 +23,7 @@ class LaunchRejected(RuntimeError):
 @dataclass(frozen=True)
 class LaunchSpec:
     profile: str
+    service: str
     release: Path
     release_id: str
     commit: str
@@ -46,9 +47,20 @@ def _private_key_is_valid(path: Path) -> bool:
         return False
 
 
-def resolve_launch(profile: str, root: Path, inherited: dict[str, str]) -> LaunchSpec:
+def resolve_launch(
+    profile: str,
+    root: Path,
+    inherited: dict[str, str],
+    *,
+    service: str = "gateway",
+    service_args: Sequence[str] = (),
+) -> LaunchSpec:
     if not _PROFILE_RE.fullmatch(profile):
         raise LaunchRejected("invalid profile id")
+    if service not in {"gateway", "dashboard"}:
+        raise LaunchRejected("invalid service")
+    if service == "gateway" and service_args:
+        raise LaunchRejected("gateway does not accept launcher passthrough arguments")
     root = root.expanduser().resolve()
     current = root / "runtime-links" / profile / "current"
     if not current.is_symlink():
@@ -110,31 +122,31 @@ def resolve_launch(profile: str, root: Path, inherited: dict[str, str]) -> Launc
         }
     )
     env.pop("PYTHONPATH", None)
-    argv = (
-        str(python),
-        "-m",
-        "hermes_cli.main",
-        "--profile",
-        profile,
-        "gateway",
-        "run",
-    )
-    return LaunchSpec(profile, release, release_id, commit, python, argv, env)
+    command = ("gateway", "run") if service == "gateway" else ("dashboard", *service_args)
+    argv = (str(python), "-m", "hermes_cli.main", "--profile", profile, *command)
+    return LaunchSpec(profile, service, release, release_id, commit, python, argv, env)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile")
+    parser.add_argument("service", nargs="?", choices=("gateway", "dashboard"), default="gateway")
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--check", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args, service_args = build_parser().parse_known_args(argv)
     root = args.root or Path(os.environ.get("HERMES_ROOT", Path.home() / ".hermes"))
     try:
-        spec = resolve_launch(args.profile, root, dict(os.environ))
+        spec = resolve_launch(
+            args.profile,
+            root,
+            dict(os.environ),
+            service=args.service,
+            service_args=service_args,
+        )
     except LaunchRejected as exc:
         print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
         return 2
@@ -144,6 +156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "ok": True,
                     "profile": spec.profile,
+                    "service": spec.service,
                     "release_id": spec.release_id,
                     "commit": spec.commit,
                     "python": str(spec.python),
