@@ -108,6 +108,13 @@ requires coordinated BWS token rotation; it must not be rewritten by normal
 Hermes release staging. Profile Keychain account names are versioned so a
 failed rotation cannot overwrite the last working bootstrap.
 
+Profile-scoped messaging credentials remain profile-scoped in Bitwarden.
+`discord.token_env` and `telegram.token_env` bridge the selected profile name
+to the adapters' canonical in-process variable. Email supports explicit
+`address_env`, `password_env`, IMAP/SMTP env-name fields, allowed-users env,
+and home-address env. The bridge runs in process memory, preserves an already
+set canonical variable, and never copies a credential value into config.
+
 ## Secret-free rollback snapshot
 
 Only explicit regular files below `HERMES_HOME` may be included. Secret-store
