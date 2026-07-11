@@ -27,7 +27,7 @@ def telegram_adapter():
 
 def test_discord_legacy_formatter_is_envelope_boundary():
     rendered = _discord_adapter().format_message(SOURCE)
-    assert rendered.startswith("**Status**")
+    assert rendered.startswith("# Status")
     assert "\n---\n" not in rendered
     assert "|---|" not in rendered
 
@@ -42,7 +42,7 @@ def test_telegram_legacy_formatter_is_envelope_boundary(telegram_adapter):
 def test_telegram_rich_payload_cannot_bypass_envelope(telegram_adapter):
     payload = telegram_adapter._rich_message_payload(SOURCE)
     rendered = payload["markdown"]
-    assert rendered.startswith("**Status**")
+    assert rendered.startswith("# Status")
     assert "\n---\n" not in rendered
     assert "|---|" not in rendered
 
@@ -93,7 +93,7 @@ async def test_discord_send_formats_before_chunk_and_transport(monkeypatch):
 
     assert result.success
     sent = channel.send.await_args.kwargs["content"]
-    assert sent.startswith("**Status**")
+    assert sent.startswith("# Status")
     assert "|---|" not in sent
 
 
@@ -112,7 +112,7 @@ async def test_discord_interim_edit_is_enveloped():
 
     assert result.success
     delivered = message.edit.await_args.kwargs["content"]
-    assert delivered.startswith("**Status**")
+    assert delivered.startswith("# Status")
     assert "|---|" not in delivered
 
 
@@ -129,7 +129,7 @@ async def test_telegram_interim_edit_is_enveloped(telegram_adapter):
 
     assert result.success
     delivered = bot.edit_message_text.await_args.kwargs["text"]
-    assert delivered.startswith("**Status**")
+    assert delivered.startswith("# Status")
     assert "|---|" not in delivered
 
 
@@ -148,7 +148,7 @@ async def test_no_agent_telegram_send_message_is_enveloped(monkeypatch):
 
     assert result["success"]
     delivered = standalone.await_args.args[2]
-    assert delivered.startswith("**Status**")
+    assert delivered.startswith("# Status")
     assert "|---|" not in delivered
 
 
@@ -169,7 +169,7 @@ async def test_no_agent_discord_send_message_is_enveloped(monkeypatch):
 
     assert result["success"]
     delivered = standalone.await_args.args[2]
-    assert delivered.startswith("**Status**")
+    assert delivered.startswith("# Status")
     assert "|---|" not in delivered
 
 

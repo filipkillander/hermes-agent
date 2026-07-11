@@ -698,11 +698,14 @@ class QueuedCommentaryAgent:
 
 
 class BackgroundReviewAgent:
+    callback_was_set = None
+
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).callback_was_set = self.background_review_callback is not None
         if self.background_review_callback:
             self.background_review_callback("💾 Skill 'prospect-scanner' created.")
         return {
@@ -1094,6 +1097,7 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 
 @pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
+    BackgroundReviewAgent.callback_was_set = None
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1103,6 +1107,28 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
     )
 
     assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert BackgroundReviewAgent.callback_was_set is True
+
+
+@pytest.mark.asyncio
+async def test_email_is_final_only_and_never_gets_background_review_callback(
+    monkeypatch, tmp_path
+):
+    BackgroundReviewAgent.callback_was_set = None
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-email-bg-review-final-only",
+        platform=Platform.EMAIL,
+        chat_id="filip@example.com",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert BackgroundReviewAgent.callback_was_set is False
     assert adapter.sent == []
 
 

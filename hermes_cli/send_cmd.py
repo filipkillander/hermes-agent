@@ -335,11 +335,16 @@ def cmd_send(args: argparse.Namespace) -> None:
         )
         sys.exit(_USAGE_EXIT)
 
-    # Optional: prepend a subject line. Useful for alerting scripts that
-    # want a consistent header without inlining it into every call.
+    # Optional subject/header.  Email uses a first-line transport directive
+    # consumed by the adapter to set the real MIME Subject header; other
+    # platforms keep the historical visible header behavior.
     subject = getattr(args, "subject", None)
     if subject:
-        message = f"{subject}\n\n{message.lstrip()}"
+        target_platform = str(target).split(":", 1)[0].strip().lower()
+        if target_platform == "email":
+            message = f"Subject: {subject}\n\n{message.lstrip()}"
+        else:
+            message = f"{subject}\n\n{message.lstrip()}"
 
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
@@ -437,7 +442,10 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         "--subject",
         metavar="LINE",
         default=None,
-        help="Prepend a subject/header line before the message body.",
+        help=(
+            "Set the real MIME Subject for email; prepend a visible header "
+            "line for other platforms."
+        ),
     )
 
     parser.add_argument(

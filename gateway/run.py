@@ -18488,10 +18488,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
+            # Email is a strict final-only surface. Background memory/skill
+            # review summaries are internal lifecycle metadata and must never
+            # become a second recipient-visible email after the actual reply.
+            _deliver_background_review = source.platform != Platform.EMAIL
+            agent.background_review_callback = (
+                _bg_review_send if _deliver_background_review else None
+            )
             # Register the release hook on the adapter so base.py's finally
-            # block can fire it after delivering the main response.
-            if _status_adapter and session_key:
+            # block can fire it after delivering the main response. Email is
+            # intentionally excluded by the final-only boundary above.
+            if _deliver_background_review and _status_adapter and session_key:
                 if getattr(type(_status_adapter), "register_post_delivery_callback", None) is not None:
                     _status_adapter.register_post_delivery_callback(
                         session_key,

@@ -35,7 +35,7 @@ def test_golden_chat_rendering(surface):
     rendered = prepare_delivery_content(source, surface=surface)
     prose_before_fence = rendered.split("```md", 1)[0]
 
-    assert rendered.startswith("**Status**")
+    assert rendered.startswith("# Status")
     assert "> quoted prose" in rendered
     assert "\n---\n" not in prose_before_fence
     assert "**Lumi**" in rendered
@@ -110,7 +110,7 @@ def test_surface_kill_switch_and_lkg_modes_are_independent():
     telegram = build_delivery_envelope(source, surface="telegram", mode="lkg")
     assert discord.mode is DeliveryMode.OFF and discord.content == source
     assert telegram.mode is DeliveryMode.LKG
-    assert telegram.content == "**Header**\n\nBody"
+    assert telegram.content == "# Header\n\nBody"
 
 
 def test_invalid_mode_fails_closed_to_enforcement():
@@ -119,7 +119,7 @@ def test_invalid_mode_fails_closed_to_enforcement():
         mode="typo",
     )
     assert result.mode is DeliveryMode.ENFORCE
-    assert result.content == "**Header**"
+    assert result.content == "# Header"
 
 
 def test_platform_config_controls_per_surface_mode():
@@ -131,11 +131,11 @@ def test_platform_config_controls_per_surface_mode():
     ) == source
     assert prepare_platform_delivery_content(
         source, surface="telegram", config=lkg
-    ) == "**Header**\n\nBody"
+    ) == "# Header\n\nBody"
 
 
 def test_primary_failure_uses_lkg_without_content_logging(monkeypatch, caplog):
-    def fail(_document):
+    def fail(_document, *, surface):
         raise RuntimeError("secret-content-must-not-be-logged")
 
     monkeypatch.setattr(envelope_module, "_render_document", fail)
@@ -143,7 +143,7 @@ def test_primary_failure_uses_lkg_without_content_logging(monkeypatch, caplog):
         "# secret-content-must-not-be-logged\nBody", surface="discord",
     )
     assert result.used_fallback is True
-    assert result.content.startswith("**secret-content-must-not-be-logged**")
+    assert result.content.startswith("# secret-content-must-not-be-logged")
     assert "secret-content-must-not-be-logged" not in caplog.text
 
 
@@ -168,6 +168,75 @@ def test_non_chat_surfaces_are_unchanged():
 def test_chrome_rich_markdown_is_not_compacted_by_delivery_envelope():
     source = f"# Chrome\n\n> quote\n\n{TABLE}"
     assert prepare_delivery_content(source, surface="chrome_extension") == source
+
+
+@pytest.mark.parametrize("surface", ["discord", "telegram"])
+def test_platform_spacing_contract_collapses_gaps_and_separates_blocks(surface):
+    source = (
+        "Svar först.\n\n\n\n"
+        "## Nästa steg\n"
+        "- Ett\n\n"
+        "- Två\n"
+        "> Viktigt\n\n\n"
+        "Avslut."
+    )
+
+    rendered = prepare_delivery_content(source, surface=surface)
+
+    assert rendered == (
+        "Svar först.\n\n"
+        "## Nästa steg\n\n"
+        "- Ett\n"
+        "- Två\n\n"
+        "> Viktigt\n\n"
+        "Avslut."
+    )
+    assert "\n\n\n" not in rendered
+
+
+@pytest.mark.parametrize("surface", ["discord", "telegram"])
+@pytest.mark.parametrize("mode", ["enforce", "lkg"])
+def test_recipient_prose_normalizes_kmros_casing_without_touching_code(surface, mode):
+    source = (
+        "KmROS, KMROS och kmros ska visas enhetligt.\n\n"
+        "```text\nKmROS must remain literal in code\n```"
+    )
+
+    rendered = prepare_delivery_content(source, surface=surface, mode=mode)
+
+    assert rendered.startswith("kmrOS, kmrOS och kmrOS ska visas enhetligt.")
+    assert "```text\nKmROS must remain literal in code\n```" in rendered
+
+
+@pytest.mark.parametrize("surface", ["discord", "telegram"])
+def test_empty_ritual_rows_are_removed_but_meaningful_rows_and_quotes_survive(surface):
+    source = (
+        "# Status\n"
+        "Saknas: Inget\n"
+        "Vad saknas — inget.\n"
+        "Kvar: 0\n"
+        "> Blockquotes är tillåtna.\n"
+        "Detta behöver kompletteras: två beslut."
+    )
+
+    rendered = prepare_delivery_content(source, surface=surface)
+
+    assert "Saknas: Inget" not in rendered
+    assert "Vad saknas" not in rendered
+    assert "Kvar: 0" not in rendered
+    assert "> Blockquotes är tillåtna." in rendered
+    assert "Detta behöver kompletteras: två beslut." in rendered
+
+
+@pytest.mark.parametrize("surface", ["discord", "telegram"])
+def test_spacing_is_idempotent_and_fenced_code_bytes_are_untouched(surface):
+    fence = "```text\nline 1\n\n\nline 2  \n```\n"
+    source = "Intro.\n\n\n" + fence + "\n\nOutro."
+    once = prepare_delivery_content(source, surface=surface)
+    twice = prepare_delivery_content(once, surface=surface)
+
+    assert twice == once
+    assert fence in once
 
 
 def test_fuzz_like_determinism_and_invariants():

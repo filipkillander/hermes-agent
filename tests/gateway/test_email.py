@@ -132,6 +132,71 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertNotIn("<p>", result)
         self.assertNotIn("<b>", result)
 
+    def test_subject_override_is_first_line_only_and_removed_from_body(self):
+        from plugins.platforms.email.adapter import _extract_subject_override
+
+        subject, body = _extract_subject_override(
+            "### Ämnesrad: KMR Studios | Veckobrev\n\nHej Filip!"
+        )
+        self.assertEqual(subject, "KMR Studios | Veckobrev")
+        self.assertEqual(body, "Hej Filip!")
+
+        subject, body = _extract_subject_override(
+            "Hej Filip!\n\nSubject: detta är vanlig brödtext"
+        )
+        self.assertIsNone(subject)
+        self.assertIn("Subject: detta är vanlig brödtext", body)
+
+    def test_internal_lifecycle_rows_are_removed_and_internal_only_is_blocked(self):
+        from plugins.platforms.email.adapter import _sanitize_outbound_body
+
+        body = _sanitize_outbound_body(
+            "Hej Filip!\n\n💾 Self-improvement review: Patched SKILL.md\n\nKlart."
+        )
+        self.assertEqual(body, "Hej Filip!\n\nKlart.")
+        self.assertNotIn("Self-improvement", body)
+        with self.assertRaisesRegex(ValueError, "internal-only"):
+            _sanitize_outbound_body(
+                "💾 Self-improvement review: Patched SKILL.md"
+            )
+
+    def test_rich_body_gets_canonical_signature_and_no_duplicate_model_signature(self):
+        from plugins.platforms.email.adapter import _email_body_parts
+
+        identity = {
+            "signature_name": "Lumi",
+            "signature_role": "Assistent",
+            "links": [
+                {
+                    "label": "Studio",
+                    "text": "killandermusicrecords.com",
+                    "url": "https://killandermusicrecords.com",
+                },
+                {
+                    "label": "Portfolio",
+                    "text": "linktr.ee/portfolio",
+                    "url": "https://linktr.ee/portfolio",
+                },
+            ],
+        }
+        plain, rendered = _email_body_parts(
+            "Hej Filip!\n\n**Bekräftat:** Allt fungerar.\n\n"
+            "- **HTML:** renderad\n- [Länk](https://example.com)\n\n"
+            "Med vänlig hälsning,\n\nLumi Norwood\nAssistent, IT",
+            identity,
+        )
+
+        self.assertIn("<p><strong>Hej Filip!</strong></p>", rendered)
+        self.assertIn("<ul>", rendered)
+        self.assertIn('<a href="https://example.com">Länk</a>', rendered)
+        self.assertEqual(rendered.count("<strong>Lumi</strong>"), 1)
+        self.assertNotIn("Norwood", rendered)
+        self.assertNotIn("Assistent, IT", rendered)
+        self.assertTrue(plain.endswith(
+            "Med vänlig hälsning,\n\nLumi\nAssistent\n"
+            "Studio: killandermusicrecords.com\nPortfolio: linktr.ee/portfolio"
+        ))
+
     def test_strip_html_br_tags(self):
         from plugins.platforms.email.adapter import _strip_html
         html = "Line 1<br>Line 2<br/>Line 3"
@@ -892,7 +957,7 @@ class TestThreadContext(unittest.TestCase):
             self.assertFalse(send_call["Subject"].startswith("Re: Re:"))
 
     def test_no_thread_context_uses_default_subject(self):
-        """Without thread context, subject should be 'Re: Hermes Agent'."""
+        """Without thread context, a proactive mail is not mislabeled as a reply."""
         adapter = self._make_adapter()
 
         with patch("smtplib.SMTP") as mock_smtp:
@@ -902,8 +967,64 @@ class TestThreadContext(unittest.TestCase):
             adapter._send_email("newuser@test.com", "Hello!", None)
 
             send_call = mock_server.send_message.call_args[0][0]
-            self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
+            self.assertEqual(send_call["Subject"], "Hermes Agent")
             self.assertIn("Date", send_call)
+
+    def test_profile_identity_sets_real_subject_from_header_and_exact_signature(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        identity = {
+            "display_name": "Igor",
+            "default_subject": "Mail från Igor",
+            "signature_name": "Igor",
+            "signature_role": "Assistent, KMR Studios",
+            "links": [
+                {
+                    "label": "KMR Studios",
+                    "text": "kmrstudios.se",
+                    "url": "https://kmrstudios.se",
+                },
+                {
+                    "label": "KMR",
+                    "text": "killandermusicrecords.com",
+                    "url": "https://killandermusicrecords.com",
+                },
+            ],
+        }
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "igor@killandermusicrecords.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            adapter = EmailAdapter(PlatformConfig(enabled=True, extra={"identity": identity}))
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            server = MagicMock()
+            mock_smtp.return_value = server
+            adapter._send_email(
+                "filip@example.com",
+                "Subject: KMR Studios | Lägesbild\n\n"
+                "Hej Filip!\n\n**Klart:** Allt är verifierat.\n\n"
+                "💾 Self-improvement review: Patched SKILL.md",
+            )
+
+        msg = server.send_message.call_args[0][0]
+        self.assertEqual(msg["Subject"], "KMR Studios | Lägesbild")
+        self.assertEqual(msg["From"], "Igor <igor@killandermusicrecords.com>")
+        payloads = {
+            part.get_content_type(): part.get_payload(decode=True).decode(
+                part.get_content_charset() or "utf-8"
+            )
+            for part in msg.walk()
+            if part.get_content_type() in {"text/plain", "text/html"}
+        }
+        self.assertNotIn("Subject:", payloads["text/plain"])
+        self.assertNotIn("Self-improvement", payloads["text/plain"])
+        self.assertIn("<strong>Igor</strong>", payloads["text/html"])
+        self.assertIn("Assistent, KMR Studios", payloads["text/html"])
+        self.assertIn('href="https://kmrstudios.se"', payloads["text/html"])
 
 
 class TestSendMethods(unittest.TestCase):
@@ -1281,6 +1402,61 @@ class TestSendEmailStandalone(unittest.TestCase):
             self.assertIn("Date", send_call)
             self.assertEqual(send_call["To"], "user@test.com")
             self.assertEqual(send_call["From"], "hermes@test.com")
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "lumi@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    })
+    def test_standalone_subject_directive_and_identity_are_mime_metadata(self):
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+
+        identity = {
+            "display_name": "Lumi",
+            "default_subject": "Mail från Lumi",
+            "signature_name": "Lumi",
+            "signature_role": "Assistent",
+            "links": [],
+        }
+        with patch("smtplib.SMTP") as mock_smtp:
+            server = MagicMock()
+            mock_smtp.return_value = server
+            result = asyncio.run(_standalone_send(
+                SimpleNamespace(extra={
+                    "address": "lumi@test.com",
+                    "smtp_host": "smtp.test.com",
+                    "identity": identity,
+                }),
+                "filip@test.com",
+                "Subject: Veckobrev\n\nHej Filip!\n\nKlart.",
+            ))
+
+        self.assertTrue(result["success"])
+        msg = server.send_message.call_args[0][0]
+        self.assertEqual(msg["Subject"], "Veckobrev")
+        self.assertEqual(msg["From"], "Lumi <lumi@test.com>")
+        self.assertNotIn(
+            "Subject:",
+            next(part for part in msg.walk() if part.get_content_type() == "text/plain")
+            .get_payload(decode=True).decode("utf-8"),
+        )
+
+
+class TestEmailYamlIdentityBridge(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_identity_is_returned_to_platform_extra_without_env_leak(self):
+        from plugins.platforms.email.adapter import _apply_yaml_config
+
+        identity = {
+            "display_name": "Lumi",
+            "signature_name": "Lumi",
+        }
+        seeded = _apply_yaml_config({}, {"identity": identity})
+        self.assertEqual(seeded, {"identity": identity})
+        self.assertNotIn("EMAIL_IDENTITY", os.environ)
 
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
