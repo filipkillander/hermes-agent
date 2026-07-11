@@ -86,6 +86,30 @@ class TestUnifiedDashboardRouting:
         # test below for why we resolve explicitly instead of popping.
         from hermes_constants import get_default_hermes_root
         assert env.get("HERMES_HOME") == str(get_default_hermes_root())
+        assert env.get("HERMES_PROFILE") == "default"
+
+    def test_reexec_overrides_inherited_named_profile(self, main_mod, monkeypatch):
+        """The re-exec environment must not retain the launcher's profile.
+
+        ``-p default`` is too late for import-time config readers, so both
+        HERMES_HOME and HERMES_PROFILE must describe the machine dashboard.
+        """
+        monkeypatch.setenv("HERMES_PROFILE", "lumi")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "lumi"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
+        captured = []
+
+        def fake_exec(exe, argv, env):
+            captured.append(env)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+        with pytest.raises(SystemExit):
+            main_mod.cmd_dashboard(_args())
+
+        assert captured[0]["HERMES_PROFILE"] == "default"
 
     def test_reexec_pins_docker_machine_root(self, main_mod, monkeypatch):
         """In the Docker layout (HERMES_HOME=/opt/data, profiles under

@@ -3466,9 +3466,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # Ignored beats allowed: even when a thread's parent channel
             # is on the allowlist, an explicit DISCORD_IGNORED_CHANNELS
             # entry on the thread or its parent rejects the interaction.
-            ignored_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
-            if ignored_raw and channel_ids:
-                ignored = {c.strip() for c in ignored_raw.split(",") if c.strip()}
+            ignored = self._discord_ignored_channels()
+            if ignored and channel_ids:
                 if "*" in ignored or (channel_keys & ignored):
                     return (False, "channel in DISCORD_IGNORED_CHANNELS")
 
@@ -4845,6 +4844,26 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_ignored_channels(self) -> set:
+        """Return channels that must be silent on message and slash surfaces.
+
+        Runtime config is authoritative; the environment variable remains a
+        supported deployment override.  Reading both here prevents a config
+        entry from protecting ordinary messages while native interactions
+        continue to answer in the same archived channel.
+        """
+        values = set()
+        for raw in (
+            self.config.extra.get("ignored_channels"),
+            os.getenv("DISCORD_IGNORED_CHANNELS", ""),
+        ):
+            if isinstance(raw, list):
+                values.update(str(part).strip() for part in raw if str(part).strip())
+            else:
+                text = str(raw).strip() if raw is not None else ""
+                values.update(part.strip() for part in text.split(",") if part.strip())
+        return values
+
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
 
@@ -6202,8 +6221,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
 
             # Check ignored channels - never respond even when mentioned
-            ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
-            ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
+            ignored_channels = self._discord_ignored_channels()
             if "*" in ignored_channels or (channel_keys & ignored_channels):
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return

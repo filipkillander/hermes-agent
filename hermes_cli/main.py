@@ -12107,6 +12107,12 @@ def cmd_dashboard(args):
             # Best-effort: if root resolution fails, fall back to the prior
             # behaviour (drop HERMES_HOME) rather than block the reroute.
             env.pop("HERMES_HOME", None)
+        # ``-p default`` is parsed only after the new interpreter starts.  An
+        # inherited HERMES_PROFILE from the named-profile launcher otherwise
+        # wins during early module/config initialisation and leaves the
+        # machine dashboard reading one profile while advertising another.
+        # Pin both identity inputs across the exec boundary.
+        env["HERMES_PROFILE"] = "default"
         # On Windows, os.execvpe() does not truly replace the process — it
         # spawns via CreateProcess then the parent exits.  Under Python 3.14+
         # this can crash with STATUS_ACCESS_VIOLATION (0xC0000005) when

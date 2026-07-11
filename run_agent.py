@@ -2783,6 +2783,35 @@ class AIAgent:
                 self._pending_steer = cleaned
         return True
 
+    def has_pending_steer(self) -> bool:
+        """Return whether a steer is still waiting for a tool boundary."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return bool(getattr(self, "_pending_steer", None))
+        with lock:
+            return bool(self._pending_steer)
+
+    def interrupt_current_tools_for_steer(self) -> None:
+        """Cancel only active tools so a pending steer reaches the next turn.
+
+        This deliberately does not set ``_interrupt_requested``: the agent
+        conversation continues, receives an interrupted tool receipt, then
+        applies the queued steer at the normal tool-result boundary.
+        """
+        tids = []
+        if self._execution_thread_id is not None:
+            tids.append(self._execution_thread_id)
+        tracker = getattr(self, "_tool_worker_threads", None)
+        tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
+        if tracker is not None and tracker_lock is not None:
+            with tracker_lock:
+                tids.extend(list(tracker))
+        for tid in set(tids):
+            try:
+                _set_interrupt(True, tid)
+            except Exception:
+                pass
+
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 

@@ -118,6 +118,44 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
+def _protected_skill_slugs() -> set[str]:
+    """Return owner-protected skill slugs from ``skills.protected``.
+
+    Protection is name based, not path based, so nested copies and every
+    profile receive the same policy. Filesystem operators can still perform
+    an explicitly approved repair; agent-facing ``skill_manage`` remains
+    proposal-only for these slugs.
+    """
+    try:
+        from hermes_cli.config import load_config
+        raw = cfg_get(load_config(), "skills", "protected") or []
+    except Exception:
+        return set()
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set)):
+        raw = [raw]
+    return {str(item).strip().lower() for item in raw if str(item).strip()}
+
+
+def _protected_skill_guard(action: str, name: str) -> Optional[Dict[str, Any]]:
+    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+        return None
+    slug = str(name or "").strip().lower()
+    if slug not in _protected_skill_slugs():
+        return None
+    return {
+        "success": False,
+        "proposal_required": True,
+        "protected_skill": slug,
+        "error": (
+            f"Skill '{slug}' is owner-protected. skill_manage cannot {action} it. "
+            "Describe the proposed change and route it through the canonical "
+            "SkillForge source for explicit owner approval and fanout."
+        ),
+    }
+
+
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
@@ -1334,6 +1372,10 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    protected = _protected_skill_guard(action, name)
+    if protected is not None:
+        return json.dumps(protected, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
