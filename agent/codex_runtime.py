@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from agent.background_review import background_review_allowed_for_platform
+
 logger = logging.getLogger(__name__)
 
 
@@ -497,6 +499,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and background_review_allowed_for_platform(getattr(agent, "platform", ""))
         and (should_review_memory or should_review_skills)
     ):
         try:
