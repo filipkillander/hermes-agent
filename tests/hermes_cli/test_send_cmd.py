@@ -116,6 +116,20 @@ def test_subject_prepends_header(fake_tool):
     assert fake_tool.calls[0]["message"] == "[CI]\n\nbody text"
 
 
+def test_email_subject_becomes_adapter_transport_directive(fake_tool):
+    args = _parse([
+        "--to", "email:filip@example.com",
+        "--subject", "KMR Studios | Veckobrev",
+        "body text",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    assert fake_tool.calls[0]["message"] == (
+        "Subject: KMR Studios | Veckobrev\n\nbody text"
+    )
+
+
 def test_json_mode_emits_payload(fake_tool, capsys):
     args = _parse(["--to", "telegram", "--json", "hi"])
     with pytest.raises(SystemExit) as exc:

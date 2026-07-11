@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -608,6 +609,81 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    @staticmethod
+    def _profile_launcher_plist(tmp_path, monkeypatch):
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "lumi"
+        profile_home.mkdir(parents=True)
+        user_home = tmp_path / "user"
+        launcher = user_home / ".local" / "bin" / "hermes-profile-launcher"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        plist_path = tmp_path / "ai.hermes.gateway-lumi.plist"
+        payload = {
+            "Label": "ai.hermes.gateway-lumi",
+            "ProgramArguments": [str(launcher), "lumi"],
+            "WorkingDirectory": str(profile_home),
+            "EnvironmentVariables": {"HERMES_ROOT": str(root), "PATH": "/usr/bin:/bin"},
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": str(profile_home / "logs" / "gateway.log"),
+            "StandardErrorPath": str(profile_home / "logs" / "gateway.error.log"),
+        }
+        plist_path.write_bytes(plistlib.dumps(payload))
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: "<plist><dict/></plist>")
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_home)
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "lumi")
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway-lumi")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: user_home)
+        return plist_path, launcher, payload
+
+    def test_profile_launcher_plist_is_current_when_contract_is_exact(
+        self, tmp_path, monkeypatch
+    ):
+        self._profile_launcher_plist(tmp_path, monkeypatch)
+        assert gateway_cli.launchd_plist_is_current() is True
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("Label", "ai.hermes.gateway-igor"),
+            ("ProgramArguments", ["/tmp/not-the-launcher", "lumi"]),
+            ("ProgramArguments", ["/tmp/not-the-launcher", "lumi", "gateway"]),
+            ("WorkingDirectory", "/tmp/wrong-home"),
+            ("StandardOutPath", "/tmp/wrong.log"),
+            ("StandardErrorPath", "/tmp/wrong.error.log"),
+        ],
+    )
+    def test_profile_launcher_plist_rejects_identity_or_path_drift(
+        self, tmp_path, monkeypatch, field, value
+    ):
+        plist_path, _launcher, payload = self._profile_launcher_plist(tmp_path, monkeypatch)
+        payload[field] = value
+        plist_path.write_bytes(plistlib.dumps(payload))
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_profile_launcher_plist_rejects_wrong_root(self, tmp_path, monkeypatch):
+        plist_path, _launcher, payload = self._profile_launcher_plist(tmp_path, monkeypatch)
+        payload["EnvironmentVariables"]["HERMES_ROOT"] = "/tmp/wrong-root"
+        plist_path.write_bytes(plistlib.dumps(payload))
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    @pytest.mark.parametrize("target", ["launcher", "plist"])
+    def test_profile_launcher_plist_rejects_group_writable_files(
+        self, tmp_path, monkeypatch, target
+    ):
+        plist_path, launcher, _payload = self._profile_launcher_plist(tmp_path, monkeypatch)
+        (launcher if target == "launcher" else plist_path).chmod(0o775)
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_profile_launcher_plist_rejects_wrong_owner(self, tmp_path, monkeypatch):
+        self._profile_launcher_plist(tmp_path, monkeypatch)
+        current_uid = os.getuid()
+        monkeypatch.setattr(gateway_cli.os, "getuid", lambda: current_uid + 1)
+        assert gateway_cli.launchd_plist_is_current() is False
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})

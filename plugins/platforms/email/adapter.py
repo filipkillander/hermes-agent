@@ -31,7 +31,7 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formataddr, formatdate
 from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,20 +102,162 @@ MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
 
-_EMAIL_INTERNAL_LEAK_MARKERS = (
-    "Compacting context",
-    "Preflight compression",
-    "tool_call",
-    "status_callback",
+_EMAIL_INTERNAL_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"💾\s*Self-improvement review:|"
+    r"💻\s*(?:terminal|tool)|"
+    r"📋\s*(?:Updating tasks|tool)|"
+    r"(?:Compacting context|Preflight compression)\b|"
+    r"(?:tool_call|status_callback|compression_callback)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_SUBJECT_OVERRIDE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*\*)?"
+    r"(?:subject|ämne|ämnesrad)(?:\*\*)?\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+_SIGNOFF_RE = re.compile(
+    r"(?is)(?:\n|^)\s*(?:\*|_)?"
+    r"(?:med vänlig hälsning|vänliga hälsningar|mvh)"
+    r"(?:\*|_)?\s*,?\s*(?:\n.*)?$"
+)
+
+_HTML_SIGNOFF_RE = re.compile(
+    r"(?is)<p\b[^>]*>\s*(?:(?:<em>|<i>)\s*)?"
+    r"(?:med vänlig hälsning|vänliga hälsningar|mvh)\s*,?\s*"
+    r"(?:(?:</em>|</i>)\s*)?</p>.*$"
 )
 
 
 def _sanitize_outbound_body(body: str) -> str:
-    """Remove internal runtime/progress markers from outbound email bodies."""
-    sanitized = body or ""
-    for marker in _EMAIL_INTERNAL_LEAK_MARKERS:
-        sanitized = sanitized.replace(marker, "[internal status removed]")
+    """Remove internal runtime/progress rows from outbound email bodies.
+
+    Email is a final-only surface.  Internal lifecycle notifications are
+    metadata, never recipient content.  Drop matching rows entirely instead of
+    replacing them with another visible implementation artefact.  Refuse an
+    internal-only message so a background callback can never become a blank or
+    cryptic email.
+    """
+    kept = [line for line in (body or "").splitlines() if not _EMAIL_INTERNAL_LINE_RE.match(line)]
+    sanitized = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if not sanitized and (body or "").strip():
+        raise ValueError("blocked internal-only email content")
     return sanitized
+
+
+def _clean_subject(value: str) -> str:
+    """Return a safe single-line RFC subject value."""
+    subject = " ".join((value or "").replace("\r", " ").replace("\n", " ").split())
+    return subject[:240].strip()
+
+
+def _extract_subject_override(body: str) -> Tuple[Optional[str], str]:
+    """Extract an explicit first-line Subject/Ämne directive from a body.
+
+    The directive is deliberately accepted only as the first non-empty line.
+    This lets ``hermes send --subject`` and agent-authored one-off mail set the
+    real MIME header without treating arbitrary prose later in the mail as
+    transport metadata.
+    """
+    lines = (body or "").splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first is None:
+        return None, body or ""
+    match = _SUBJECT_OVERRIDE_RE.match(lines[first])
+    if not match:
+        return None, body or ""
+    subject = _clean_subject(match.group(1))
+    del lines[first]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return (subject or None), "\n".join(lines).strip()
+
+
+def _email_identity(extra: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Normalize the profile-owned sender identity/signature contract."""
+    source = dict((extra or {}).get("identity") or {})
+    links = source.get("links") if isinstance(source.get("links"), list) else []
+    normalized_links = []
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        text = str(item.get("text") or item.get("url") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if label and text and re.match(r"^https?://", url, re.IGNORECASE):
+            normalized_links.append({"label": label, "text": text, "url": url})
+    return {
+        "display_name": str(source.get("display_name") or "").strip(),
+        "default_subject": _clean_subject(str(source.get("default_subject") or "Hermes Agent")),
+        "signature_name": str(source.get("signature_name") or "").strip(),
+        "signature_role": str(source.get("signature_role") or "").strip(),
+        "links": normalized_links,
+    }
+
+
+def _from_header(address: str, identity: Dict[str, Any]) -> str:
+    display_name = str(identity.get("display_name") or "").strip()
+    return formataddr((display_name, address)) if display_name else address
+
+
+def _strip_existing_signature(body: str) -> str:
+    """Remove a model-authored trailing signature before canonical injection."""
+    if _looks_like_html(body):
+        return _HTML_SIGNOFF_RE.sub("", body).strip()
+    return _SIGNOFF_RE.sub("", body).strip()
+
+
+def _signature_parts(identity: Dict[str, Any]) -> Tuple[str, str]:
+    """Build the exact profile-owned plain/HTML signature."""
+    name = str(identity.get("signature_name") or "").strip()
+    if not name:
+        return "", ""
+    role = str(identity.get("signature_role") or "").strip()
+    plain_lines = ["Med vänlig hälsning,", "", name]
+    html_lines = [
+        "<p><em>Med vänlig hälsning,</em></p>",
+        f"<p><strong>{html.escape(name)}</strong>",
+    ]
+    if role:
+        plain_lines.append(role)
+        html_lines.append(f"<br>{html.escape(role)}")
+    for link in identity.get("links") or []:
+        label = str(link["label"])
+        text = str(link["text"])
+        url = str(link["url"])
+        plain_lines.append(f"{label}: {text}")
+        html_lines.append(
+            f'<br>{html.escape(label)}: <a href="{html.escape(url, quote=True)}">'
+            f"{html.escape(text)}</a>"
+        )
+    html_lines.append("</p>")
+    return "\n".join(plain_lines), "".join(html_lines)
+
+
+def _prepare_subject_and_body(
+    body: str,
+    *,
+    identity: Dict[str, Any],
+    thread_context: Optional[Dict[str, str]] = None,
+    explicit_subject: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve the MIME subject and remove transport metadata from the body."""
+    body_subject, clean_body = _extract_subject_override(body)
+    requested = _clean_subject(explicit_subject or body_subject or "")
+    if requested:
+        return requested, clean_body
+
+    prior = _clean_subject(str((thread_context or {}).get("subject") or ""))
+    if prior:
+        if not prior.lower().startswith("re:"):
+            prior = f"Re: {prior}"
+        return prior, clean_body
+
+    fallback = _clean_subject(str(identity.get("default_subject") or "Hermes Agent"))
+    return fallback or "Hermes Agent", clean_body
 
 
 def _looks_like_html(body: str) -> bool:
@@ -146,11 +288,19 @@ def _markdown_to_email_html(body: str) -> str:
             parts.append(f"</{list_kind}>")
             list_kind = None
 
+    first_content_line = True
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
             close_list()
             continue
+
+        if first_content_line and re.match(r"^(?:hej|hejsan)\b.*[!.?]?$", line, re.IGNORECASE):
+            close_list()
+            parts.append(f"<p><strong>{_markdown_inline_to_html(line)}</strong></p>")
+            first_content_line = False
+            continue
+        first_content_line = False
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", line)
         if heading:
@@ -206,19 +356,39 @@ def _markdown_to_plain_text(body: str) -> str:
     return text.strip()
 
 
-def _email_body_parts(body: str) -> Tuple[str, str]:
-    clean = _sanitize_outbound_body(body)
+def _email_body_parts(
+    body: str,
+    identity: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    clean = _strip_existing_signature(_sanitize_outbound_body(body))
     if _looks_like_html(clean):
         html_body = clean
         plain_body = _strip_html(clean)
     else:
         html_body = _markdown_to_email_html(clean)
         plain_body = _markdown_to_plain_text(clean)
+
+    signature_plain, signature_html = _signature_parts(identity or {})
+    if signature_plain:
+        plain_body = f"{plain_body.rstrip()}\n\n{signature_plain}".strip()
+        if re.search(r"</body>\s*</html>\s*$", html_body, re.IGNORECASE):
+            html_body = re.sub(
+                r"</body>\s*</html>\s*$",
+                signature_html + "</body></html>",
+                html_body,
+                flags=re.IGNORECASE,
+            )
+        else:
+            html_body = html_body.rstrip() + signature_html
     return plain_body, html_body
 
 
-def _attach_email_body(msg: MIMEMultipart, body: str) -> None:
-    plain_body, html_body = _email_body_parts(body)
+def _attach_email_body(
+    msg: MIMEMultipart,
+    body: str,
+    identity: Optional[Dict[str, Any]] = None,
+) -> None:
+    plain_body, html_body = _email_body_parts(body, identity)
     if msg.get_content_subtype() == "alternative":
         msg.attach(MIMEText(plain_body, "plain", "utf-8"))
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -603,6 +773,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_host = (os.getenv("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
         self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
         self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
+        self._identity = _email_identity(extra)
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -1063,8 +1234,11 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email reply to the given address."""
         try:
             loop = asyncio.get_running_loop()
+            explicit_subject = None
+            if isinstance(metadata, dict):
+                explicit_subject = metadata.get("subject")
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, explicit_subject
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1086,17 +1260,21 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        explicit_subject: Optional[str] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart("alternative")
-        msg["From"] = self._address
+        msg["From"] = _from_header(self._address, self._identity)
         msg["To"] = to_addr
 
         # Thread context for reply
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject, body = _prepare_subject_and_body(
+            body,
+            identity=self._identity,
+            thread_context=ctx,
+            explicit_subject=explicit_subject,
+        )
         msg["Subject"] = subject
 
         # Threading headers
@@ -1109,7 +1287,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        _attach_email_body(msg, body)
+        _attach_email_body(msg, body, self._identity)
 
         smtp = self._connect_smtp()
         try:
@@ -1204,13 +1382,15 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = _from_header(self._address, self._identity)
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject, body = _prepare_subject_and_body(
+            body,
+            identity=self._identity,
+            thread_context=ctx,
+        )
         msg["Subject"] = subject
 
         original_msg_id = ctx.get("message_id")
@@ -1223,7 +1403,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            _attach_email_body(msg, body)
+            _attach_email_body(msg, body, self._identity)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1284,13 +1464,15 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = _from_header(self._address, self._identity)
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject, body = _prepare_subject_and_body(
+            body,
+            identity=self._identity,
+            thread_context=ctx,
+        )
         msg["Subject"] = subject
 
         original_msg_id = ctx.get("message_id")
@@ -1303,7 +1485,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            _attach_email_body(msg, body)
+            _attach_email_body(msg, body, self._identity)
 
         # Attach file
         p = Path(file_path)
@@ -1367,6 +1549,7 @@ async def _standalone_send(
     from email.utils import formatdate
 
     extra = getattr(pconfig, "extra", {}) or {}
+    identity = _email_identity(extra)
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
     password = os.getenv("EMAIL_PASSWORD", "")
     smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
@@ -1379,11 +1562,15 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
+        subject, message = _prepare_subject_and_body(
+            message,
+            identity=identity,
+        )
         msg = MIMEMultipart("alternative")
-        _attach_email_body(msg, message)
-        msg["From"] = address
+        _attach_email_body(msg, message, identity)
+        msg["From"] = _from_header(address, identity)
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = subject
         msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
@@ -1416,7 +1603,7 @@ def _build_adapter(config):
     return EmailAdapter(config)
 
 
-def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
+def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> Optional[dict]:
     """Bridge explicit profile-scoped email env names to canonical EMAIL_* names."""
     extra = email_cfg.get("extra") if isinstance(email_cfg.get("extra"), dict) else {}
     nested = {}
@@ -1475,6 +1662,17 @@ def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
             value = str(allowed_users).strip()
         if value:
             os.environ["EMAIL_ALLOWED_USERS"] = value
+
+    # Non-secret, profile-owned delivery identity. Return it to the platform
+    # loader so it is available both to the live adapter and standalone/cron
+    # sender.  Do not bridge this policy through process-global environment.
+    identity = email_cfg.get(
+        "identity",
+        extra.get("identity", nested.get("identity", nested_extra.get("identity"))),
+    )
+    if isinstance(identity, dict):
+        return {"identity": identity}
+    return None
 
 
 def register(ctx) -> None:

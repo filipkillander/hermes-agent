@@ -69,8 +69,16 @@ class DeliveryEnvelope:
 
 
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 _HORIZONTAL_RULE_RE = re.compile(r"^\s{0,3}(?:\*\s*){3,}$|^\s{0,3}(?:-\s*){3,}$|^\s{0,3}(?:_\s*){3,}$")
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-+*•]\s+|\d+[.)]\s+)")
+_BLOCKQUOTE_RE = re.compile(r"^\s{0,3}>\s?")
+_KMROS_CASE_RE = re.compile(r"\bkmros\b", re.IGNORECASE)
+_EMPTY_RITUAL_RE = re.compile(
+    r"^\s*(?:saknas|kvar|vad\s+saknas|missing|remaining)\s*"
+    r"(?::|[-–—])\s*(?:inget|none|n/?a|ej\s+aktuellt|0|-)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _split_fenced_blocks(content: str) -> Iterable[DocumentBlock]:
@@ -126,17 +134,60 @@ def _split_fenced_blocks(content: str) -> Iterable[DocumentBlock]:
         yield block
 
 
-def _semantic_heading(line: str) -> str:
-    match = _HEADING_RE.match(line)
-    if not match:
-        return line
-    title = match.group(1).strip()
-    if title.startswith("**") and title.endswith("**"):
-        return title
-    return f"**{title}**"
+def _line_kind(line: str) -> str:
+    if _HEADING_RE.match(line):
+        return "heading"
+    if _LIST_ITEM_RE.match(line):
+        return "list"
+    if _BLOCKQUOTE_RE.match(line):
+        return "blockquote"
+    return "prose"
 
 
-def _render_prose(prose: str) -> str:
+def _normalize_chat_spacing(lines: list[str]) -> list[str]:
+    """Apply one model-independent blank-line contract to chat blocks."""
+    compact: list[str] = []
+    for line in lines:
+        if not line.strip():
+            if compact and compact[-1] != "":
+                compact.append("")
+            continue
+        compact.append(line.rstrip())
+
+    while compact and compact[0] == "":
+        compact.pop(0)
+    while compact and compact[-1] == "":
+        compact.pop()
+
+    nonblank = [index for index, line in enumerate(compact) if line]
+    if not nonblank:
+        return []
+
+    out: list[str] = []
+    for position, index in enumerate(nonblank):
+        line = compact[index]
+        kind = _line_kind(line)
+        if out:
+            previous = out[-1]
+            previous_kind = _line_kind(previous) if previous else "blank"
+            between_had_blank = any(
+                not value for value in compact[nonblank[position - 1] + 1:index]
+            )
+            same_tight_block = (
+                kind == previous_kind and kind in {"list", "blockquote"}
+            )
+            block_boundary = (
+                kind in {"heading", "list", "blockquote"}
+                or previous_kind in {"heading", "list", "blockquote"}
+            )
+            if not same_tight_block and (between_had_blank or block_boundary):
+                if out[-1] != "":
+                    out.append("")
+        out.append(line)
+    return out
+
+
+def _render_prose(prose: str, *, surface: str) -> str:
     """Render chat-safe prose without touching fenced code."""
 
     if not prose:
@@ -147,22 +198,40 @@ def _render_prose(prose: str) -> str:
     for line in prose.splitlines():
         if _HORIZONTAL_RULE_RE.fullmatch(line):
             continue
-        rendered.append(_semantic_heading(line).rstrip())
-    text = "\n".join(rendered)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if _EMPTY_RITUAL_RE.fullmatch(line):
+            continue
+        rendered.append(_KMROS_CASE_RE.sub("kmrOS", line).rstrip())
+    if surface in {"discord", "telegram", "raycast_extension"}:
+        rendered = _normalize_chat_spacing(rendered)
+    text = "\n".join(rendered).strip("\n")
     if had_final_newline and text:
         return text + "\n"
     return text
 
 
-def _render_document(document: ResponseDocument) -> str:
-    return "".join(
-        block.text if block.kind == "fenced_code" else _render_prose(block.text)
-        for block in document.blocks
-    )
+def _render_document(document: ResponseDocument, *, surface: str) -> str:
+    chunks: list[str] = []
+    previous_kind: str | None = None
+    for block in document.blocks:
+        if block.kind == "fenced_code":
+            if chunks and chunks[-1].strip():
+                chunks[-1] = chunks[-1].rstrip("\n") + "\n\n"
+            chunks.append(block.text)
+            previous_kind = block.kind
+            continue
+
+        rendered = _render_prose(block.text, surface=surface)
+        if not rendered:
+            continue
+        if previous_kind == "fenced_code" and chunks:
+            prefix = "\n" if chunks[-1].endswith("\n") else "\n\n"
+            rendered = prefix + rendered.lstrip("\n")
+        chunks.append(rendered)
+        previous_kind = block.kind
+    return "".join(chunks)
 
 
-def _render_lkg(content: str) -> str:
+def _render_lkg(content: str, *, surface: str) -> str:
     """Small deterministic fallback with the same safety invariants.
 
     This path intentionally avoids the document dataclasses.  It is separately
@@ -184,7 +253,9 @@ def _render_lkg(content: str) -> str:
             ending = prose_line[len(bare):]
             if _HORIZONTAL_RULE_RE.fullmatch(bare):
                 continue
-            out.append(_semantic_heading(bare).rstrip() + ending)
+            if _EMPTY_RITUAL_RE.fullmatch(bare):
+                continue
+            out.append(bare.rstrip() + ending)
 
     for line in content.splitlines(keepends=True):
         match = _FENCE_RE.match(line)
@@ -204,7 +275,21 @@ def _render_lkg(content: str) -> str:
             continue
         prose.append(line)
     flush_prose()
-    return "".join(out)
+    # LKG keeps fence bytes untouched; normalize only prose blocks in a second
+    # fence-aware pass using the smaller prose renderer.
+    rendered: list[str] = []
+    for block in _split_fenced_blocks("".join(out)):
+        if block.kind == "fenced_code":
+            if rendered and rendered[-1].strip():
+                rendered[-1] = rendered[-1].rstrip("\n") + "\n\n"
+            rendered.append(block.text)
+        else:
+            prose = _render_prose(block.text, surface=surface)
+            if rendered and rendered[-1].lstrip().startswith(("```", "~~~")) and prose:
+                prose = ("\n" if rendered[-1].endswith("\n") else "\n\n") + prose.lstrip("\n")
+            if prose:
+                rendered.append(prose)
+    return "".join(rendered)
 
 
 def _configured_mode(mode: DeliveryMode | str | None = None) -> DeliveryMode:
@@ -253,13 +338,15 @@ def build_delivery_envelope(
     used_fallback = False
     try:
         if mode is DeliveryMode.LKG:
-            rendered = _render_lkg(original)
+            rendered = _render_lkg(original, surface=normalized_surface)
         else:
-            rendered = _render_document(ResponseDocument.parse(original))
+            rendered = _render_document(
+                ResponseDocument.parse(original), surface=normalized_surface
+            )
     except Exception:
         used_fallback = True
         try:
-            rendered = _render_lkg(original)
+            rendered = _render_lkg(original, surface=normalized_surface)
         except Exception:
             rendered = original
 

@@ -3916,9 +3916,79 @@ def launchd_plist_is_current() -> bool:
 
     installed = plist_path.read_text(encoding="utf-8")
     expected = generate_launchd_plist()
-    return _normalize_launchd_plist_for_comparison(
+    if _normalize_launchd_plist_for_comparison(
         installed
-    ) == _normalize_launchd_plist_for_comparison(expected)
+    ) == _normalize_launchd_plist_for_comparison(expected):
+        return True
+
+    # kmrOS profile gateways intentionally use one stable launcher which pins
+    # each profile to its immutable release.  The generic Hermes generator
+    # emits a direct ``python -m hermes_cli.main`` plist, so raw comparison
+    # would otherwise report every healthy profile launcher as stale and may
+    # replace it during a harmless status/start operation.  Accept this
+    # alternate definition only when every identity/path field is exact and
+    # the launcher itself is a private, user-owned executable.
+    return _profile_launcher_plist_is_current(plist_path, installed)
+
+
+def _profile_launcher_plist_is_current(plist_path: Path, installed: str) -> bool:
+    """Validate the strict profile-launcher launchd contract.
+
+    This is deliberately narrower than general plist equivalence.  It accepts
+    only named profiles rooted at ``<root>/profiles/<profile>`` and rejects
+    altered arguments, roots, working directories, log paths, labels, or an
+    insecure launcher file.
+    """
+    import plistlib
+    import stat
+
+    profile = _profile_suffix()
+    profile_home = get_hermes_home().resolve()
+    if not profile or profile_home.parent.name != "profiles":
+        return False
+    root = profile_home.parent.parent.resolve()
+    launcher = (_launchd_user_home() / ".local" / "bin" / "hermes-profile-launcher")
+
+    try:
+        payload = plistlib.loads(installed.encode("utf-8"))
+        launcher_stat = launcher.stat()
+        plist_stat = plist_path.stat()
+    except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+    expected_logs = profile_home / "logs"
+    env = payload.get("EnvironmentVariables")
+    if not isinstance(env, dict):
+        return False
+    expected = {
+        "Label": get_launchd_label(),
+        "ProgramArguments": [str(launcher), profile],
+        "WorkingDirectory": str(profile_home),
+        "StandardOutPath": str(expected_logs / "gateway.log"),
+        "StandardErrorPath": str(expected_logs / "gateway.error.log"),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        return False
+    if env.get("HERMES_ROOT") != str(root):
+        return False
+
+    # Both the plist and launcher must be owned by the current account.  The
+    # launcher may be world-readable/executable, but it must never be writable
+    # by group/other and its owner must be able to execute it.
+    if plist_stat.st_uid != os.getuid() or plist_stat.st_mode & 0o022:
+        return False
+    if (
+        launcher_stat.st_uid != os.getuid()
+        or not stat.S_ISREG(launcher_stat.st_mode)
+        or launcher_stat.st_mode & 0o022
+        or not launcher_stat.st_mode & stat.S_IXUSR
+    ):
+        return False
+    return True
 
 
 def refresh_launchd_plist_if_needed() -> bool:
