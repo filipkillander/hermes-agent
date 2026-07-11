@@ -205,6 +205,14 @@ class TestHelperFunctions(unittest.TestCase):
             "Studio: killandermusicrecords.com\nPortfolio: linktr.ee/portfolio"
         ))
 
+    def test_from_header_normalizes_public_mailbox_casing(self):
+        from plugins.platforms.email.adapter import _from_header
+
+        self.assertEqual(
+            _from_header("Igor@KillanderMusicRecords.com", {"display_name": "Igor"}),
+            "Igor <igor@killandermusicrecords.com>",
+        )
+
     def test_strip_html_br_tags(self):
         from plugins.platforms.email.adapter import _strip_html
         html = "Line 1<br>Line 2<br/>Line 3"
