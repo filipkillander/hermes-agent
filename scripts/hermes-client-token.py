@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-SURFACES = {"chrome_extension", "raycast_extension"}
+SURFACES = {"chrome_extension", "raycast_extension", "generic_api"}
 AGENTS = ("lumi", "igor", "spark")
 DEFAULT_SCOPES = ["status", "chat", "sessions", "capture"]
 
@@ -90,6 +90,11 @@ def issue(args: argparse.Namespace) -> None:
     scopes = list(DEFAULT_SCOPES)
     if args.agent == "spark" and surface == "raycast_extension":
         scopes.append("messaging")
+    if surface == "generic_api":
+        # Hermes Desktop currently sends no client-surface header. Give its
+        # revocable per-device credential parity with the legacy master key
+        # without distributing that shared key to another machine.
+        scopes.append("admin")
     entry = {
         "key_id": key_id,
         "principal": principal,
