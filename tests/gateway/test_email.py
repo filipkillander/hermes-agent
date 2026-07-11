@@ -141,6 +141,14 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertEqual(subject, "KMR Studios | Veckobrev")
         self.assertEqual(body, "Hej Filip!")
 
+        for directive in (
+            "**Ämnesrad:** KMR Studios | Veckobrev",
+            "**Subject**: KMR Studios | Veckobrev",
+        ):
+            subject, body = _extract_subject_override(directive + "\n\nHej Filip!")
+            self.assertEqual(subject, "KMR Studios | Veckobrev")
+            self.assertEqual(body, "Hej Filip!")
+
         subject, body = _extract_subject_override(
             "Hej Filip!\n\nSubject: detta är vanlig brödtext"
         )

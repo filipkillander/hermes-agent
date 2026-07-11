@@ -115,7 +115,8 @@ _EMAIL_INTERNAL_LINE_RE = re.compile(
 
 _SUBJECT_OVERRIDE_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?(?:\*\*)?"
-    r"(?:subject|ämne|ämnesrad)(?:\*\*)?\s*:\s*(.+?)\s*$",
+    r"(?:subject|ämne|ämnesrad)"
+    r"(?:(?:\*\*)\s*:|:\s*(?:\*\*)?)\s*(.+?)\s*$",
     re.IGNORECASE,
 )
 
