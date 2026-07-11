@@ -1,4 +1,6 @@
 """Phase 3: secondary-profile adapter registry + same-token conflict detection."""
+import hashlib
+
 import pytest
 
 from gateway.run import GatewayRunner
@@ -52,6 +54,26 @@ class TestCredentialFingerprint:
 
         assert fp is not None
         assert "config-token" not in fp
+
+    def test_api_server_key_uses_keyed_fingerprint_without_secret_or_bare_sha(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+        from hermes_cli.runtime_registry import credential_fingerprint
+
+        secret = "api-server-canary-secret-20260711"
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"key": secret})
+        )
+        try:
+            fingerprint = GatewayRunner._adapter_credential_fingerprint(adapter)
+
+            assert fingerprint == credential_fingerprint(secret)
+            assert fingerprint is not None
+            assert fingerprint.startswith("hmac-sha256:")
+            assert secret not in fingerprint
+            assert hashlib.sha256(secret.encode()).hexdigest() not in fingerprint
+        finally:
+            adapter._response_store.close()
 
 
 class TestProfileMessageHandler:

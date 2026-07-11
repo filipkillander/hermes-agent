@@ -35,7 +35,8 @@ def test_golden_chat_rendering(surface):
     rendered = prepare_delivery_content(source, surface=surface)
     prose_before_fence = rendered.split("```md", 1)[0]
 
-    assert rendered.startswith("# Status")
+    expected_heading = "# Status" if surface == "discord" else "**Status**"
+    assert rendered.startswith(expected_heading)
     assert "> quoted prose" in rendered
     assert "\n---\n" not in prose_before_fence
     assert "**Lumi**" in rendered
@@ -110,7 +111,7 @@ def test_surface_kill_switch_and_lkg_modes_are_independent():
     telegram = build_delivery_envelope(source, surface="telegram", mode="lkg")
     assert discord.mode is DeliveryMode.OFF and discord.content == source
     assert telegram.mode is DeliveryMode.LKG
-    assert telegram.content == "# Header\n\nBody"
+    assert telegram.content == "**Header**\n\nBody"
 
 
 def test_invalid_mode_fails_closed_to_enforcement():
@@ -119,7 +120,7 @@ def test_invalid_mode_fails_closed_to_enforcement():
         mode="typo",
     )
     assert result.mode is DeliveryMode.ENFORCE
-    assert result.content == "# Header"
+    assert result.content == "**Header**"
 
 
 def test_platform_config_controls_per_surface_mode():
@@ -131,7 +132,7 @@ def test_platform_config_controls_per_surface_mode():
     ) == source
     assert prepare_platform_delivery_content(
         source, surface="telegram", config=lkg
-    ) == "# Header\n\nBody"
+    ) == "**Header**\n\nBody"
 
 
 def test_primary_failure_uses_lkg_without_content_logging(monkeypatch, caplog):
@@ -183,9 +184,10 @@ def test_platform_spacing_contract_collapses_gaps_and_separates_blocks(surface):
 
     rendered = prepare_delivery_content(source, surface=surface)
 
+    heading = "## Nästa steg" if surface == "discord" else "**Nästa steg**"
     assert rendered == (
         "Svar först.\n\n"
-        "## Nästa steg\n\n"
+        f"{heading}\n\n"
         "- Ett\n"
         "- Två\n\n"
         "> Viktigt\n\n"
