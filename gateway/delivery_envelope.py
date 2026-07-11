@@ -144,6 +144,26 @@ def _line_kind(line: str) -> str:
     return "prose"
 
 
+def _render_heading_for_surface(line: str, *, surface: str) -> str:
+    """Preserve native Discord headings; compact unsupported surfaces.
+
+    Telegram does not support Markdown headings and Raycast's compact result
+    view is more readable with a bold section label.  The conversion is
+    deliberately surface-specific so Discord can retain its native heading
+    hierarchy.  Fenced code never reaches this function.
+    """
+
+    if surface not in {"telegram", "raycast_extension"}:
+        return line
+    match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+    if not match:
+        return line
+    title = match.group(1).strip()
+    if title.startswith("**") and title.endswith("**"):
+        return title
+    return f"**{title}**"
+
+
 def _normalize_chat_spacing(lines: list[str]) -> list[str]:
     """Apply one model-independent blank-line contract to chat blocks."""
     compact: list[str] = []
@@ -200,7 +220,8 @@ def _render_prose(prose: str, *, surface: str) -> str:
             continue
         if _EMPTY_RITUAL_RE.fullmatch(line):
             continue
-        rendered.append(_KMROS_CASE_RE.sub("kmrOS", line).rstrip())
+        normalized = _KMROS_CASE_RE.sub("kmrOS", line).rstrip()
+        rendered.append(_render_heading_for_surface(normalized, surface=surface))
     if surface in {"discord", "telegram", "raycast_extension"}:
         rendered = _normalize_chat_spacing(rendered)
     text = "\n".join(rendered).strip("\n")

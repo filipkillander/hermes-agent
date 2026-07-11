@@ -42,7 +42,7 @@ def test_telegram_legacy_formatter_is_envelope_boundary(telegram_adapter):
 def test_telegram_rich_payload_cannot_bypass_envelope(telegram_adapter):
     payload = telegram_adapter._rich_message_payload(SOURCE)
     rendered = payload["markdown"]
-    assert rendered.startswith("# Status")
+    assert rendered.startswith("**Status**")
     assert "\n---\n" not in rendered
     assert "|---|" not in rendered
 
@@ -129,7 +129,7 @@ async def test_telegram_interim_edit_is_enveloped(telegram_adapter):
 
     assert result.success
     delivered = bot.edit_message_text.await_args.kwargs["text"]
-    assert delivered.startswith("# Status")
+    assert delivered.startswith("**Status**")
     assert "|---|" not in delivered
 
 
@@ -148,7 +148,7 @@ async def test_no_agent_telegram_send_message_is_enveloped(monkeypatch):
 
     assert result["success"]
     delivered = standalone.await_args.args[2]
-    assert delivered.startswith("# Status")
+    assert delivered.startswith("**Status**")
     assert "|---|" not in delivered
 
 
