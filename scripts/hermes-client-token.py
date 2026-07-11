@@ -87,13 +87,16 @@ def issue(args: argparse.Namespace) -> None:
         raise SystemExit(f"active key already exists: {key_id}; revoke it first")
     token = "kmr_" + secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
+    scopes = list(DEFAULT_SCOPES)
+    if args.agent == "spark" and surface == "raycast_extension":
+        scopes.append("messaging")
     entry = {
         "key_id": key_id,
         "principal": principal,
         "device": device,
         "agent": args.agent,
         "surfaces": [surface],
-        "scopes": DEFAULT_SCOPES,
+        "scopes": scopes,
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "created_at": now.isoformat().replace("+00:00", "Z"),
         "expires_at": (now + timedelta(days=args.days)).isoformat().replace("+00:00", "Z"),

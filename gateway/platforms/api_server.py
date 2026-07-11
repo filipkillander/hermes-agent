@@ -1155,6 +1155,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return "sessions"
         if path.endswith("/capture"):
             return "capture"
+        if path == "/v1/messaging/send":
+            return "messaging"
         if path.startswith("/v1/chat/") or path.startswith("/v1/responses") or path.startswith("/v1/runs"):
             return "chat"
         return "admin"
