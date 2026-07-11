@@ -96,20 +96,28 @@ def _relocate_venv_shebangs(staging: Path, final_release: Path) -> int:
     final_release = final_release.resolve()
     if final_release.parent != staging.parent or final_release.name.startswith(".staging-"):
         raise UpdateBuildError("invalid_final_release_path", "stage_build")
-    prefix = ("#!" + str(staging)).encode("utf-8")
-    replacement = ("#!" + str(final_release)).encode("utf-8")
+    staging_bytes = str(staging).encode("utf-8")
+    final_bytes = str(final_release).encode("utf-8")
+    prefix = b"#!" + staging_bytes
+    replacement = b"#!" + final_bytes
     changed = 0
     bin_dir = staging / ".venv" / "bin"
     for path in sorted(bin_dir.iterdir()):
         if path.is_symlink() or not path.is_file():
             continue
         payload = path.read_bytes()
-        if not payload.startswith(prefix):
+        if payload.startswith(prefix):
+            newline = payload.find(b"\n")
+            if newline < 0:
+                raise UpdateBuildError("invalid_venv_shebang", "stage_build")
+            payload = replacement + payload[len(prefix):newline] + payload[newline:]
+        elif payload.startswith(b"#!/bin/sh\n") and staging_bytes in payload[:1024]:
+            # uv uses a shell trampoline when the interpreter path is too long
+            # for a native shebang. Its exec line must be relocated as well.
+            payload = payload.replace(staging_bytes, final_bytes)
+        else:
             continue
-        newline = payload.find(b"\n")
-        if newline < 0:
-            raise UpdateBuildError("invalid_venv_shebang", "stage_build")
-        path.write_bytes(replacement + payload[len(prefix):newline] + payload[newline:])
+        path.write_bytes(payload)
         changed += 1
     return changed
 
