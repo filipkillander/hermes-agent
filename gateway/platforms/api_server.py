@@ -43,6 +43,7 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -100,6 +101,7 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 CLIENT_SURFACE_HEADER = "X-Hermes-Client-Surface"
 CLIENT_SURFACES = frozenset({"chrome_extension", "raycast_extension", "generic_api"})
 DEFAULT_CLIENT_SURFACE = "generic_api"
+CLIENT_KEY_FILE_ENV = "API_SERVER_CLIENT_KEYS_FILE"
 
 _CHROME_FORMAT_PROMPT = (
     "The authenticated client surface is a Chrome extension with rich Markdown "
@@ -912,6 +914,11 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        client_keys_file = extra.get("client_keys_file", os.getenv(CLIENT_KEY_FILE_ENV, ""))
+        if not client_keys_file:
+            profile_home = os.getenv("HERMES_HOME", "").strip()
+            client_keys_file = str(Path(profile_home) / "client-keys.json") if profile_home else ""
+        self._client_keys_file: Optional[Path] = Path(client_keys_file).expanduser() if client_keys_file else None
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1119,7 +1126,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._api_key:
             auth_header = request.headers.get("Authorization", "")
             token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
-            if not hmac.compare_digest(token, self._api_key):
+            master_ok = hmac.compare_digest(token, self._api_key)
+            client_identity = None if master_ok else self._match_client_key(token, request)
+            if not master_ok and client_identity is None:
                 logger.warning(
                     "API server rejected invalid API key: %s",
                     self._request_audit_log_suffix(request),
@@ -1128,11 +1137,74 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
                     status=401,
                 )
+            if client_identity is not None:
+                request["hermes_client_identity"] = client_identity
 
         try:
             _client_surface_from_request(request)
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
+        return None
+
+    @staticmethod
+    def _required_client_scope(request: "web.Request") -> str:
+        path = request.path
+        if path in {"/v1/models", "/v1/capabilities"}:
+            return "status"
+        if path.startswith("/api/sessions"):
+            return "sessions"
+        if path.endswith("/capture"):
+            return "capture"
+        if path.startswith("/v1/chat/") or path.startswith("/v1/responses") or path.startswith("/v1/runs"):
+            return "chat"
+        return "admin"
+
+    def _match_client_key(self, token: str, request: "web.Request") -> Optional[Dict[str, Any]]:
+        """Validate a revocable client key from a hash-only profile registry."""
+        if not token or self._client_keys_file is None:
+            return None
+        try:
+            payload = json.loads(self._client_keys_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+        entries = payload.get("keys", []) if isinstance(payload, dict) else []
+        if not isinstance(entries, list):
+            return None
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            surface = _client_surface_from_request(request)
+        except ValueError:
+            return None
+        required_scope = self._required_client_scope(request)
+        active_profile = os.getenv("HERMES_PROFILE", "").strip().lower()
+        now = datetime.now(timezone.utc)
+        for item in entries:
+            if not isinstance(item, dict) or item.get("revoked") is True:
+                continue
+            if not hmac.compare_digest(str(item.get("token_sha256", "")), digest):
+                continue
+            if active_profile and str(item.get("agent", "")).strip().lower() != active_profile:
+                return None
+            if surface not in set(item.get("surfaces", [])):
+                return None
+            scopes = set(item.get("scopes", []))
+            if required_scope not in scopes:
+                return None
+            expires_at = str(item.get("expires_at", "")).strip()
+            if expires_at:
+                try:
+                    expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+                if expiry.tzinfo is None or expiry <= now:
+                    return None
+            return {
+                "key_id": str(item.get("key_id", "")),
+                "principal": str(item.get("principal", "")),
+                "agent": str(item.get("agent", "")),
+                "surface": surface,
+                "scopes": sorted(scopes),
+            }
         return None
 
     @staticmethod
