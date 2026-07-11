@@ -54,6 +54,32 @@ def test_arbitrary_session_id_collapses_to_default():
     assert terminal_tool._resolve_container_task_id("sess-123e4567-e89b-12d3") == "default"
 
 
+def test_local_environment_keeps_session_id():
+    assert (
+        terminal_tool._resolve_environment_task_id("sess-123", "local")
+        == "sess-123"
+    )
+
+
+def test_container_environment_preserves_shared_contract():
+    assert (
+        terminal_tool._resolve_environment_task_id("sess-123", "docker")
+        == "default"
+    )
+
+
+def test_get_active_env_prefers_exact_local_session():
+    local_env = object()
+    shared_env = object()
+    terminal_tool._active_environments["sess-123"] = local_env
+    terminal_tool._active_environments["default"] = shared_env
+    try:
+        assert terminal_tool.get_active_env("sess-123") is local_env
+    finally:
+        terminal_tool._active_environments.pop("sess-123", None)
+        terminal_tool._active_environments.pop("default", None)
+
+
 def test_rl_task_with_override_keeps_its_own_id():
     # RL / benchmark pattern: register a per-task image, then the task_id
     # must survive ``_resolve_container_task_id`` so the rollout lands in

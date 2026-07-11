@@ -1155,6 +1155,22 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     return "default"
 
 
+def _resolve_environment_task_id(task_id: Optional[str], env_type: str) -> str:
+    """Return the cache key for the selected terminal backend.
+
+    Containers are intentionally shared unless a benchmark explicitly opts
+    into isolation.  A local backend is different: its environment owns a
+    persistent shell, cwd and foreground process registry.  Sharing that
+    object across unrelated gateway sessions lets one stuck command or ``cd``
+    leak into every conversation.  Keep local environments session/task
+    scoped while preserving the established container contract.
+    """
+    raw = str(task_id or "default").strip() or "default"
+    if env_type == "local":
+        return raw
+    return _resolve_container_task_id(raw)
+
+
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     """Return the env overrides for *task_id*, raw key first then collapsed.
 
@@ -1642,7 +1658,9 @@ def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        # A local backend is cached under the raw session/task id; container
+        # backends remain under the collapsed key. Prefer the exact match.
+        return _active_environments.get(task_id) or _active_environments.get(lookup)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -2071,7 +2089,7 @@ def terminal_tool(
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
+        effective_task_id = _resolve_environment_task_id(task_id, env_type)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``

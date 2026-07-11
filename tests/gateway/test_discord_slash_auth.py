@@ -373,6 +373,14 @@ async def test_ignored_channel_wildcard_blocks_all(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_config_ignored_channel_blocks_native_slash(adapter, monkeypatch):
+    """A config-only archive rule must cover slash interactions too."""
+    adapter.config.extra["ignored_channels"] = ["9999"]
+    interaction = _make_interaction("100200300", channel_id=9999)
+    assert await adapter._check_slash_authorization(interaction, "/status") is False
+
+
+@pytest.mark.asyncio
 async def test_ignored_channel_matches_by_name(adapter, monkeypatch):
     """Ignore list configured by channel NAME blocks slash interactions too."""
     monkeypatch.setenv("DISCORD_IGNORED_CHANNELS", "cypher")

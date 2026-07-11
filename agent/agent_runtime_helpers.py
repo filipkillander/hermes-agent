@@ -2532,7 +2532,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                         patched.append({
                             "role": "tool",
                             "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                            "content": "[Result unavailable — see context summary above]",
+                            "content": (
+                                "[Tool call interrupted before a result was recorded. "
+                                "Do not retry it automatically; continue from the "
+                                "user's latest message.]"
+                            ),
                             "tool_call_id": cid,
                         })
         messages = patched

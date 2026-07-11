@@ -2997,6 +2997,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Executor futures are tracked separately from agent objects so /stop
+        # can wait for the tool worker to finish recording its interrupted
+        # result before the session lock is released.
+        self._running_executor_tasks: Dict[str, tuple[Optional[int], asyncio.Future]] = {}
         self._active_session_leases: Dict[str, Any] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Last successfully-resolved (non-empty) model, keyed by session. Used
@@ -5456,6 +5460,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
+            if steered and hasattr(running_agent, "interrupt_current_tools_for_steer"):
+                async def _escalate_stale_steer(
+                    _agent=running_agent,
+                    _session_key=session_key,
+                ) -> None:
+                    try:
+                        delay = max(
+                            0.1,
+                            float(os.getenv("HERMES_STEER_TOOL_GRACE_SECONDS", "15")),
+                        )
+                    except (TypeError, ValueError):
+                        delay = 15.0
+                    await asyncio.sleep(delay)
+                    if (
+                        self._running_agents.get(_session_key) is _agent
+                        and getattr(_agent, "has_pending_steer", lambda: False)()
+                    ):
+                        logger.warning(
+                            "Steer for %s exceeded %.1fs tool grace; interrupting active tool only",
+                            _session_key,
+                            delay,
+                        )
+                        _agent.interrupt_current_tools_for_steer()
+
+                asyncio.create_task(_escalate_stale_steer())
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -9210,13 +9239,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
-                await self._interrupt_and_clear_session(
+                _drained = await self._interrupt_and_clear_session(
                     _quick_key,
                     source,
                     interrupt_reason=_INTERRUPT_REASON_STOP,
                     invalidation_reason="stop_command",
                 )
-                logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key)
+                if not _drained:
+                    return EphemeralReply(
+                        "⚡ Stop requested. The active tool is still closing; "
+                        "this session remains locked until its interrupted "
+                        "result has been recorded."
+                    )
+                logger.info("STOP for session %s — agent interrupted, executor drained", _quick_key)
                 return EphemeralReply(t("gateway.stop.stopped"))
 
             # /reset and /new must bypass the running-agent guard so they
@@ -9228,12 +9263,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interrupt completes.
             if _cmd_def_inner and _cmd_def_inner.name == "new":
                 # Clear any pending messages so the old text doesn't replay
-                await self._interrupt_and_clear_session(
+                _drained = await self._interrupt_and_clear_session(
                     _quick_key,
                     source,
                     interrupt_reason=_INTERRUPT_REASON_RESET,
                     invalidation_reason="new_command",
                 )
+                if not _drained:
+                    return EphemeralReply(
+                        "⚡ The previous run is still closing. The new session "
+                        "will not start until its interrupted tool result is recorded."
+                    )
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
                 return await self._handle_reset_command(event)
@@ -15941,10 +15981,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupt_reason: str,
         invalidation_reason: str,
         release_running_state: bool = True,
-    ) -> None:
-        """Interrupt the current run and clear queued session state consistently."""
+    ) -> bool:
+        """Interrupt the current run and clear queued state after it drains.
+
+        Returns True when the executor has stopped (or none was registered).
+        A False result leaves the running slot locked; a background finalizer
+        releases it only after the old executor actually exits.  This prevents
+        a new generation from sharing terminal state with an orphaned tool.
+        """
         if not session_key:
-            return
+            return True
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
@@ -15955,8 +16001,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        drained = True
+        executor_tasks = getattr(self, "_running_executor_tasks", {})
+        executor_entry = executor_tasks.get(session_key)
+        if executor_entry is not None:
+            _executor_generation, executor_task = executor_entry
+            if not executor_task.done():
+                try:
+                    drain_timeout = max(
+                        0.1,
+                        float(os.getenv("HERMES_STOP_DRAIN_TIMEOUT", "5")),
+                    )
+                except (TypeError, ValueError):
+                    drain_timeout = 5.0
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(executor_task), timeout=drain_timeout
+                    )
+                except asyncio.TimeoutError:
+                    drained = False
+                except Exception:
+                    # The executor is finished even when its run raised.
+                    drained = True
         if release_running_state:
-            self._release_running_agent_state(session_key)
+            if drained:
+                self._release_running_agent_state(session_key)
+            else:
+                logger.warning(
+                    "Session %s is still draining after /stop; keeping it locked",
+                    session_key,
+                )
+
+                async def _release_after_executor_drain() -> None:
+                    try:
+                        await asyncio.shield(executor_task)
+                    except Exception:
+                        pass
+                    current = executor_tasks.get(session_key)
+                    if current is executor_entry:
+                        executor_tasks.pop(session_key, None)
+                    self._release_running_agent_state(session_key)
+                    self._evict_cached_agent(session_key)
+                    logger.info("Interrupted session %s fully drained and unlocked", session_key)
+
+                asyncio.create_task(_release_after_executor_drain())
             # Evict the cached agent: ``_interrupt_requested`` is only
             # cleared by the turn finalizer, so on a hung or still-draining
             # run the flag survives the lock release and kills the session's
@@ -15966,7 +16054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # rebuilds the agent from session history, while the old agent
             # object keeps its interrupt flag so a hung drain still dies
             # when it unblocks.
-            self._evict_cached_agent(session_key)
+            if drained:
+                self._evict_cached_agent(session_key)
+        return drained
 
     async def _refresh_agent_cache_message_count(
         self, session_key: str, session_id: Optional[str]
@@ -19289,6 +19379,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(run_sync)
             )
+            if session_key:
+                self._running_executor_tasks[session_key] = (
+                    run_generation,
+                    _executor_task,
+                )
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0
@@ -19813,6 +19908,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Clean up tracking
             tracking_task.cancel()
             if session_key:
+                _registered_executor = self._running_executor_tasks.get(session_key)
+                if (
+                    _registered_executor is not None
+                    and _registered_executor[1] is locals().get("_executor_task")
+                ):
+                    self._running_executor_tasks.pop(session_key, None)
                 # Only release the slot if this run's generation still owns
                 # it.  A /stop or /new that bumped the generation while we
                 # were unwinding has already installed its own state; this

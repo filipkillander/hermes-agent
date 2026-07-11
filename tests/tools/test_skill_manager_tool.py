@@ -1316,6 +1316,39 @@ class TestCuratorConsolidationDeleteGuard:
 
         _reset_background_review_read_marks()
 
+
+class TestProtectedSkills:
+    @pytest.mark.parametrize(
+        "action,kwargs",
+        [
+            ("edit", {"content": VALID_SKILL_CONTENT}),
+            ("patch", {"old_string": "old", "new_string": "new"}),
+            ("delete", {}),
+            ("write_file", {"file_path": "references/x.md", "file_content": "x"}),
+            ("remove_file", {"file_path": "references/x.md"}),
+        ],
+    )
+    def test_slug_protection_is_proposal_only(self, monkeypatch, action, kwargs):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"skills": {"protected": ["formatting-harness"]}},
+        )
+        result = json.loads(
+            skill_manage(action=action, name="formatting-harness", **kwargs)
+        )
+        assert result["success"] is False
+        assert result["proposal_required"] is True
+        assert result["protected_skill"] == "formatting-harness"
+
+    def test_unprotected_slug_is_not_blocked_by_owner_guard(self, monkeypatch):
+        from tools.skill_manager_tool import _protected_skill_guard
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"skills": {"protected": ["formatting-harness"]}},
+        )
+        assert _protected_skill_guard("patch", "ordinary-skill") is None
+
     def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
         from tools.skills_tool import skill_view
         from tools.skill_manager_tool import _reset_background_review_read_marks

@@ -377,3 +377,49 @@ class TestPostStopInterruptSwallow:
             "Cached agent with a set interrupt flag must be evicted on /stop "
             "so the flag cannot kill the session's next message (#44212)"
         )
+
+    @pytest.mark.asyncio
+    async def test_stop_keeps_session_locked_until_executor_drains(self, monkeypatch):
+        """A timed-out /stop must not unlock an orphaned terminal worker."""
+        import asyncio
+        import threading
+
+        from gateway.run import GatewayRunner, _INTERRUPT_REASON_STOP
+
+        class _Agent:
+            def interrupt(self, reason=None):
+                self.reason = reason
+
+        key = "agent:main:discord:channel:drain"
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id="drain", chat_type="channel"
+        )
+        agent = _Agent()
+        executor = asyncio.get_running_loop().create_future()
+        runner = object.__new__(GatewayRunner)
+        runner._running_agents = {key: agent}
+        runner._running_executor_tasks = {key: (1, executor)}
+        runner._agent_cache = {key: (agent, "sig")}
+        runner._agent_cache_lock = threading.Lock()
+        runner.adapters = {}
+        runner._pending_messages = {}
+        runner._invalidate_session_run_generation = lambda *a, **k: 2
+        released = []
+        runner._release_running_agent_state = lambda session_key, **kw: released.append(session_key)
+        monkeypatch.setenv("HERMES_STOP_DRAIN_TIMEOUT", "0.01")
+
+        drained = await runner._interrupt_and_clear_session(
+            key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_STOP,
+            invalidation_reason="test",
+        )
+        assert drained is False
+        assert released == []
+        assert key in runner._running_agents
+
+        executor.set_result(None)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert released == [key]
+        assert key not in runner._agent_cache
