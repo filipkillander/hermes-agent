@@ -11970,6 +11970,20 @@ def cmd_dashboard(args):
     # build gate, and start_server.
     _headless_backend = getattr(args, "headless_backend", False)
 
+    # A unified-dashboard child (including the LaunchAgent form) already
+    # carries ``--open-profile`` and therefore intentionally skips the re-exec
+    # block below.  Normalize its process identity here as well: launchd may
+    # have inherited HERMES_PROFILE from Lumi even though argv says
+    # ``-p default``.  The selected UI profile remains in ``open_profile``;
+    # only the machine backend identity is reset.
+    if getattr(args, "open_profile", "") and not getattr(args, "isolated", False):
+        os.environ["HERMES_PROFILE"] = "default"
+        try:
+            from hermes_constants import get_default_hermes_root
+            os.environ["HERMES_HOME"] = str(get_default_hermes_root())
+        except Exception:
+            os.environ.pop("HERMES_HOME", None)
+
     # ── Unified profile launch routing ────────────────────────────────
     # The dashboard is a MACHINE management surface: it can read/write any
     # profile via the per-request ?profile= scoping. Running one dashboard

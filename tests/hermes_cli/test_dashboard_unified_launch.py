@@ -204,6 +204,8 @@ class TestUnifiedDashboardRouting:
     def test_reexec_child_does_not_reroute(self, main_mod, monkeypatch):
         """The re-exec'd child carries --open-profile; the guard must treat
         that as 'already routed' and never re-exec again (no exec loop)."""
+        monkeypatch.setenv("HERMES_PROFILE", "worker_x")
+        monkeypatch.setenv("HERMES_HOME", "/tmp/profiles/worker_x")
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
         )
@@ -214,6 +216,9 @@ class TestUnifiedDashboardRouting:
         with pytest.raises((SystemExit, AttributeError, ImportError, TypeError)):
             main_mod.cmd_dashboard(_args(open_profile="worker_x"))
         assert execs == []
+        assert main_mod.os.environ["HERMES_PROFILE"] == "default"
+        from hermes_constants import get_default_hermes_root
+        assert main_mod.os.environ["HERMES_HOME"] == str(get_default_hermes_root())
 
     def test_dashboard_starts_mcp_discovery_for_ws_backend(self, main_mod, monkeypatch):
         """The dashboard process serves the /api/ws gateway but never runs
