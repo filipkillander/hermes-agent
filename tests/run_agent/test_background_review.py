@@ -4,6 +4,15 @@ from __future__ import annotations
 
 import run_agent as run_agent_module
 from run_agent import AIAgent
+from agent.background_review import background_review_allowed_for_platform
+
+
+def test_scheduled_cron_turns_cannot_spawn_background_self_mutation():
+    assert background_review_allowed_for_platform("cron") is False
+    assert background_review_allowed_for_platform(" CRON ") is False
+    assert background_review_allowed_for_platform("discord") is True
+    assert background_review_allowed_for_platform("telegram") is True
+    assert background_review_allowed_for_platform(None) is True
 
 
 def _bare_agent() -> AIAgent:

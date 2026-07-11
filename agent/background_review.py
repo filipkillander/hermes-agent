@@ -28,6 +28,20 @@ from agent.thread_scoped_output import thread_scoped_silence
 logger = logging.getLogger(__name__)
 
 
+def background_review_allowed_for_platform(platform: Any) -> bool:
+    """Return whether a foreground turn may spawn self-improvement review.
+
+    Scheduled cron runs are automation receipts, not interactive learning
+    turns.  Letting them launch the post-turn fork makes a successful cron able
+    to mutate skills or memory after its own completion boundary, and makes the
+    recorded cron status blind to that extra work.  Keep manual/interactive
+    platforms unchanged while making every ``platform=cron`` turn read-only
+    after finalization.
+    """
+
+    return str(platform or "").strip().lower() != "cron"
+
+
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
 #
