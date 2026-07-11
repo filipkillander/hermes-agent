@@ -287,6 +287,7 @@ class RestartCoordinator:
         *,
         allow_code_revision_mismatch: bool = False,
         allow_config_revision_mismatch: bool = False,
+        allow_registry_revision_mismatch: bool = False,
     ) -> tuple[bool, list[str]]:
         failures: list[str] = []
         identity = payload.get("runtime_identity") if isinstance(payload.get("runtime_identity"), dict) else {}
@@ -315,6 +316,11 @@ class RestartCoordinator:
             # An owner-approved config change is expected to differ from the
             # running process during preflight only. Postflight remains strict.
             failures = [failure for failure in failures if failure != "config_revision_mismatch"]
+        if allow_registry_revision_mismatch:
+            # A registry edit necessarily leaves the running process reporting
+            # the previous registry revision until it is restarted. Permit
+            # only that expected preflight mismatch; postflight stays strict.
+            failures = [failure for failure in failures if failure != "registry_revision_mismatch"]
         return not failures, failures
 
     def _validate_readiness(
@@ -346,6 +352,7 @@ class RestartCoordinator:
         *,
         allow_release_transition: bool = False,
         allow_config_transition: bool = False,
+        allow_registry_transition: bool = False,
     ) -> RestartResult:
         """Restart one registry-owned gateway.
 
@@ -380,6 +387,7 @@ class RestartCoordinator:
                     config_revision,
                     allow_code_revision_mismatch=allow_release_transition,
                     allow_config_revision_mismatch=allow_config_transition,
+                    allow_registry_revision_mismatch=allow_registry_transition,
                 )
                 if not identity_ok:
                     raise RestartRejected(f"Existing listener has wrong identity: {', '.join(failures)}")
@@ -473,6 +481,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             "owner-approved config change; postflight remains strict"
         ),
     )
+    parser.add_argument(
+        "--allow-registry-transition",
+        action="store_true",
+        help=(
+            "allow only a preflight registry-revision mismatch for an intentional "
+            "registry change; postflight remains strict"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         registry = load_runtime_registry(args.registry, required=True)
@@ -480,6 +496,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.profile,
             allow_release_transition=args.allow_release_transition,
             allow_config_transition=args.allow_config_transition,
+            allow_registry_transition=args.allow_registry_transition,
         )
     except Exception as exc:
         print(f"restart rejected: {exc}", file=sys.stderr)

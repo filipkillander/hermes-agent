@@ -527,6 +527,34 @@ def test_restart_coordinator_allows_only_preflight_config_transition(tmp_path):
     assert driver.restart_calls == 1
 
 
+def test_restart_coordinator_allows_only_preflight_registry_transition(tmp_path):
+    registry = load_runtime_registry(_registry_file(tmp_path))
+    profile = registry.require("lumi")
+    revision = hashlib.sha256((profile.home / "config.yaml").read_bytes()).hexdigest()
+    driver = _Driver()
+
+    def health(url, timeout):
+        payload = _health_payload(profile, registry, driver.current_pid, revision)
+        if driver.restart_calls == 0:
+            payload["runtime_identity"]["registry_revision"] = "old-registry"
+        return payload
+
+    coordinator = RestartCoordinator(
+        registry,
+        driver=driver,
+        state_dir=tmp_path / "state",
+        health_probe=health,
+        port_probe=lambda port: {driver.current_pid},
+        process_probe=lambda pid, profile: True,
+        stable_probes=1,
+        sleeper=lambda seconds: None,
+    )
+    result = coordinator.restart("lumi", allow_registry_transition=True)
+    assert result.old_pid == 101
+    assert result.new_pid == 102
+    assert driver.restart_calls == 1
+
+
 def test_config_transition_is_opt_in(tmp_path):
     registry = load_runtime_registry(_registry_file(tmp_path))
     profile = registry.require("lumi")
@@ -714,11 +742,19 @@ def test_restart_coordinator_cli_forwards_release_transition_flag(monkeypatch, t
         def __init__(self, received_registry):
             assert received_registry is registry
 
-        def restart(self, profile, *, allow_release_transition, allow_config_transition):
+        def restart(
+            self,
+            profile,
+            *,
+            allow_release_transition,
+            allow_config_transition,
+            allow_registry_transition,
+        ):
             calls.update(
                 profile=profile,
                 allow_release_transition=allow_release_transition,
                 allow_config_transition=allow_config_transition,
+                allow_registry_transition=allow_registry_transition,
             )
             return module.RestartResult(
                 profile=profile,
@@ -731,11 +767,19 @@ def test_restart_coordinator_cli_forwards_release_transition_flag(monkeypatch, t
     monkeypatch.setattr(module, "load_runtime_registry", lambda *args, **kwargs: registry)
     monkeypatch.setattr(module, "RestartCoordinator", FakeCoordinator)
 
-    assert module.main(["lumi", "--allow-release-transition", "--allow-config-transition"]) == 0
+    assert module.main(
+        [
+            "lumi",
+            "--allow-release-transition",
+            "--allow-config-transition",
+            "--allow-registry-transition",
+        ]
+    ) == 0
     assert calls == {
         "profile": "lumi",
         "allow_release_transition": True,
         "allow_config_transition": True,
+        "allow_registry_transition": True,
     }
 
 
