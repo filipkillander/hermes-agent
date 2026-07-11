@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 SURFACES = {"chrome_extension", "raycast_extension"}
+AGENTS = ("lumi", "igor", "spark")
 DEFAULT_SCOPES = ["status", "chat", "sessions", "capture"]
 
 
@@ -133,7 +134,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("issue")
-    create.add_argument("--agent", choices=("lumi", "igor"), required=True)
+    create.add_argument("--agent", choices=AGENTS, required=True)
     create.add_argument("--principal", required=True)
     create.add_argument("--device", required=True)
     create.add_argument("--surface", choices=sorted(SURFACES), required=True)
@@ -141,11 +142,11 @@ def main() -> int:
     create.add_argument("--copy", action="store_true")
     create.set_defaults(func=issue)
     remove = sub.add_parser("revoke")
-    remove.add_argument("--agent", choices=("lumi", "igor"), required=True)
+    remove.add_argument("--agent", choices=AGENTS, required=True)
     remove.add_argument("--key-id", required=True)
     remove.set_defaults(func=revoke)
     show = sub.add_parser("list")
-    show.add_argument("--agent", choices=("lumi", "igor"), required=True)
+    show.add_argument("--agent", choices=AGENTS, required=True)
     show.set_defaults(func=list_keys)
     args = parser.parse_args()
     args.func(args)
