@@ -201,7 +201,12 @@ def _email_identity(extra: Dict[str, Any] | None) -> Dict[str, Any]:
 
 def _from_header(address: str, identity: Dict[str, Any]) -> str:
     display_name = str(identity.get("display_name") or "").strip()
-    return formataddr((display_name, address)) if display_name else address
+    # Mailbox identity is user-visible policy, independent of the exact casing
+    # accepted by the SMTP login. Normalize the rendered address so a stale
+    # provider-side value such as ``Igor@...`` cannot drift the public From
+    # contract while authentication continues to use ``self._address``.
+    rendered_address = address.strip().lower()
+    return formataddr((display_name, rendered_address)) if display_name else rendered_address
 
 
 def _strip_existing_signature(body: str) -> str:
