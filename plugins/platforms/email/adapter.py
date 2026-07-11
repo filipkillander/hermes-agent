@@ -1464,6 +1464,18 @@ def _apply_yaml_config(_yaml_cfg: dict, email_cfg: dict) -> None:
         if value:
             os.environ["EMAIL_ALLOWED_DOMAINS"] = value
 
+    allowed_users = email_cfg.get(
+        "allowed_users",
+        extra.get("allowed_users", nested.get("allowed_users", nested_extra.get("allowed_users"))),
+    )
+    if allowed_users is not None and not os.getenv("EMAIL_ALLOWED_USERS"):
+        if isinstance(allowed_users, list):
+            value = ",".join(str(item).strip() for item in allowed_users if str(item).strip())
+        else:
+            value = str(allowed_users).strip()
+        if value:
+            os.environ["EMAIL_ALLOWED_USERS"] = value
+
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""

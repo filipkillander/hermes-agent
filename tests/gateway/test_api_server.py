@@ -526,6 +526,70 @@ class TestAuth:
         assert result is not None
         assert result.status == 401
 
+    def test_revocable_client_key_accepts_matching_agent_surface_and_scope(self, tmp_path, monkeypatch):
+        token = "client-secret-value"
+        registry = tmp_path / "client-keys.json"
+        registry.write_text(json.dumps({"schema_version": 1, "keys": [{
+            "key_id": "igor-filip-chrome-1",
+            "principal": "filip",
+            "agent": "igor",
+            "token_sha256": __import__("hashlib").sha256(token.encode()).hexdigest(),
+            "surfaces": ["chrome_extension"],
+            "scopes": ["status", "chat", "sessions", "capture"],
+            "revoked": False,
+        }]}))
+        monkeypatch.setenv("HERMES_PROFILE", "igor")
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+            "key": "master-key", "client_keys_file": str(registry),
+        }))
+
+        class Request(dict):
+            path = "/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-Hermes-Client-Surface": "chrome_extension",
+            }
+
+        request = Request()
+        assert adapter._check_auth(request) is None
+        assert request["hermes_client_identity"]["principal"] == "filip"
+
+    @pytest.mark.parametrize("profile,surface,path,revoked", [
+        ("lumi", "chrome_extension", "/v1/chat/completions", False),
+        ("igor", "raycast_extension", "/v1/chat/completions", False),
+        ("igor", "chrome_extension", "/api/admin", False),
+        ("igor", "chrome_extension", "/v1/chat/completions", True),
+    ])
+    def test_client_key_fails_closed_on_identity_scope_surface_or_revoke(
+        self, tmp_path, monkeypatch, profile, surface, path, revoked,
+    ):
+        token = "client-secret-value"
+        registry = tmp_path / "client-keys.json"
+        registry.write_text(json.dumps({"schema_version": 1, "keys": [{
+            "key_id": "igor-filip-chrome-1", "principal": "filip", "agent": "igor",
+            "token_sha256": __import__("hashlib").sha256(token.encode()).hexdigest(),
+            "surfaces": ["chrome_extension"], "scopes": ["status", "chat"],
+            "revoked": revoked,
+        }]}))
+        monkeypatch.setenv("HERMES_PROFILE", profile)
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+            "key": "master-key", "client_keys_file": str(registry),
+        }))
+
+        class Request(dict):
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-Hermes-Client-Surface": surface,
+            }
+            method = "POST"
+            path_qs = path
+            transport = None
+            remote = "127.0.0.1"
+
+        request = Request()
+        request.path = path
+        assert adapter._check_auth(request).status == 401
+
 
 # ---------------------------------------------------------------------------
 # Concurrency cap (gateway.api_server.max_concurrent_runs) — #7483
