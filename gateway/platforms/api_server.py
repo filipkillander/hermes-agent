@@ -1192,8 +1192,13 @@ class APIServerAdapter(BasePlatformAdapter):
             scopes = set(item.get("scopes", []))
             if required_scope not in scopes:
                 return None
-            expires_at = str(item.get("expires_at", "")).strip()
-            if expires_at:
+            raw_expires_at = item.get("expires_at")
+            if raw_expires_at not in (None, ""):
+                if not isinstance(raw_expires_at, str):
+                    return None
+                expires_at = raw_expires_at.strip()
+                if not expires_at:
+                    return None
                 try:
                     expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
                 except ValueError:
