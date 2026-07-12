@@ -2408,11 +2408,17 @@ async def get_status(profile: Optional[str] = None):
 
     try:
         current_ver, latest_ver = check_config_version()
+        status_home = get_hermes_home()
         # --- Gateway liveness detection ---
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = get_running_pid()
+        # Gateway runtime identity is process-scoped by design, so the status
+        # helper's implicit path follows the dashboard process rather than the
+        # requested profile context.  Pass the selected profile paths
+        # explicitly or a unified dashboard reports a healthy named gateway as
+        # stopped while its topology entry is simultaneously live.
+        gateway_pid = get_running_pid(status_home / "gateway.pid")
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
@@ -2444,7 +2450,7 @@ async def get_status(profile: Optional[str] = None):
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
-        local_runtime = read_runtime_status()
+        local_runtime = read_runtime_status(status_home / "gateway_state.json")
         runtime = local_runtime
         if runtime is None and remote_health_body and remote_health_body.get("gateway_state"):
             runtime = remote_health_body
@@ -2454,7 +2460,10 @@ async def get_status(profile: Optional[str] = None):
         # is display-only. (Running os.kill on a remote PID is both wrong and
         # trips the test live-system guard.)
         if not gateway_running and local_runtime is not None:
-            runtime_pid = get_runtime_status_running_pid(local_runtime)
+            runtime_pid = get_runtime_status_running_pid(
+                local_runtime,
+                expected_home=status_home,
+            )
             if runtime_pid is not None:
                 gateway_running = True
                 gateway_pid = runtime_pid

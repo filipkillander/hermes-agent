@@ -453,23 +453,31 @@ class TestProfileScopedGateway:
 
         seen_homes = []
 
-        def fake_get_running_pid():
+        seen_pid_paths = []
+        seen_runtime_paths = []
+
+        def fake_get_running_pid(pid_path):
             seen_homes.append(str(get_hermes_home()))
+            seen_pid_paths.append(pid_path)
             return None
+
+        def fake_read_runtime_status(runtime_path):
+            seen_runtime_paths.append(runtime_path)
+            return {"gateway_state": "startup_failed", "platforms": {}}
 
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
         monkeypatch.setattr(web_server, "get_running_pid", fake_get_running_pid)
-        monkeypatch.setattr(
-            web_server,
-            "read_runtime_status",
-            lambda: {"gateway_state": "startup_failed", "platforms": {}},
-        )
+        monkeypatch.setattr(web_server, "read_runtime_status", fake_read_runtime_status)
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
 
         resp = client.get("/api/status", params={"profile": "worker_beta"})
 
         assert resp.status_code == 200
         assert seen_homes[0] == str(isolated_profiles["worker_beta"])
+        assert seen_pid_paths == [isolated_profiles["worker_beta"] / "gateway.pid"]
+        assert seen_runtime_paths == [
+            isolated_profiles["worker_beta"] / "gateway_state.json"
+        ]
         assert resp.json()["hermes_home"] == str(isolated_profiles["worker_beta"])
 
     def test_status_uses_runtime_pid_when_profile_pid_file_is_missing(
@@ -493,10 +501,12 @@ class TestProfileScopedGateway:
             "updated_at": "2026-06-17T00:00:00+00:00",
         }
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
-        monkeypatch.setattr(web_server, "get_running_pid", lambda: None)
-        monkeypatch.setattr(web_server, "read_runtime_status", lambda: runtime)
+        monkeypatch.setattr(web_server, "get_running_pid", lambda _path: None)
+        monkeypatch.setattr(web_server, "read_runtime_status", lambda _path: runtime)
         monkeypatch.setattr(
-            web_server, "get_runtime_status_running_pid", lambda payload: 4242
+            web_server,
+            "get_runtime_status_running_pid",
+            lambda payload, *, expected_home: 4242,
         )
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
         from gateway.config import Platform
