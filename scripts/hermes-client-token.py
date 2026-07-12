@@ -104,7 +104,10 @@ def issue(args: argparse.Namespace) -> None:
         "scopes": scopes,
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "created_at": now.isoformat().replace("+00:00", "Z"),
-        "expires_at": (now + timedelta(days=args.days)).isoformat().replace("+00:00", "Z"),
+        "expires_at": (
+            (now + timedelta(days=args.days)).isoformat().replace("+00:00", "Z")
+            if args.days > 0 else None
+        ),
         "revoked": False,
     }
     data["keys"].append(entry)
@@ -146,7 +149,12 @@ def main() -> int:
     create.add_argument("--principal", required=True)
     create.add_argument("--device", required=True)
     create.add_argument("--surface", choices=sorted(SURFACES), required=True)
-    create.add_argument("--days", type=int, default=365)
+    create.add_argument(
+        "--days",
+        type=int,
+        default=0,
+        help="validity in days; 0 (default) creates a non-expiring key",
+    )
     create.add_argument("--copy", action="store_true")
     create.set_defaults(func=issue)
     remove = sub.add_parser("revoke")
@@ -157,6 +165,8 @@ def main() -> int:
     show.add_argument("--agent", choices=AGENTS, required=True)
     show.set_defaults(func=list_keys)
     args = parser.parse_args()
+    if args.command == "issue" and args.days < 0:
+        parser.error("--days must be 0 or greater")
     args.func(args)
     return 0
 

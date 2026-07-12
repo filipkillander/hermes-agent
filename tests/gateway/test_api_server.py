@@ -554,6 +554,37 @@ class TestAuth:
         assert adapter._check_auth(request) is None
         assert request["hermes_client_identity"]["principal"] == "filip"
 
+    @pytest.mark.parametrize("expires_at", [None, ""])
+    def test_revocable_client_key_accepts_explicit_non_expiring_marker(
+        self, tmp_path, monkeypatch, expires_at,
+    ):
+        """JSON null and an empty string both mean that the key does not expire."""
+        token = "non-expiring-client-secret"
+        registry = tmp_path / "client-keys.json"
+        registry.write_text(json.dumps({"schema_version": 1, "keys": [{
+            "key_id": "lumi-filip-raycast",
+            "principal": "filip",
+            "agent": "lumi",
+            "token_sha256": __import__("hashlib").sha256(token.encode()).hexdigest(),
+            "surfaces": ["raycast_extension"],
+            "scopes": ["status", "chat"],
+            "expires_at": expires_at,
+            "revoked": False,
+        }]}))
+        monkeypatch.setenv("HERMES_PROFILE", "lumi")
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+            "key": "master-key", "client_keys_file": str(registry),
+        }))
+
+        class Request(dict):
+            path = "/v1/models"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-Hermes-Client-Surface": "raycast_extension",
+            }
+
+        assert adapter._check_auth(Request()) is None
+
     def test_revocable_client_key_accepts_explicit_messaging_scope(self, tmp_path, monkeypatch):
         token = "spark-client-secret"
         registry = tmp_path / "client-keys.json"
