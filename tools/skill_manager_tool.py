@@ -138,16 +138,38 @@ def _protected_skill_slugs() -> set[str]:
     return {str(item).strip().lower() for item in raw if str(item).strip()}
 
 
+def _is_skillforge_managed(name: str) -> bool:
+    """Return whether an existing skill is owned by SkillForge fanout.
+
+    SkillForge writes a regular ``.skillforge-sync.json`` marker into every
+    managed installation. The marker is a durable ownership boundary: model
+    self-improvement must propose changes against the canonical forge source,
+    never patch the fanned-out runtime copy. Symlink markers are rejected so
+    an unrelated path cannot opt itself into owner protection indirectly.
+    """
+    try:
+        existing = _find_skill(str(name or "").strip())
+        if not existing:
+            return False
+        marker = existing["path"] / ".skillforge-sync.json"
+        return marker.is_file() and not marker.is_symlink()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _protected_skill_guard(action: str, name: str) -> Optional[Dict[str, Any]]:
     if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     slug = str(name or "").strip().lower()
-    if slug not in _protected_skill_slugs():
+    configured = slug in _protected_skill_slugs()
+    skillforge_managed = _is_skillforge_managed(slug)
+    if not configured and not skillforge_managed:
         return None
     return {
         "success": False,
         "proposal_required": True,
         "protected_skill": slug,
+        "protection_source": "config" if configured else "skillforge_marker",
         "error": (
             f"Skill '{slug}' is owner-protected. skill_manage cannot {action} it. "
             "Describe the proposed change and route it through the canonical "

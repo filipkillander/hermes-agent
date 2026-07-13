@@ -1349,6 +1349,33 @@ class TestProtectedSkills:
         )
         assert _protected_skill_guard("patch", "ordinary-skill") is None
 
+    @pytest.mark.parametrize(
+        "action,kwargs",
+        [
+            ("edit", {"content": VALID_SKILL_CONTENT}),
+            ("patch", {"old_string": "old", "new_string": "new"}),
+            ("delete", {}),
+            ("write_file", {"file_path": "references/x.md", "file_content": "x"}),
+            ("remove_file", {"file_path": "references/x.md"}),
+        ],
+    )
+    def test_skillforge_managed_install_is_proposal_only(self, tmp_path, monkeypatch, action, kwargs):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"skills": {"protected": []}},
+        )
+        with _skill_dir(tmp_path):
+            _create_skill("forge-managed", _skill_content("forge-managed"))
+            marker = tmp_path / "forge-managed" / ".skillforge-sync.json"
+            marker.write_text('{"schema_version":1}\n', encoding="utf-8")
+
+            result = json.loads(skill_manage(action=action, name="forge-managed", **kwargs))
+
+        assert result["success"] is False
+        assert result["proposal_required"] is True
+        assert result["protected_skill"] == "forge-managed"
+        assert result["protection_source"] == "skillforge_marker"
+
     def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
         from tools.skills_tool import skill_view
         from tools.skill_manager_tool import _reset_background_review_read_marks
