@@ -168,6 +168,33 @@ class TestHelperFunctions(unittest.TestCase):
                 "💾 Self-improvement review: Patched SKILL.md"
             )
 
+    def test_internal_planning_preamble_before_greeting_is_removed(self):
+        from plugins.platforms.email.adapter import _sanitize_outbound_body
+
+        body = _sanitize_outbound_body(
+            "Bra — jag har Google Calendar API tillgängligt via Filips Google "
+            "Workspace. Filip bad om en preview han kan godkänna innan inbjudan "
+            "skickas. Jag skapar ingen event, bara visar exakt vad jag skulle "
+            "skicka.\n\n"
+            "Hejsan Filip!\n\n"
+            "Här är preview av kalenderinbjudan."
+        )
+        self.assertEqual(
+            body,
+            "Hejsan Filip!\n\nHär är preview av kalenderinbjudan.",
+        )
+
+    def test_legitimate_intro_before_greeting_is_not_removed(self):
+        from plugins.platforms.email.adapter import _sanitize_outbound_body
+
+        body = _sanitize_outbound_body(
+            "Inför tisdagens möte\n\nHej Filip!\n\nHär kommer underlaget."
+        )
+        self.assertEqual(
+            body,
+            "Inför tisdagens möte\n\nHej Filip!\n\nHär kommer underlaget.",
+        )
+
     def test_rich_body_gets_canonical_signature_and_no_duplicate_model_signature(self):
         from plugins.platforms.email.adapter import _email_body_parts
 

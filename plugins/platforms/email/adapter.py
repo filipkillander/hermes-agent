@@ -113,6 +113,19 @@ _EMAIL_INTERNAL_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EMAIL_GREETING_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:hej|hejsan|hello|hi)\b",
+    re.IGNORECASE,
+)
+
+_EMAIL_PLANNING_PREAMBLE_SIGNALS = (
+    re.compile(r"\b(?:Filip|användaren)\s+(?:bad|har bett)\b", re.IGNORECASE),
+    re.compile(r"\b(?:jag|vi)\s+(?:skapar|skickar|gör)\s+(?:ingen|inte)\b", re.IGNORECASE),
+    re.compile(r"\bbara\s+(?:visar|förhandsvisar)\b", re.IGNORECASE),
+    re.compile(r"\b(?:via|genom)\s+(?:Filips\s+)?(?:Google|Composio|API|verktyg)", re.IGNORECASE),
+    re.compile(r"\b(?:intern(?:t|a)?|plan|reasoning|resonemang|tool)\b", re.IGNORECASE),
+)
+
 _SUBJECT_OVERRIDE_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?(?:\*\*)?"
     r"(?:subject|ämne|ämnesrad)"
@@ -143,6 +156,27 @@ def _sanitize_outbound_body(body: str) -> str:
     cryptic email.
     """
     kept = [line for line in (body or "").splitlines() if not _EMAIL_INTERNAL_LINE_RE.match(line)]
+
+    # Some models occasionally prepend a short implementation plan before the
+    # recipient-facing greeting.  Treat that as transport metadata only when a
+    # greeting follows near the start and at least two independent internal-plan
+    # signals are present.  The two-signal rule prevents ordinary introductory
+    # prose from being removed merely because it precedes "Hej".
+    first_content = next((index for index, line in enumerate(kept) if line.strip()), None)
+    greeting_index = next(
+        (
+            index
+            for index, line in enumerate(kept[:12])
+            if _EMAIL_GREETING_RE.match(line)
+        ),
+        None,
+    )
+    if first_content is not None and greeting_index is not None and greeting_index > first_content:
+        preamble = "\n".join(kept[first_content:greeting_index]).strip()
+        signal_count = sum(bool(pattern.search(preamble)) for pattern in _EMAIL_PLANNING_PREAMBLE_SIGNALS)
+        if len(preamble) <= 1_200 and signal_count >= 2:
+            kept = kept[greeting_index:]
+
     sanitized = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
     if not sanitized and (body or "").strip():
         raise ValueError("blocked internal-only email content")
