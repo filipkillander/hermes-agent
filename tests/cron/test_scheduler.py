@@ -2530,6 +2530,18 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
+    def test_localized_tyst_trailing_suppresses_delivery(self):
+        """A model-localized silence marker must never leak to recipients."""
+        response = "Allt är grönt.\n\n[TYST]"
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
     def test_silent_is_case_insensitive(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
@@ -2578,6 +2590,9 @@ class TestSilentDelivery:
         assert sil("NO_REPLY")
         assert sil("NO REPLY")
         assert sil("Summary.\nSILENT")
+        assert sil("[TYST]")
+        assert sil("Allt är grönt.\n\n[TYST]")
+        assert sil("TYST")
         # Deliver: real content, mid-sentence quotes, bare words, junk.
         assert not sil("Daily report: 4 PRs merged.")
         assert not sil("I stayed [SILENT] but here is the report: 3 items.")
@@ -2585,6 +2600,72 @@ class TestSilentDelivery:
         assert not sil("[SILENT")  # malformed open-bracket is not the sentinel
         assert not sil("")
         assert not sil("   \n\t ")
+
+
+class TestVisibleOutputContract:
+    def _make_job(self):
+        return {
+            "id": "monitor-job",
+            "name": "monitor",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    def _make_contract_job(self):
+        return {
+            "id": "nexus-daily",
+            "name": "nexus-daily-close",
+            "deliver": "discord:123",
+            "metadata": {"visible_output_contract": "nexus-daily-discord-v1"},
+        }
+
+    def test_valid_nexus_report_passes(self):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        report = (
+            "✅ **Nexus Daily Audit** (2026-07-12)\n"
+            "Done-listan är skriven och kontrollerad.\n"
+            "- Säkra länkar: 1 applicerad."
+        )
+        assert _cron_visible_output_contract_error(self._make_contract_job(), report) is None
+
+    def test_nexus_report_without_heading_is_rejected(self):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        error = _cron_visible_output_contract_error(
+            self._make_contract_job(),
+            "Allt är grönt:\n- Daglig anteckning skapad",
+        )
+        assert error == "obligatorisk Nexus-titel saknas eller har fel format"
+
+    def test_nexus_report_with_internal_terms_is_rejected(self):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        error = _cron_visible_output_contract_error(
+            self._make_contract_job(),
+            "✅ **Nexus Daily Audit** (2026-07-12)\n- ask_filip: 0",
+        )
+        assert error == "intern kontrolltext finns i mottagartexten"
+
+    def test_invalid_nexus_output_is_replaced_and_marks_run_failed(self):
+        job = self._make_contract_job()
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(True, "# output", "Allt är grönt utan rubrik.", None),
+             ), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        delivered = deliver_mock.call_args.args[1]
+        assert delivered.startswith("⚠️ **Nexus Daily Audit stoppades**")
+        assert "Allt är grönt utan rubrik" not in delivered
+        mark_mock.assert_called_once()
+        assert mark_mock.call_args.args[1] is False
+        assert "Visible output contract rejected" in mark_mock.call_args.args[2]
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""

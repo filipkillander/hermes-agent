@@ -260,15 +260,18 @@ SILENT_MARKER = "[SILENT]"
 # a marker is the entire response OR appears as its own first/last line — but
 # NOT when a token merely appears mid-sentence in a genuine report (e.g.
 # "I considered staying [SILENT] but here is the summary…" must deliver).
-_CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+_CRON_SILENCE_TOKENS = frozenset(
+    {"[SILENT]", "SILENT", "[TYST]", "TYST", "NO_REPLY", "NO REPLY"}
+)
 
 
 def _is_cron_silence_response(text: str) -> bool:
     """Return True when a cron final response should suppress delivery.
 
     Recognizes the bracketed ``[SILENT]`` sentinel (whole-response, first line,
-    or last line) plus the bracketless ``SILENT`` / ``NO_REPLY`` / ``NO REPLY``
-    variants the model emits when it drops the brackets (#51438, #46917).
+    or last line) plus the localized Swedish ``[TYST]`` alias and the
+    bracketless ``SILENT`` / ``TYST`` / ``NO_REPLY`` / ``NO REPLY`` variants
+    models emit when they translate or drop the brackets (#51438, #46917).
     Whitespace-trimmed and case-insensitive.  A token buried mid-sentence is
     treated as real content and delivered.
     """
@@ -293,9 +296,67 @@ def _is_cron_silence_response(text: str) -> bool:
     # pattern "[SILENT] No changes detected".  Restricted to the bracketed
     # form so a bare word like "Silent retry succeeded" is NOT swallowed.
     upper = stripped.upper()
-    if upper.startswith("[SILENT]"):
+    if upper.startswith(("[SILENT]", "[TYST]")):
         return True
     return False
+
+
+_NEXUS_DAILY_VISIBLE_HEADER_RE = re.compile(
+    r"^✅ \*\*Nexus Daily Audit\*\* \(\d{4}-\d{2}-\d{2}\)$"
+)
+_NEXUS_DAILY_FORBIDDEN_OUTPUT = (
+    "[SILENT]",
+    "[TYST]",
+    "ask_filip",
+    "auto_link",
+    "defer_batch",
+    "backlog_written",
+    "entity-sweep",
+)
+
+
+def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
+    """Validate an explicitly configured recipient-facing cron contract.
+
+    Skills remain the semantic source of truth, but a visible scheduled
+    delivery must not rely on model compliance alone.  Jobs opt in through
+    ``metadata.visible_output_contract`` so unrelated upstream cron behavior
+    remains unchanged.
+    """
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    contract = metadata.get("visible_output_contract")
+    if not contract:
+        return None
+    if contract != "nexus-daily-discord-v1":
+        return "okänt leveranskontrakt"
+    if _is_cron_silence_response(text):
+        return None
+
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines or not _NEXUS_DAILY_VISIBLE_HEADER_RE.fullmatch(lines[0]):
+        return "obligatorisk Nexus-titel saknas eller har fel format"
+
+    folded = text.casefold()
+    leaked = [token for token in _NEXUS_DAILY_FORBIDDEN_OUTPUT if token.casefold() in folded]
+    if leaked:
+        return "intern kontrolltext finns i mottagartexten"
+    return None
+
+
+def _summarize_cron_output_contract_failure(job: dict, reason: str) -> str:
+    """Return a deterministic, recipient-safe failure receipt."""
+    label = "Nexus Daily Audit" if (
+        isinstance(job.get("metadata"), dict)
+        and job["metadata"].get("visible_output_contract") == "nexus-daily-discord-v1"
+    ) else (job.get("name") or "Cronleverans")
+    return (
+        f"⚠️ **{label} stoppades**\n"
+        "Den råa modelltexten skickades inte eftersom formatkontrollen underkände leveransen.\n"
+        f"- Orsak: {reason}.\n"
+        "- Åtgärd: körningen och originalsvaret är sparade lokalt för felsökning."
+    )
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -3387,6 +3448,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
+
+            # Model-agnostic recipient-output gate for jobs that explicitly
+            # opt in.  Invalid raw model text is never sent as if it were a
+            # valid report; a deterministic failure receipt is sent instead
+            # and the run is marked failed for Cron Doctor/heartbeat.
+            if should_deliver and success:
+                contract_error = _cron_visible_output_contract_error(job, deliver_content)
+                if contract_error:
+                    logger.error(
+                        "Job '%s': visible output contract rejected delivery: %s",
+                        job["id"],
+                        contract_error,
+                    )
+                    success = False
+                    error = f"Visible output contract rejected delivery: {contract_error}"
+                    deliver_content = _summarize_cron_output_contract_failure(job, contract_error)
 
             if should_deliver:
                 try:
