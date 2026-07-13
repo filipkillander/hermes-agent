@@ -185,15 +185,53 @@ def test_platform_spacing_contract_collapses_gaps_and_separates_blocks(surface):
     rendered = prepare_delivery_content(source, surface=surface)
 
     heading = "## Nästa steg" if surface == "discord" else "**Nästa steg**"
-    assert rendered == (
-        "Svar först.\n\n"
-        f"{heading}\n\n"
-        "- Ett\n"
-        "- Två\n\n"
-        "> Viktigt\n\n"
-        "Avslut."
-    )
+    if surface == "discord":
+        assert rendered == (
+            "Svar först.\n\n"
+            f"{heading}\n"
+            "- Ett\n"
+            "- Två\n"
+            "> Viktigt\n\n"
+            "Avslut."
+        )
+    else:
+        assert rendered == (
+            "Svar först.\n\n"
+            f"{heading}\n\n"
+            "- Ett\n"
+            "- Två\n\n"
+            "> Viktigt\n\n"
+            "Avslut."
+        )
     assert "\n\n\n" not in rendered
+
+
+def test_discord_compacts_real_glm_outline_without_changing_content():
+    source = (
+        "Sparat i minnet.\n\n"
+        "## Nästa steg\n\n"
+        "**1. Jag installerar biblioteket på iMacen**\n"
+        "- Skapar en isolerad venv\n"
+        "- Installerar biblioteket\n\n"
+        "**2. Du autentiseras**\n"
+        "- Du knappar in själv\n"
+        "- Inget loggas\n\n"
+        "## Vad jag behöver av dig\n\n"
+        "Säg kör så börjar jag."
+    )
+
+    assert prepare_delivery_content(source, surface="discord") == (
+        "Sparat i minnet.\n\n"
+        "## Nästa steg\n"
+        "**1. Jag installerar biblioteket på iMacen**\n"
+        "- Skapar en isolerad venv\n"
+        "- Installerar biblioteket\n\n"
+        "**2. Du autentiseras**\n"
+        "- Du knappar in själv\n"
+        "- Inget loggas\n\n"
+        "## Vad jag behöver av dig\n"
+        "Säg kör så börjar jag."
+    )
 
 
 @pytest.mark.parametrize("surface", ["discord", "telegram"])

@@ -73,6 +73,7 @@ _HORIZONTAL_RULE_RE = re.compile(r"^\s{0,3}(?:\*\s*){3,}$|^\s{0,3}(?:-\s*){3,}$|
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-+*•]\s+|\d+[.)]\s+)")
 _BLOCKQUOTE_RE = re.compile(r"^\s{0,3}>\s?")
+_STRONG_SECTION_RE = re.compile(r"^\s*\*\*\S(?:.*\S)?\*\*\s*$")
 _KMROS_CASE_RE = re.compile(r"\bkmros\b", re.IGNORECASE)
 _EMPTY_RITUAL_RE = re.compile(
     r"^\s*(?:saknas|kvar|vad\s+saknas|missing|remaining)\s*"
@@ -137,6 +138,8 @@ def _split_fenced_blocks(content: str) -> Iterable[DocumentBlock]:
 def _line_kind(line: str) -> str:
     if _HEADING_RE.match(line):
         return "heading"
+    if _STRONG_SECTION_RE.match(line):
+        return "subheading"
     if _LIST_ITEM_RE.match(line):
         return "list"
     if _BLOCKQUOTE_RE.match(line):
@@ -164,7 +167,7 @@ def _render_heading_for_surface(line: str, *, surface: str) -> str:
     return f"**{title}**"
 
 
-def _normalize_chat_spacing(lines: list[str]) -> list[str]:
+def _normalize_chat_spacing(lines: list[str], *, surface: str) -> list[str]:
     """Apply one model-independent blank-line contract to chat blocks."""
     compact: list[str] = []
     for line in lines:
@@ -182,6 +185,36 @@ def _normalize_chat_spacing(lines: list[str]) -> list[str]:
     nonblank = [index for index, line in enumerate(compact) if line]
     if not nonblank:
         return []
+
+    if surface == "discord":
+        # Discord renders headings and strong-only section labels with their
+        # own visual weight.  Preserving a model-generated empty line after
+        # those labels doubles the perceived gap, while synthesizing gaps at
+        # every list/quote boundary makes GLM-style outlines look fragmented.
+        # Keep only authored semantic section gaps and make heading bodies and
+        # adjacent list/quote rows tight.  Fenced code is handled separately.
+        out: list[str] = []
+        for position, index in enumerate(nonblank):
+            line = compact[index]
+            kind = _line_kind(line)
+            if out:
+                previous_index = nonblank[position - 1]
+                previous = compact[previous_index]
+                previous_kind = _line_kind(previous)
+                between_had_blank = any(
+                    not value for value in compact[previous_index + 1:index]
+                )
+                tight = (
+                    previous_kind in {"heading", "subheading"}
+                    or (
+                        kind == previous_kind
+                        and kind in {"list", "blockquote"}
+                    )
+                )
+                if between_had_blank and not tight:
+                    out.append("")
+            out.append(line)
+        return out
 
     out: list[str] = []
     for position, index in enumerate(nonblank):
@@ -223,7 +256,7 @@ def _render_prose(prose: str, *, surface: str) -> str:
         normalized = _KMROS_CASE_RE.sub("kmrOS", line).rstrip()
         rendered.append(_render_heading_for_surface(normalized, surface=surface))
     if surface in {"discord", "telegram", "raycast_extension"}:
-        rendered = _normalize_chat_spacing(rendered)
+        rendered = _normalize_chat_spacing(rendered, surface=surface)
     text = "\n".join(rendered).strip("\n")
     if had_final_newline and text:
         return text + "\n"
