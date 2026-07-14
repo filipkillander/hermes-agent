@@ -1,6 +1,9 @@
-"""Regression tests for #54947 — cross-process guard must not invalidate the
-agent cache when the active ``session_id`` differs from the snapshot's
-``session_id``, even when both share the same ``session_key``.
+"""Regression tests for #54947 and ended-session cache coherence.
+
+The cross-process guard must preserve a cached agent when two *live*
+``session_id`` values share the same ``session_key``. It must evict that agent
+when its cached session has already ended, otherwise stale routing recovery
+can publish the dead identity back into the new session.
 
 Bug
 ---
@@ -13,7 +16,8 @@ sessions' ``message_count`` values as the same counter — invalidating the
 agent on EVERY session switch and busting the per-conversation prompt cache.
 
 These tests pin the production guard's reuse decision across:
-  L1 — session-id switch must REUSE (not invalidate) the cached agent.
+  L1 — live session-id switch must REUSE the cached agent.
+  L1b — ended cached session must INVALIDATE on a switch to a fresh session.
   L2 — cache tuple records the snapshot's session_id.
   L3 — re-baseline skips the cache entry when session_id differs.
   L4 — same-session_id turns still re-baseline correctly (no regression
@@ -44,20 +48,18 @@ def _make_runner():
 
 
 def _guard_would_reuse(runner, session_key, session_id):
-    """Mirror the production cache-hit guard's reuse decision exactly
-    AFTER the fix: reuse when the session_id matches the snapshot's
-    session_id, OR when the entry is a legacy 2-tuple / pending sentinel.
+    """Drive the production cache-invalidation classifier.
 
     Reuse iff any of:
       - cached session_id matches current session_id AND live count matches
         snapshot count (same-process turn OR no foreign write)
-      - cached session_id differs from current session_id (different
-        conversation, snapshot is from a different DB row → meaningless
-        to compare, REUSE without invalidation)
+      - cached session_id differs and the cached session is still live or
+        absent (different/unknown DB row → REUSE without invalidation)
       - entry is a 2-tuple (legacy opt-out of guard)
       - either side is None (unknown state → REUSE, fail-safe)
 
     Invalidate iff:
+      - cached session_id differs AND its DB row has ``end_reason`` set; OR
       - cached session_id == current session_id AND
         cached_mc is not None AND live_mc is not None AND
         live_mc != cached_mc (genuine cross-process write on the SAME
@@ -82,18 +84,13 @@ def _guard_would_reuse(runner, session_key, session_id):
     cached_sid = cached[3] if len(cached) > 3 else None
     cached_mc = cached[2]
 
-    # Snapshot belongs to a DIFFERENT session_id → comparison is
-    # meaningless; REUSE without invalidation.
-    if cached_sid is not None and session_id is not None and cached_sid != session_id:
-        return True
-
-    # Same session_id: standard cross-process guard.
-    invalidate = (
-        cached_mc is not None
-        and live is not None
-        and live != cached_mc
+    reason = runner._agent_cache_invalidation_reason(
+        cached_sid,
+        session_id,
+        cached_mc,
+        live,
     )
-    return not invalidate
+    return reason is None
 
 
 class TestSessionIdCacheCoherence:
@@ -133,6 +130,46 @@ class TestSessionIdCacheCoherence:
         # The original agent must still be in the cache.
         with runner._agent_cache_lock:
             assert runner._agent_cache["telegram:USER1"][0] is agent
+
+    def test_ended_cached_session_invalidates_after_stale_recovery(self, tmp_path):
+        """Incident regression: ended cache A + fresh session B must rebuild.
+
+        This is the combination the separate #54947 and routing-stale tests did
+        not cover: the routing layer correctly creates B after A ends, while
+        the in-process cache still contains an agent bound to A.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db.create_session("sA", source="discord")
+        db.create_session("sB", source="discord")
+        db.end_session("sA", "ws_orphan_reap")
+        runner = _make_runner()
+        runner._session_db = AsyncSessionDB(db)
+        agent = object()
+
+        with runner._agent_cache_lock:
+            runner._agent_cache["discord:THREAD1"] = (agent, "sig", 0, "sA")
+
+        assert _guard_would_reuse(runner, "discord:THREAD1", "sB") is False, (
+            "BUG: agent bound to an ended session was reused after stale "
+            "routing recovery, allowing the dead session id to split back"
+        )
+
+    def test_missing_cached_session_row_preserves_live_switch_reuse(self, tmp_path):
+        """Absent/legacy cache rows fail safe to reuse, preserving #54947."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db.create_session("sB", source="telegram")
+        runner = _make_runner()
+        runner._session_db = AsyncSessionDB(db)
+        agent = object()
+
+        with runner._agent_cache_lock:
+            runner._agent_cache["telegram:USER1"] = (agent, "sig", 0, "missingA")
+
+        assert _guard_would_reuse(runner, "telegram:USER1", "sB") is True
 
     @pytest.mark.asyncio
     async def test_same_session_id_turns_still_reuse(self, tmp_path):

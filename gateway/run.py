@@ -16058,6 +16058,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._evict_cached_agent(session_key)
         return drained
 
+    def _agent_cache_invalidation_reason(
+        self,
+        cached_session_id: Optional[str],
+        current_session_id: Optional[str],
+        cached_message_count: Optional[int],
+        current_message_count: Optional[int],
+    ) -> Optional[str]:
+        """Classify whether a cached agent must be rebuilt for this turn.
+
+        A live session-id switch under the same gateway ``session_key`` must
+        keep reusing the cached agent (#54947): message counts from different
+        rows are not comparable.  That exception must not apply when the cache
+        belongs to a session already ended in ``state.db``.  Reusing that agent
+        would publish its dead identity back into the freshly recovered lane
+        and make every following turn start with empty history.
+
+        Fail-safe behavior is deliberate: if the cached row is absent or the
+        DB lookup fails, preserve the existing cache-reuse behavior rather than
+        evicting every legitimate session switch.
+        """
+        session_id_mismatch = (
+            cached_session_id is not None
+            and current_session_id is not None
+            and cached_session_id != current_session_id
+        )
+        if session_id_mismatch:
+            try:
+                sync_db = getattr(self._session_db, "_db", None)
+                cached_row = (
+                    sync_db.get_session(cached_session_id) if sync_db is not None else None
+                )
+            except Exception:
+                cached_row = None
+            if cached_row and cached_row.get("end_reason") is not None:
+                return "ended_cached_session"
+            return None
+
+        if (
+            cached_message_count is not None
+            and current_message_count is not None
+            and current_message_count != cached_message_count
+        ):
+            return "cross_process_write"
+        return None
+
     async def _refresh_agent_cache_message_count(
         self, session_key: str, session_id: Optional[str]
     ) -> None:
@@ -18101,31 +18146,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # when the active session_id differs (#54947).
                         _cached_mc = cached[2] if len(cached) > 2 else None
                         _cached_sid = cached[3] if len(cached) > 3 else None
-                        # If the snapshot belongs to a different session_id
-                        # (same session_key, different conversation), the
-                        # message_count comparison is meaningless — the
-                        # counts track DIFFERENT DB rows.  REUSE the cached
-                        # agent rather than rebuild and bust the prompt cache
-                        # on every session switch (#54947).
-                        _session_id_mismatch = (
-                            _cached_sid is not None
-                            and session_id is not None
-                            and _cached_sid != session_id
+                        # Different live session ids deliberately reuse the
+                        # agent (#54947), but a cache entry whose own session
+                        # has ended must be discarded. Otherwise stale routing
+                        # recovery creates a fresh session and this old agent
+                        # immediately publishes the ended identity back into
+                        # the lane (same-lane amnesia after ws_orphan_reap).
+                        _invalidation_reason = self._agent_cache_invalidation_reason(
+                            _cached_sid,
+                            session_id,
+                            _cached_mc,
+                            _current_msg_count,
                         )
-                        if (
-                            not _session_id_mismatch
-                            and _cached_mc is not None
-                            and _current_msg_count is not None
-                            and _current_msg_count != _cached_mc
-                        ):
-                            # Cross-process write detected — discard stale
-                            # agent so it rebuilds from fresh DB transcript.
-                            logger.info(
-                                "Agent cache invalidated for session %s: "
-                                "message_count changed (%s -> %s), "
-                                "possible cross-process write",
-                                session_key, _cached_mc, _current_msg_count,
-                            )
+                        if _invalidation_reason is not None:
+                            if _invalidation_reason == "ended_cached_session":
+                                logger.warning(
+                                    "Agent cache invalidated for session %s: "
+                                    "cached session %s has ended before current "
+                                    "session %s; rebuilding after stale recovery",
+                                    session_key, _cached_sid, session_id,
+                                )
+                            else:
+                                # Cross-process write detected — discard stale
+                                # agent so it rebuilds from fresh DB transcript.
+                                logger.info(
+                                    "Agent cache invalidated for session %s: "
+                                    "message_count changed (%s -> %s), "
+                                    "possible cross-process write",
+                                    session_key, _cached_mc, _current_msg_count,
+                                )
                             evicted = self._agent_cache.pop(session_key, None)
                             _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
                             if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
