@@ -1469,6 +1469,49 @@ class AIAgent:
             return True
         return False
 
+    @classmethod
+    def _has_natural_email_signature_ending(cls, content: str) -> bool:
+        """Accept a complete mail body followed by a bounded signature block.
+
+        The Ollama/GLM stop guard normally requires terminal punctuation.  A
+        real mail often ends in a name, role, or URL instead because the model
+        authored a signature that the email adapter will replace mechanically.
+        Treat that as complete only when (a) the body immediately before a
+        short trailing block has a natural ending and (b) the trailing block
+        contains an explicit signoff or a labelled signature URL.  Arbitrary
+        unpunctuated prose therefore remains classified as truncated.
+        """
+        lines = [line.strip() for line in (content or "").splitlines()]
+        nonempty = [(index, line) for index, line in enumerate(lines) if line]
+        if len(nonempty) < 2:
+            return False
+
+        signoff_re = re.compile(
+            r"^(?:med vänlig(?:a)? hälsning(?:ar)?|mvh|best regards|kind regards|regards|sincerely)\s*,?$",
+            re.IGNORECASE,
+        )
+        labelled_url_re = re.compile(
+            r"^(?:portfolio|studio|webb|website|hemsida|kmr(?: studios)?)\s*:\s*"
+            r"(?:https?://)?[^\s]+\.[^\s]+(?:/[^\s]*)?$",
+            re.IGNORECASE,
+        )
+
+        # At most twelve non-empty lines are allowed to behave as a signature;
+        # anything larger is body content and must satisfy the normal guard.
+        for split in range(max(1, len(nonempty) - 12), len(nonempty)):
+            body_end_index = nonempty[split - 1][0]
+            body = "\n".join(lines[: body_end_index + 1]).rstrip()
+            signature_lines = [line for _, line in nonempty[split:]]
+            if not cls._has_natural_response_ending(body):
+                continue
+            if any(len(line) > 200 for line in signature_lines):
+                continue
+            if any(signoff_re.match(line) for line in signature_lines) or any(
+                labelled_url_re.match(line) for line in signature_lines
+            ):
+                return True
+        return False
+
     def _is_ollama_glm_backend(self) -> bool:
         """Detect Ollama-hosted GLM models affected by stop misreports.
 
@@ -1520,7 +1563,12 @@ class AIAgent:
         if len(visible_text) < 20 or not re.search(r"\s", visible_text):
             return False
 
-        return not self._has_natural_response_ending(visible_text)
+        if self._has_natural_response_ending(visible_text):
+            return False
+        if str(getattr(self, "platform", "") or "").lower() == "email":
+            if self._has_natural_email_signature_ending(visible_text):
+                return False
+        return True
 
     def _looks_like_codex_intermediate_ack(
         self,

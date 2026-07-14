@@ -168,6 +168,17 @@ class TestHelperFunctions(unittest.TestCase):
                 "💾 Self-improvement review: Patched SKILL.md"
             )
 
+    def test_raw_markdown_separator_is_removed_without_blocking_short_mail(self):
+        from plugins.platforms.email.adapter import _sanitize_outbound_body
+
+        body = _sanitize_outbound_body(
+            "Hej Filip!\n\n---\n\nKlart.\n\nDet här -- är vanlig text."
+        )
+        self.assertEqual(
+            body,
+            "Hej Filip!\n\nKlart.\n\nDet här -- är vanlig text.",
+        )
+
     def test_internal_planning_preamble_before_greeting_is_removed(self):
         from plugins.platforms.email.adapter import _sanitize_outbound_body
 
@@ -937,8 +948,10 @@ class TestThreadContext(unittest.TestCase):
         import asyncio
         adapter = self._make_adapter()
 
+        captured = []
+
         async def noop_handle(event):
-            pass
+            captured.append(event)
 
         adapter.handle_message = noop_handle
 
@@ -955,10 +968,161 @@ class TestThreadContext(unittest.TestCase):
         }
 
         asyncio.run(adapter._dispatch_message(msg_data))
-        ctx = adapter._thread_context.get("user@test.com")
+        self.assertEqual(len(captured), 1)
+        thread_id = captured[0].source.thread_id
+        self.assertTrue(thread_id.startswith("email-"))
+        self.assertEqual(captured[0].auto_skill, "email-formatting")
+        ctx = adapter._thread_context.get(
+            adapter._thread_context_key("user@test.com", thread_id)
+        )
         self.assertIsNotNone(ctx)
         self.assertEqual(ctx["subject"], "Project question")
         self.assertEqual(ctx["message_id"], "<original@test.com>")
+
+    def test_different_mail_threads_from_same_sender_use_different_model_sessions(self):
+        """Regression: sender-only email sessions mixed unrelated subjects."""
+        import asyncio
+        from gateway.session import build_session_key
+
+        adapter = self._make_adapter()
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        common = {
+            "uid": b"10",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "in_reply_to": "",
+            "references": "",
+            "body": "Hello",
+            "attachments": [],
+            "date": "",
+        }
+        asyncio.run(adapter._dispatch_message({
+            **common,
+            "subject": "Project Alpha",
+            "message_id": "<alpha@test.com>",
+        }))
+        asyncio.run(adapter._dispatch_message({
+            **common,
+            "uid": b"11",
+            "subject": "Project Beta",
+            "message_id": "<beta@test.com>",
+        }))
+
+        self.assertEqual(len(captured), 2)
+        self.assertNotEqual(captured[0].source.thread_id, captured[1].source.thread_id)
+        self.assertNotEqual(
+            build_session_key(captured[0].source),
+            build_session_key(captured[1].source),
+        )
+        alpha_key = adapter._thread_context_key(
+            "user@test.com", captured[0].source.thread_id
+        )
+        beta_key = adapter._thread_context_key(
+            "user@test.com", captured[1].source.thread_id
+        )
+        self.assertEqual(adapter._thread_context[alpha_key]["subject"], "Project Alpha")
+        self.assertEqual(adapter._thread_context[beta_key]["subject"], "Project Beta")
+
+    def test_references_keep_reply_in_original_model_session(self):
+        import asyncio
+        from gateway.session import build_session_key
+
+        adapter = self._make_adapter()
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        base = {
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "body": "Hello",
+            "attachments": [],
+            "date": "",
+        }
+        asyncio.run(adapter._dispatch_message({
+            **base,
+            "uid": b"20",
+            "subject": "Project Alpha",
+            "message_id": "<root@test.com>",
+            "in_reply_to": "",
+            "references": "",
+        }))
+        asyncio.run(adapter._dispatch_message({
+            **base,
+            "uid": b"21",
+            "subject": "Re: Project Alpha",
+            "message_id": "<reply@test.com>",
+            "in_reply_to": "<hermes-generated@test.com>",
+            "references": "<root@test.com> <hermes-generated@test.com>",
+        }))
+
+        self.assertEqual(captured[0].source.thread_id, captured[1].source.thread_id)
+        self.assertEqual(
+            build_session_key(captured[0].source),
+            build_session_key(captured[1].source),
+        )
+
+    def test_references_are_stable_across_adapter_restart(self):
+        """A restart must not change the root Message-ID thread fingerprint."""
+        first = self._make_adapter()
+        restarted = self._make_adapter()
+        initial = {
+            "sender_addr": "user@test.com",
+            "subject": "Project Alpha",
+            "message_id": "<root@test.com>",
+            "in_reply_to": "",
+            "references": "",
+            "body": "Initial",
+            "date": "",
+        }
+        reply = {
+            **initial,
+            "subject": "Re: Project Alpha",
+            "message_id": "<reply@test.com>",
+            "in_reply_to": "<hermes@test.com>",
+            "references": "<root@test.com> <hermes@test.com>",
+            "body": "Reply",
+        }
+        self.assertEqual(
+            first._resolve_thread_id(initial),
+            restarted._resolve_thread_id(reply),
+        )
+
+    def test_send_uses_thread_metadata_not_other_subject_from_same_sender(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        alpha = "email-alpha"
+        beta = "email-beta"
+        adapter._thread_context[adapter._thread_context_key("user@test.com", alpha)] = {
+            "subject": "Alpha",
+            "message_id": "<alpha@test.com>",
+        }
+        adapter._thread_context[adapter._thread_context_key("user@test.com", beta)] = {
+            "subject": "Beta",
+            "message_id": "<beta@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            server = MagicMock()
+            mock_smtp.return_value = server
+            result = asyncio.run(adapter.send(
+                "user@test.com",
+                "Alpha answer.",
+                metadata={"thread_id": alpha},
+            ))
+
+        self.assertTrue(result.success)
+        sent = server.send_message.call_args[0][0]
+        self.assertEqual(sent["Subject"], "Re: Alpha")
+        self.assertEqual(sent["In-Reply-To"], "<alpha@test.com>")
 
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
