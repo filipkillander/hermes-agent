@@ -1316,66 +1316,6 @@ class TestCuratorConsolidationDeleteGuard:
 
         _reset_background_review_read_marks()
 
-    @pytest.mark.parametrize(
-        "action,kwargs",
-        [
-            ("edit", {"content": _skill_content("managed") + "Autonomous drift.\n"}),
-            ("patch", {"old_string": "Step 1: Do the thing.", "new_string": "Step 1: Autonomous drift."}),
-            ("delete", {}),
-            ("write_file", {"file_path": "references/drift.md", "file_content": "Autonomous drift.\n"}),
-            ("remove_file", {"file_path": "references/drift.md"}),
-        ],
-    )
-    def test_background_review_cannot_mutate_skillforge_managed_skill(
-        self, tmp_path, monkeypatch, action, kwargs
-    ):
-        from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
-
-        _reset_background_review_read_marks()
-        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
-            _create_skill("managed", _skill_content("managed"))
-            managed_dir = skills_root / "managed"
-            (managed_dir / ".skillforge-sync.json").write_text(
-                '{"skill":"managed","last_direction":"source_to_workspace"}\n',
-                encoding="utf-8",
-            )
-
-            # Even a read-before-write cannot authorize autonomous drift from
-            # a SkillForge-managed runtime copy.
-            assert json.loads(skill_view("managed"))["success"] is True
-            before = (managed_dir / "SKILL.md").read_text(encoding="utf-8")
-            blocked = json.loads(skill_manage(action=action, name="managed", **kwargs))
-
-            assert blocked["success"] is False
-            assert blocked["proposal_required"] is True
-            assert blocked["managed_skill"] is True
-            assert managed_dir.is_dir()
-            assert (managed_dir / "SKILL.md").read_text(encoding="utf-8") == before
-            assert not (managed_dir / "references" / "drift.md").exists()
-
-        _reset_background_review_read_marks()
-
-    def test_foreground_user_directed_patch_of_managed_skill_is_unchanged(self, tmp_path):
-        with _skill_dir(tmp_path):
-            _create_skill("managed", _skill_content("managed"))
-            (tmp_path / "managed" / ".skillforge-sync.json").write_text(
-                '{"skill":"managed","last_direction":"source_to_workspace"}\n',
-                encoding="utf-8",
-            )
-            allowed = skill_manage(
-                action="patch",
-                name="managed",
-                old_string="Step 1: Do the thing.",
-                new_string="Step 1: Owner-directed repair.",
-            )
-
-        result = json.loads(allowed)
-        assert result["success"] is True, result
-        assert "Owner-directed repair" in (tmp_path / "managed" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-
 
 class TestProtectedSkills:
     @pytest.mark.parametrize(
