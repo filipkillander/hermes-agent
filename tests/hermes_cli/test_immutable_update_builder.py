@@ -222,8 +222,16 @@ def test_stage_build_emits_digest_not_raw_tool_output(
     npm.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = run ]; then\n"
-        "  mkdir -p hermes_cli/web_dist\n"
-        "  printf '<html>dashboard</html>\\n' > hermes_cli/web_dist/index.html\n"
+        "  case \"$*\" in\n"
+        "    *web*)\n"
+        "      mkdir -p hermes_cli/web_dist\n"
+        "      printf '<html>dashboard</html>\\n' > hermes_cli/web_dist/index.html\n"
+        "      ;;\n"
+        "    *ui-tui*)\n"
+        "      mkdir -p ui-tui/dist\n"
+        "      printf 'console.log(\\\"tui\\\")\\n' > ui-tui/dist/entry.js\n"
+        "      ;;\n"
+        "  esac\n"
         "fi\n"
         "exit 0\n",
         encoding="utf-8",
@@ -237,6 +245,10 @@ def test_stage_build_emits_digest_not_raw_tool_output(
     record = json.loads(rendered)
     assert record["state"] == "passed"
     assert len(record["dependency_output_sha256"]) == 64
+    assert len(record["tui_build_output_sha256"]) == 64
+    assert (staging / "hermes_cli/tui_dist/entry.js").read_text(encoding="utf-8") == (
+        'console.log("tui")\n'
+    )
 
 
 def test_stage_build_refuses_non_staging_worktree(tmp_path: Path) -> None:

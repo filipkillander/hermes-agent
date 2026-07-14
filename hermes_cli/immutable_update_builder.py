@@ -84,9 +84,13 @@ for path in root.glob("lib/python*/site-packages/*.pth"):
             candidate.resolve().relative_to(root)
 
 hermes_cli = importlib.import_module("hermes_cli")
-dashboard = pathlib.Path(hermes_cli.__file__).resolve().parent / "web_dist" / "index.html"
+hermes_cli_dir = pathlib.Path(hermes_cli.__file__).resolve().parent
+dashboard = hermes_cli_dir / "web_dist" / "index.html"
 if not dashboard.is_file() or dashboard.stat().st_size == 0:
     raise SystemExit(21)
+bundled_tui = hermes_cli_dir / "tui_dist" / "entry.js"
+if not bundled_tui.is_file() or bundled_tui.stat().st_size == 0:
+    raise SystemExit(22)
 """
 
 
@@ -516,6 +520,8 @@ def _stage_build(uv: Path, npm: Path, final_release: Path) -> int:
                 "ci",
                 "--workspace",
                 "web",
+                "--workspace",
+                "ui-tui",
                 "--include-workspace-root",
                 "--ignore-scripts",
             ],
@@ -558,6 +564,31 @@ def _stage_build(uv: Path, npm: Path, final_release: Path) -> int:
         dashboard_index = cwd / "hermes_cli" / "web_dist" / "index.html"
         if not dashboard_index.is_file() or dashboard_index.stat().st_size == 0:
             raise UpdateBuildError("dashboard_assets_missing", "stage_build")
+        tui_build = _run_digest(
+            [str(npm), "run", "build", "--workspace", "ui-tui"],
+            cwd=cwd,
+            home=home,
+            timeout=_BUILD_TIMEOUT,
+        )
+        if tui_build.returncode:
+            print(
+                json.dumps(
+                    {
+                        "state": "failed",
+                        "phase": "tui_build",
+                        "output_sha256": tui_build.output_sha256,
+                        "output_bytes": tui_build.output_bytes,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 1
+        tui_entry = cwd / "ui-tui" / "dist" / "entry.js"
+        if not tui_entry.is_file() or tui_entry.stat().st_size == 0:
+            raise UpdateBuildError("tui_assets_missing", "stage_build")
+        bundled_tui = cwd / "hermes_cli" / "tui_dist" / "entry.js"
+        bundled_tui.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(tui_entry, bundled_tui)
         for dependency_dir in (
             cwd / "node_modules",
             cwd / "web" / "node_modules",
@@ -608,6 +639,8 @@ def _stage_build(uv: Path, npm: Path, final_release: Path) -> int:
         "dashboard_install_output_bytes": npm_install.output_bytes,
         "dashboard_build_output_sha256": dashboard_build.output_sha256,
         "dashboard_build_output_bytes": dashboard_build.output_bytes,
+        "tui_build_output_sha256": tui_build.output_sha256,
+        "tui_build_output_bytes": tui_build.output_bytes,
         "import_output_sha256": probe.output_sha256,
         "import_output_bytes": probe.output_bytes,
         "relocated_script_count": relocated_scripts,
