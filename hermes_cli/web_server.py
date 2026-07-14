@@ -77,6 +77,7 @@ from hermes_cli.config import (
 from gateway.status import (
     derive_gateway_busy,
     derive_gateway_drainable,
+    evaluate_runtime_readiness,
     get_running_pid,
     get_runtime_status_running_pid,
     parse_active_agents,
@@ -1119,6 +1120,121 @@ except (ValueError, TypeError):
         os.getenv("GATEWAY_HEALTH_TIMEOUT"),
     )
     _GATEWAY_HEALTH_TIMEOUT = 3.0
+
+# A named-profile health probe is a fallback for the unified dashboard only.
+# Keep both the response body and diagnostic surface bounded: this endpoint is
+# polled frequently, and neither an accidental oversized body nor arbitrary
+# exception text should become a dashboard denial-of-service or information
+# leak.
+_PROFILE_GATEWAY_HEALTH_MAX_BYTES = 256 * 1024
+_GATEWAY_STATUS_ISSUE_LIMIT = 8
+
+
+def _bounded_gateway_status_issues(raw: Any) -> list[str]:
+    """Return a small, code-only gateway diagnostic list.
+
+    Callers pass internal reason codes, never exception strings.  The helper
+    normalizes those codes before they can reach the loopback-only status
+    payload so a failed probe remains actionable without leaking URLs, paths,
+    response bodies, or credentials.
+    """
+    issues: list[str] = []
+    for item in raw if isinstance(raw, (list, tuple, set)) else []:
+        code = re.sub(r"[^a-z0-9_:.-]+", "_", str(item).strip().lower())[:96]
+        if code and code not in issues:
+            issues.append(code)
+        if len(issues) >= _GATEWAY_STATUS_ISSUE_LIMIT:
+            break
+    return issues
+
+
+def _probe_registered_profile_health(
+    profile_name: str,
+    profile_home: Path,
+) -> tuple[bool, dict | None, list[str]]:
+    """Validate one named profile through its operator-owned health endpoint.
+
+    A bare HTTP 200 is deliberately insufficient.  The registry owns the
+    loopback URL and expected runtime identity, while
+    :func:`evaluate_runtime_readiness` verifies that the responder is the
+    requested external gateway.  Readiness problems such as a disconnected
+    required platform are reported as bounded diagnostics but do not rewrite
+    a live, identity-verified process to ``stopped``.
+
+    This is blocking and must run in an executor from async request handlers.
+    """
+    normalized_name = str(profile_name or "").strip().lower()
+    if not normalized_name or normalized_name == "current":
+        return False, None, ["profile_unspecified"]
+
+    try:
+        from hermes_cli.runtime_registry import load_runtime_registry
+
+        registry = load_runtime_registry(required=False)
+    except Exception:
+        _log.debug("runtime registry unavailable for dashboard health probe", exc_info=True)
+        return False, None, ["registry_unavailable"]
+
+    runtime_profile = registry.get(normalized_name)
+    if runtime_profile is None:
+        return False, None, ["profile_not_registered"]
+    try:
+        home_matches = runtime_profile.home.resolve() == Path(profile_home).resolve()
+    except (OSError, RuntimeError):
+        home_matches = False
+    if not home_matches:
+        return False, None, ["profile_home_mismatch"]
+    if runtime_profile.role != "external_gateway" or not runtime_profile.health_url:
+        return False, None, ["profile_not_external_gateway"]
+
+    try:
+        req = urllib.request.Request(runtime_profile.health_url, method="GET")
+        with urllib.request.urlopen(req, timeout=_GATEWAY_HEALTH_TIMEOUT) as resp:
+            if resp.status != 200:
+                return False, None, ["health_http_error"]
+            payload_bytes = resp.read(_PROFILE_GATEWAY_HEALTH_MAX_BYTES + 1)
+    except Exception:
+        _log.debug(
+            "registered profile health probe failed for %s",
+            normalized_name,
+            exc_info=True,
+        )
+        return False, None, ["health_unreachable"]
+
+    if len(payload_bytes) > _PROFILE_GATEWAY_HEALTH_MAX_BYTES:
+        return False, None, ["health_response_too_large"]
+    try:
+        payload = json.loads(payload_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, None, ["health_response_invalid"]
+    if not isinstance(payload, dict):
+        return False, None, ["health_response_invalid"]
+
+    _ready, readiness_failures = evaluate_runtime_readiness(
+        payload,
+        expected_profile=runtime_profile.name,
+        expected_service_label=runtime_profile.service_label,
+        expected_port=runtime_profile.port,
+        expected_registry_revision=registry.revision,
+    )
+    failures = _bounded_gateway_status_issues(readiness_failures)
+    # These failures mean the HTTP responder is not proven to be the selected
+    # live gateway.  Operational readiness failures (required platform down,
+    # secret source not ready, fingerprint drift) are important diagnostics,
+    # but the process itself is still running and must not be labelled stopped.
+    operational_issue_prefixes = (
+        "required_platform_disconnected:",
+        "unauthorized_platform_connected:",
+        "bot_fingerprint_mismatch:",
+    )
+    identity_verified = all(
+        code == "secret_sources_not_ready"
+        or code.startswith(operational_issue_prefixes)
+        for code in failures
+    )
+    if not identity_verified:
+        return False, payload, failures or ["runtime_identity_unverified"]
+    return True, payload, failures
 
 # DEPRECATED (scheduled for removal): GATEWAY_HEALTH_URL / GATEWAY_HEALTH_TIMEOUT.
 # Cross-container / cross-host gateway liveness detection will be folded into a
@@ -2420,7 +2536,10 @@ async def get_status(profile: Optional[str] = None):
         # stopped while its topology entry is simultaneously live.
         gateway_pid = get_running_pid(status_home / "gateway.pid")
         gateway_running = gateway_pid is not None
+        gateway_status_source = "pid_file" if gateway_running else "none"
+        gateway_status_issues: list[str] = []
         remote_health_body: dict | None = None
+        profile_health_body: dict | None = None
 
         if not gateway_running and _GATEWAY_HEALTH_URL:
             loop = asyncio.get_running_loop()
@@ -2429,6 +2548,7 @@ async def get_status(profile: Optional[str] = None):
             )
             if alive:
                 gateway_running = True
+                gateway_status_source = "configured_health"
                 # PID from the remote container (display only — not locally valid)
                 if remote_health_body:
                     gateway_pid = remote_health_body.get("pid")
@@ -2467,6 +2587,35 @@ async def get_status(profile: Optional[str] = None):
             if runtime_pid is not None:
                 gateway_running = True
                 gateway_pid = runtime_pid
+                gateway_status_source = "runtime_pid"
+
+        # A unified dashboard manages several independent profile gateways.
+        # If PID evidence is unavailable, use the operator-owned runtime
+        # registry to probe only the selected profile's loopback endpoint and
+        # verify the responder identity.  This closes the false ``stopped``
+        # state without treating an arbitrary HTTP 200 as gateway ownership.
+        if (
+            not gateway_running
+            and requested_profile
+            and requested_profile.lower() != "current"
+        ):
+            loop = asyncio.get_running_loop()
+            alive, profile_health_body, gateway_status_issues = await loop.run_in_executor(
+                None,
+                _probe_registered_profile_health,
+                requested_profile,
+                status_home,
+            )
+            gateway_status_issues = _bounded_gateway_status_issues(
+                gateway_status_issues
+            )
+            if alive:
+                gateway_running = True
+                gateway_status_source = "registry_health"
+                gateway_pid = profile_health_body.get("pid") if profile_health_body else None
+                # A selected-profile health response is fresher than a stale
+                # local runtime file and has already passed identity checks.
+                runtime = profile_health_body
 
         if runtime:
             gateway_state = runtime.get("gateway_state")
@@ -2627,6 +2776,8 @@ async def get_status(profile: Optional[str] = None):
                 "env_path": str(get_env_path()),
                 "gateway_pid": gateway_pid,
                 "gateway_health_url": _GATEWAY_HEALTH_URL,
+                "gateway_status_source": gateway_status_source,
+                "gateway_status_issues": gateway_status_issues,
                 "gateways": topology["gateways"],
             })
 

@@ -528,6 +528,56 @@ class TestProfileScopedGateway:
         assert data["gateway_state"] == "running"
         assert data["gateway_platforms"] == {"telegram": {"state": "connected"}}
 
+    def test_status_uses_identity_verified_registered_health_when_pid_evidence_fails(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        worker_home = isolated_profiles["worker_beta"]
+        stale_runtime = {
+            "pid": 1111,
+            "gateway_state": "stopped",
+            "platforms": {},
+        }
+        live_health = {
+            "pid": 4242,
+            "gateway_state": "running",
+            "platforms": {"api_server": {"state": "connected"}},
+            "active_agents": 0,
+        }
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(web_server, "get_running_pid", lambda _path: None)
+        monkeypatch.setattr(
+            web_server, "read_runtime_status", lambda _path: stale_runtime
+        )
+        monkeypatch.setattr(
+            web_server,
+            "get_runtime_status_running_pid",
+            lambda payload, *, expected_home: None,
+        )
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+        monkeypatch.setattr(
+            web_server,
+            "_probe_registered_profile_health",
+            lambda profile, home: (
+                profile == "worker_beta" and home == worker_home,
+                live_health,
+                ["required_platform_disconnected:discord"],
+            ),
+        )
+
+        resp = client.get("/api/status", params={"profile": "worker_beta"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["gateway_running"] is True
+        assert data["gateway_pid"] == 4242
+        assert data["gateway_state"] == "running"
+        assert data["gateway_status_source"] == "registry_health"
+        assert data["gateway_status_issues"] == [
+            "required_platform_disconnected:discord"
+        ]
+
 
 class TestProfileScopedTelegramOnboarding:
     def test_apply_writes_target_profile_and_restarts_target(

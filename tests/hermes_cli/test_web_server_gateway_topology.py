@@ -5,13 +5,150 @@ added to ``/api/status``: profile enumeration, single vs multiplex vs multiple
 gateway detection, and per-platform port resolution.
 """
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from hermes_cli import web_server
 from hermes_cli.web_server import (
+    _bounded_gateway_status_issues,
     _collect_profile_gateway_topology,
+    _probe_registered_profile_health,
     _profile_platform_ports,
 )
+
+
+class _HealthResponse:
+    def __init__(self, payload: bytes, *, status: int = 200):
+        self._payload = payload
+        self.status = status
+
+    def read(self, limit: int = -1) -> bytes:
+        return self._payload if limit < 0 else self._payload[:limit]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def _runtime_health_payload(*, profile: str = "lumi", required=(), platforms=None):
+    return {
+        "status": "ok",
+        "gateway_state": "running",
+        "pid": 4242,
+        "platforms": platforms or {},
+        "runtime_identity": {
+            "profile": profile,
+            "role": "external_gateway",
+            "service_label": "ai.hermes.gateway-lumi",
+            "port": 8642,
+            "registry_revision": "registry-revision",
+            "registry_verified": True,
+            "secret_readiness": {"ready": True},
+            "required_platforms": list(required),
+            "allowed_platforms": list(required),
+            "bot_fingerprints": {},
+        },
+    }
+
+
+class TestRegisteredProfileHealthProbe:
+    def _patch_registry(self, monkeypatch, home, *, required=()):
+        import hermes_cli.runtime_registry as registry_mod
+
+        profile = SimpleNamespace(
+            name="lumi",
+            home=home,
+            role="external_gateway",
+            health_url="http://127.0.0.1:8642/health/detailed",
+            service_label="ai.hermes.gateway-lumi",
+            port=8642,
+            required_platforms=tuple(required),
+        )
+        registry = SimpleNamespace(
+            revision="registry-revision",
+            get=lambda name: profile if name == "lumi" else None,
+        )
+        monkeypatch.setattr(
+            registry_mod, "load_runtime_registry", lambda required=False: registry
+        )
+
+    def test_verified_profile_health_is_live(self, tmp_path, monkeypatch):
+        self._patch_registry(monkeypatch, tmp_path)
+        payload = json.dumps(_runtime_health_payload()).encode()
+        monkeypatch.setattr(
+            web_server.urllib.request,
+            "urlopen",
+            lambda request, timeout: _HealthResponse(payload),
+        )
+
+        alive, body, issues = _probe_registered_profile_health("lumi", tmp_path)
+
+        assert alive is True
+        assert body["pid"] == 4242
+        assert issues == []
+
+    def test_readiness_failure_is_reported_without_calling_process_stopped(
+        self, tmp_path, monkeypatch
+    ):
+        self._patch_registry(monkeypatch, tmp_path, required=("discord",))
+        payload = json.dumps(
+            _runtime_health_payload(
+                required=("discord",),
+                platforms={"discord": {"state": "disconnected"}},
+            )
+        ).encode()
+        monkeypatch.setattr(
+            web_server.urllib.request,
+            "urlopen",
+            lambda request, timeout: _HealthResponse(payload),
+        )
+
+        alive, _body, issues = _probe_registered_profile_health("lumi", tmp_path)
+
+        assert alive is True
+        assert issues == ["required_platform_disconnected:discord"]
+
+    def test_wrong_profile_identity_is_rejected(self, tmp_path, monkeypatch):
+        self._patch_registry(monkeypatch, tmp_path)
+        payload = json.dumps(_runtime_health_payload(profile="igor")).encode()
+        monkeypatch.setattr(
+            web_server.urllib.request,
+            "urlopen",
+            lambda request, timeout: _HealthResponse(payload),
+        )
+
+        alive, _body, issues = _probe_registered_profile_health("lumi", tmp_path)
+
+        assert alive is False
+        assert "profile_mismatch" in issues
+
+    def test_oversized_health_response_is_rejected(self, tmp_path, monkeypatch):
+        self._patch_registry(monkeypatch, tmp_path)
+        payload = b"{" + b"x" * (web_server._PROFILE_GATEWAY_HEALTH_MAX_BYTES + 1)
+        monkeypatch.setattr(
+            web_server.urllib.request,
+            "urlopen",
+            lambda request, timeout: _HealthResponse(payload),
+        )
+
+        alive, body, issues = _probe_registered_profile_health("lumi", tmp_path)
+
+        assert alive is False
+        assert body is None
+        assert issues == ["health_response_too_large"]
+
+    def test_diagnostics_are_bounded_and_code_only(self):
+        issues = _bounded_gateway_status_issues(
+            [" profile mismatch ", "path /Users/name/secret", *[f"issue-{i}" for i in range(20)]]
+        )
+
+        assert len(issues) == web_server._GATEWAY_STATUS_ISSUE_LIMIT
+        assert issues[0] == "profile_mismatch"
+        assert issues[1] == "path_users_name_secret"
 
 
 # ---------------------------------------------------------------------------

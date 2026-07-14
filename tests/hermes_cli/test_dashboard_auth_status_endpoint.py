@@ -100,7 +100,7 @@ def test_status_preserves_existing_fields(loopback_client):
 # leak that detail to anonymous callers.
 _HOST_DETAIL_FIELDS = frozenset({
     "hermes_home", "config_path", "env_path", "gateway_pid",
-    "gateway_health_url",
+    "gateway_health_url", "gateway_status_source", "gateway_status_issues",
 })
 
 
