@@ -351,6 +351,32 @@ def _background_review_write_guard(
     except Exception:
         return None
 
+    # SkillForge-managed runtime copies carry this marker at the skill root.
+    # The background review is an autonomous maintenance actor and must never
+    # turn a canonical source -> runtime installation into runtime -> source
+    # drift. Foreground, user-directed edits remain available so an operator
+    # can still repair a managed copy deliberately; SkillForge reconciliation
+    # and owner approval remain the durable promotion path.
+    skillforge_marker = skill_dir / ".skillforge-sync.json"
+    try:
+        is_skillforge_managed = skillforge_marker.is_file() or skillforge_marker.is_symlink()
+    except OSError:
+        # Fail closed when marker metadata cannot be inspected. A broken or
+        # unreadable marker is not permission for autonomous mutation.
+        is_skillforge_managed = True
+    if is_skillforge_managed:
+        return {
+            "success": False,
+            "proposal_required": True,
+            "managed_skill": True,
+            "protected_skill": name,
+            "error": (
+                f"Refusing background curator {action} for SkillForge-managed "
+                f"skill '{name}'. Route the proposal through canonical "
+                "SkillForge source and explicit owner approval."
+            ),
+        }
+
     # Pin must be respected by autonomous maintenance. The curator already
     # skips pinned skills from every auto-transition; the background review
     # fork is the same kind of autonomous, no-user-present actor, so it must
