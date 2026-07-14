@@ -2619,6 +2619,14 @@ class TestVisibleOutputContract:
             "metadata": {"visible_output_contract": "nexus-daily-discord-v1"},
         }
 
+    def _make_named_contract_job(self, name, contract):
+        return {
+            "id": name,
+            "name": name,
+            "deliver": "discord:123",
+            "metadata": {"visible_output_contract": contract},
+        }
+
     def test_valid_nexus_report_passes(self):
         from cron.scheduler import _cron_visible_output_contract_error
 
@@ -2628,6 +2636,83 @@ class TestVisibleOutputContract:
             "- Säkra länkar: 1 applicerad."
         )
         assert _cron_visible_output_contract_error(self._make_contract_job(), report) is None
+
+    @pytest.mark.parametrize(
+        ("name", "contract", "report"),
+        [
+            (
+                "nexus-weekly-compile",
+                "nexus-weekly-discord-v1",
+                "✅ **Nexus Weekly** (Vecka 28) — stängd\n"
+                "Resultat: veckonoten och nästa mall är uppdaterade.\n"
+                "Kontroll: innehåll, länkar och struktur är godkända.",
+            ),
+            (
+                "nexus-monthly-compile",
+                "nexus-monthly-discord-v1",
+                "✅ **Nexus Monthly** (Juni 2026) — stängd\n"
+                "Resultat: månadssummeringen och nästa mall är uppdaterade.\n"
+                "Kontroll: innehåll, länkar och struktur är godkända.",
+            ),
+            (
+                "nexus-yearly-close",
+                "nexus-yearly-discord-v1",
+                "✅ **Nexus Yearly** (År 2026) — stängd\n"
+                "Resultat: årsavslutet och nästa års struktur är uppdaterade.\n"
+                "Kontroll: innehåll, länkar och struktur är godkända.",
+            ),
+        ],
+    )
+    def test_all_nexus_period_contracts_accept_compact_titled_receipts(
+        self, name, contract, report
+    ):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        job = self._make_named_contract_job(name, contract)
+        assert _cron_visible_output_contract_error(job, report) is None
+
+    @pytest.mark.parametrize(
+        ("contract", "report"),
+        [
+            (
+                "nexus-weekly-discord-v1",
+                "✅ **Nexus Weekly** (Vecka 28) — behöver beslut\n"
+                "Behöver dig: välj om den blockerade länken ska tas bort.",
+            ),
+            (
+                "nexus-monthly-discord-v1",
+                "✅ **Nexus Monthly** (Juni 2026) — behöver beslut\n"
+                "Behöver dig: välj ägare för den blockerade posten.",
+            ),
+            (
+                "nexus-yearly-discord-v1",
+                "✅ **Nexus Yearly** (År 2026) — behöver beslut\n"
+                "Behöver dig: välj om den öppna punkten ska följa med till 2027.",
+            ),
+        ],
+    )
+    def test_period_contracts_accept_decision_receipts(self, contract, report):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        job = self._make_named_contract_job("nexus", contract)
+        assert _cron_visible_output_contract_error(job, report) is None
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            "nexus-daily-discord-v1",
+            "nexus-weekly-discord-v1",
+            "nexus-monthly-discord-v1",
+            "nexus-yearly-discord-v1",
+        ],
+    )
+    def test_all_nexus_period_contracts_reject_localized_silence(self, contract):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        job = self._make_named_contract_job("nexus", contract)
+        assert _cron_visible_output_contract_error(job, "[tyst]") == (
+            "tyst markör är inte en giltig Nexus-leverans"
+        )
 
     def test_nexus_report_without_heading_is_rejected(self):
         from cron.scheduler import _cron_visible_output_contract_error
@@ -2646,6 +2731,46 @@ class TestVisibleOutputContract:
             "✅ **Nexus Daily Audit** (2026-07-12)\n- ask_filip: 0",
         )
         assert error == "intern kontrolltext finns i mottagartexten"
+
+    @pytest.mark.parametrize(
+        "leaked_text",
+        [
+            "Allt verifierat. Sammanställer kvittot.",
+            "**Verifieringssammanfattning:**",
+            "Detta är gjort",
+            "- Vad saknas: Inget",
+            "- tool result: ok",
+            "- nexus audit --scope current",
+            "- git diff --check",
+            "- Session ID: 20260709_160230_694cd73f",
+            "- scratch: klart",
+        ],
+    )
+    def test_nexus_report_rejects_scratch_and_ritual_output(self, leaked_text):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        report = "✅ **Nexus Daily Audit** (2026-07-12)\n" + leaked_text
+        assert _cron_visible_output_contract_error(self._make_contract_job(), report) == (
+            "intern kontrolltext finns i mottagartexten"
+        )
+
+    def test_nexus_report_rejects_file_headings_and_oversize_output(self):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        heading_report = (
+            "✅ **Nexus Daily Audit** (2026-07-12)\n"
+            "## Detaljer\n- En rad"
+        )
+        assert _cron_visible_output_contract_error(
+            self._make_contract_job(), heading_report
+        ) == "filrubriker får inte förekomma i Discord-kvittot"
+
+        oversize_report = (
+            "✅ **Nexus Daily Audit** (2026-07-12)\n" + "x" * 901
+        )
+        assert _cron_visible_output_contract_error(
+            self._make_contract_job(), oversize_report
+        ) == "Nexus-kvittot överskrider 900 tecken"
 
     def test_invalid_nexus_output_is_replaced_and_marks_run_failed(self):
         job = self._make_contract_job()
@@ -2666,6 +2791,23 @@ class TestVisibleOutputContract:
         mark_mock.assert_called_once()
         assert mark_mock.call_args.args[1] is False
         assert "Visible output contract rejected" in mark_mock.call_args.args[2]
+
+    def test_nexus_localized_silence_is_replaced_not_suppressed(self):
+        job = self._make_named_contract_job(
+            "nexus-weekly-compile", "nexus-weekly-discord-v1"
+        )
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[tyst]", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        delivered = deliver_mock.call_args.args[1]
+        assert delivered.startswith("⚠️ **Nexus Weekly stoppades**")
+        assert "[tyst]" not in delivered.casefold()
+        assert mark_mock.call_args.args[1] is False
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""

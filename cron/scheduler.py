@@ -301,10 +301,36 @@ def _is_cron_silence_response(text: str) -> bool:
     return False
 
 
-_NEXUS_DAILY_VISIBLE_HEADER_RE = re.compile(
-    r"^✅ \*\*Nexus Daily Audit\*\* \(\d{4}-\d{2}-\d{2}\)$"
-)
-_NEXUS_DAILY_FORBIDDEN_OUTPUT = (
+_NEXUS_VISIBLE_OUTPUT_CONTRACTS = {
+    "nexus-daily-discord-v1": (
+        "Nexus Daily Audit",
+        re.compile(r"^✅ \*\*Nexus Daily Audit\*\* \(\d{4}-\d{2}-\d{2}\)$"),
+    ),
+    "nexus-weekly-discord-v1": (
+        "Nexus Weekly",
+        re.compile(
+            r"^✅ \*\*Nexus Weekly\*\* \(Vecka \d{1,2}\) "
+            r"— (?:stängd|behöver beslut)$"
+        ),
+    ),
+    "nexus-monthly-discord-v1": (
+        "Nexus Monthly",
+        re.compile(
+            r"^✅ \*\*Nexus Monthly\*\* "
+            r"\((?:Januari|Februari|Mars|April|Maj|Juni|Juli|Augusti|"
+            r"September|Oktober|November|December) \d{4}\) "
+            r"— (?:stängd|behöver beslut)$"
+        ),
+    ),
+    "nexus-yearly-discord-v1": (
+        "Nexus Yearly",
+        re.compile(
+            r"^✅ \*\*Nexus Yearly\*\* \(År \d{4}\) "
+            r"— (?:stängd|behöver beslut)$"
+        ),
+    ),
+}
+_NEXUS_FORBIDDEN_VISIBLE_OUTPUT = (
     "[SILENT]",
     "[TYST]",
     "ask_filip",
@@ -312,6 +338,26 @@ _NEXUS_DAILY_FORBIDDEN_OUTPUT = (
     "defer_batch",
     "backlog_written",
     "entity-sweep",
+    "hygiene-check",
+    "safe-tidy",
+    "Verifieringssammanfattning",
+    "Sammanställer kvittot",
+    "Allt verifierat",
+    "Detta är gjort",
+    "Detta är godkänt",
+    "Detta behöver kompletteras",
+    "Vad saknas",
+    "Saknas: Inget",
+    "Kvar: Inget",
+    "Inget från Filip",
+    "tool call",
+    "tool result",
+    "nexus audit",
+    "git diff",
+    "traceback",
+    "session id",
+    "api call",
+    "scratch",
 )
 
 
@@ -329,17 +375,24 @@ def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
     contract = metadata.get("visible_output_contract")
     if not contract:
         return None
-    if contract != "nexus-daily-discord-v1":
+    nexus_contract = _NEXUS_VISIBLE_OUTPUT_CONTRACTS.get(contract)
+    if nexus_contract is None:
         return "okänt leveranskontrakt"
     if _is_cron_silence_response(text):
-        return None
+        return "tyst markör är inte en giltig Nexus-leverans"
 
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    if not lines or not _NEXUS_DAILY_VISIBLE_HEADER_RE.fullmatch(lines[0]):
+    _label, header_re = nexus_contract
+    if not lines or not header_re.fullmatch(lines[0]):
         return "obligatorisk Nexus-titel saknas eller har fel format"
 
+    if len(text) > 900:
+        return "Nexus-kvittot överskrider 900 tecken"
+    if any(line.startswith(("# ", "## ", "### ")) for line in lines):
+        return "filrubriker får inte förekomma i Discord-kvittot"
+
     folded = text.casefold()
-    leaked = [token for token in _NEXUS_DAILY_FORBIDDEN_OUTPUT if token.casefold() in folded]
+    leaked = [token for token in _NEXUS_FORBIDDEN_VISIBLE_OUTPUT if token.casefold() in folded]
     if leaked:
         return "intern kontrolltext finns i mottagartexten"
     return None
@@ -347,10 +400,10 @@ def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
 
 def _summarize_cron_output_contract_failure(job: dict, reason: str) -> str:
     """Return a deterministic, recipient-safe failure receipt."""
-    label = "Nexus Daily Audit" if (
-        isinstance(job.get("metadata"), dict)
-        and job["metadata"].get("visible_output_contract") == "nexus-daily-discord-v1"
-    ) else (job.get("name") or "Cronleverans")
+    metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    contract = metadata.get("visible_output_contract")
+    contract_spec = _NEXUS_VISIBLE_OUTPUT_CONTRACTS.get(contract)
+    label = contract_spec[0] if contract_spec else (job.get("name") or "Cronleverans")
     return (
         f"⚠️ **{label} stoppades**\n"
         "Den råa modelltexten skickades inte eftersom formatkontrollen underkände leveransen.\n"
@@ -3439,20 +3492,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            # Cron silence suppression — see _is_cron_silence_response.  Replaces the
-            # old `SILENT_MARKER in ...upper()` substring check, which both leaked
-            # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
-            # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
-                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                should_deliver = False
-
             # Model-agnostic recipient-output gate for jobs that explicitly
             # opt in.  Invalid raw model text is never sent as if it were a
             # valid report; a deterministic failure receipt is sent instead
-            # and the run is marked failed for Cron Doctor/heartbeat.
+            # and the run is marked failed for Cron Doctor/heartbeat.  Run
+            # this before generic silence suppression: an opted-in Nexus job
+            # promises a visible titled receipt, so a translated ``[TYST]``
+            # must fail closed rather than silently erase the delivery.
             if should_deliver and success:
                 contract_error = _cron_visible_output_contract_error(job, deliver_content)
                 if contract_error:
@@ -3464,6 +3510,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     success = False
                     error = f"Visible output contract rejected delivery: {contract_error}"
                     deliver_content = _summarize_cron_output_contract_failure(job, contract_error)
+
+            # Cron silence suppression — see _is_cron_silence_response.  Replaces the
+            # old `SILENT_MARKER in ...upper()` substring check, which both leaked
+            # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
+            # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
+            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
+            # tolerance the cron contract relies on.  Recipient contracts run
+            # first above and may reject silence when a visible receipt is required.
+            if should_deliver and success and _is_cron_silence_response(deliver_content):
+                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                should_deliver = False
 
             if should_deliver:
                 try:
