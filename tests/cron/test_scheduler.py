@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _format_human_report_delivery
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -622,6 +622,151 @@ class TestDeliverResultWrapping:
             (root,),
         )
         return media_file.resolve()
+
+    def test_human_report_contract_adds_system_owned_envelope(self):
+        job = {
+            "id": "1d260f37c97d",
+            "metadata": {
+                "delivery_contract": "human-report-v1",
+                "delivery_title": "Nexus Daily Audit",
+            },
+        }
+        with patch("cron.scheduler._hermes_now") as now:
+            now.return_value.strftime.return_value = "260715, 08:05"
+            result = _format_human_report_delivery(
+                job,
+                "**Läget:** Anteckningen är uppdaterad.\n\n- 🟢 **Kontroll:** Grön.",
+            )
+
+        assert result == (
+            "# Nexus Daily Audit\n"
+            "**Job ID**: 1d260f37c97d\n"
+            "**Datum**: 260715, 08:05\n\n"
+            "**Läget:** Anteckningen är uppdaterad.\n\n"
+            "- 🟢 **Kontroll:** Grön."
+        )
+
+    def test_human_report_contract_replaces_legacy_script_envelope(self):
+        job = {
+            "id": "8c81b73a7dab",
+            "metadata": {
+                "delivery_contract": "human-report-v1",
+                "delivery_title": "Heartbeat",
+            },
+        }
+        legacy = (
+            "# Heartbeat\n"
+            "**Job ID**: 8c81b73a7dab\n"
+            "**Datum**: 260714, 09:00\n\n"
+            "**Läget:** Allt är grönt."
+        )
+        with patch("cron.scheduler._hermes_now") as now:
+            now.return_value.strftime.return_value = "260715, 09:00"
+            result = _format_human_report_delivery(job, legacy)
+
+        assert result.count("# Heartbeat") == 1
+        assert "260714" not in result
+        assert "**Datum**: 260715, 09:00" in result
+        assert result.endswith("**Läget:** Allt är grönt.")
+
+    def test_human_report_contract_removes_validated_nexus_body_title(self):
+        job = {
+            "id": "1d260f37c97d",
+            "metadata": {
+                "delivery_contract": "human-report-v1",
+                "delivery_title": "Nexus Daily Audit",
+                "visible_output_contract": "nexus-daily-discord-v1",
+            },
+        }
+        body = (
+            "✅ **Nexus Daily Audit** (2026-07-14)\n"
+            "Resultat: gårdagens anteckning är uppdaterad.\n"
+            "Kontroll: innehåll, länkar och struktur är godkända."
+        )
+        with patch("cron.scheduler._hermes_now") as now:
+            now.return_value.strftime.return_value = "260715, 08:05"
+            result = _format_human_report_delivery(job, body)
+
+        assert result.startswith("# Nexus Daily Audit\n**Job ID**: 1d260f37c97d")
+        assert "✅ **Nexus Daily Audit**" not in result
+        assert result.endswith("Kontroll: innehåll, länkar och struktur är godkända.")
+
+    def test_unknown_human_report_contract_fails_closed_before_send(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        send_mock = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "bad-contract",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+            "metadata": {
+                "delivery_contract": "unknown-v9",
+                "delivery_title": "Rapport",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(job, "**Läget:** Test")
+
+        assert "unsupported delivery contract" in result
+        send_mock.assert_not_awaited()
+
+    def test_required_human_contract_heals_legacy_job_before_send(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+        send_mock = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "legacy-report",
+            "name": "morning-update-summary",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "123"},
+        }
+
+        with patch("cron.scheduler._hermes_now") as now, \
+             patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch(
+                 "cron.scheduler.load_config",
+                 return_value={
+                     "cron": {
+                         "wrap_response": False,
+                         "require_human_delivery_contract": True,
+                     }
+                 },
+             ):
+            now.return_value.strftime.return_value = "260715, 08:05"
+            result = _deliver_result(job, "**Läget:** Uppdateringen är klar.")
+
+        assert result is None
+        sent = send_mock.call_args.args[3]
+        assert sent.startswith(
+            "# Morning Update Summary\n"
+            "**Job ID**: legacy-report\n"
+            "**Datum**: 260715, 08:05"
+        )
+        assert sent.count("# Morning Update Summary") == 1
+
+    def test_required_human_contract_excludes_machine_targets(self):
+        from cron.scheduler import _targets_include_human_delivery
+
+        assert not _targets_include_human_delivery(
+            [{"platform": "webhook", "chat_id": "https://example.invalid"}]
+        )
+        assert not _targets_include_human_delivery(
+            [{"platform": "api_server", "chat_id": "internal"}]
+        )
+        assert _targets_include_human_delivery(
+            [{"platform": "discord", "chat_id": "123"}]
+        )
 
     def test_delivery_wraps_content_with_header_and_footer(self):
         """Delivered content should include task name header and agent-invisible note."""
@@ -2630,6 +2775,49 @@ class TestVisibleOutputContract:
     def _enable_repair(self, job):
         job["metadata"]["visible_output_repair"] = "extract-valid-receipt-v1"
         return job
+
+    def test_shared_nexus_body_contract_accepts_standard_report_body(self):
+        from cron.scheduler import _cron_visible_output_contract_error
+
+        job = self._make_named_contract_job("nexus-daily", "nexus-human-body-v1")
+        report = (
+            "**Läget:** Anteckningen för 2026-07-14 är uppdaterad.\n\n"
+            "- 🟢 **Resultat:** Done-listan är skriven.\n"
+            "- 🟢 **Kontroll:** Innehåll, länkar och struktur är godkända."
+        )
+        assert _cron_visible_output_contract_error(job, report) is None
+
+    def test_shared_nexus_body_contract_repairs_model_preamble(self):
+        from cron.scheduler import _repair_cron_visible_output
+
+        job = self._enable_repair(
+            self._make_named_contract_job("nexus-daily", "nexus-human-body-v1")
+        )
+        raw = (
+            "Alla kontroller är nu klara.\n\n"
+            "**Läget:** Anteckningen för 2026-07-14 är uppdaterad.\n\n"
+            "- 🟢 **Kontroll:** Innehåll, länkar och struktur är godkända."
+        )
+        repaired = _repair_cron_visible_output(job, raw)
+        assert repaired == (
+            "**Läget:** Anteckningen för 2026-07-14 är uppdaterad.\n\n"
+            "- 🟢 **Kontroll:** Innehåll, länkar och struktur är godkända."
+        )
+
+    def test_shared_nexus_failure_receipt_uses_standard_body(self):
+        from cron.scheduler import _summarize_cron_output_contract_failure
+
+        job = self._make_named_contract_job("nexus-daily", "nexus-human-body-v1")
+        job["metadata"].update({
+            "delivery_contract": "human-report-v1",
+            "delivery_title": "Nexus Daily Audit",
+        })
+        receipt = _summarize_cron_output_contract_failure(
+            job, "obligatorisk första rapportrad saknas eller har fel format"
+        )
+        assert receipt.startswith("**Läget:** Rapporten stoppades innan leverans.")
+        assert "🔴 **Leverans:**" in receipt
+        assert "⚠️ **Nexus" not in receipt
 
     def test_valid_nexus_report_passes(self):
         from cron.scheduler import _cron_visible_output_contract_error

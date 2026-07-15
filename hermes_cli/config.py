@@ -2599,6 +2599,11 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Enforce the canonical recipient-facing envelope for every human cron
+        # delivery. Reviewed jobs should define metadata.delivery_contract and
+        # metadata.delivery_title; legacy jobs receive a safe derived title at
+        # run time so raw output cannot bypass the standard.
+        "require_human_delivery_contract": False,
         # Make cron deliveries CONTINUABLE: a user can reply to a cron brief
         # and the agent has it in context (no "what is Task #2?" amnesia).
         # Default False preserves the historical isolation guarantee (cron

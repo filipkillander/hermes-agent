@@ -302,6 +302,10 @@ def _is_cron_silence_response(text: str) -> bool:
 
 
 _NEXUS_VISIBLE_OUTPUT_CONTRACTS = {
+    "nexus-human-body-v1": (
+        "Nexusrapport",
+        re.compile(r"^\*\*Läget:\*\*\s+\S.*$"),
+    ),
     "nexus-daily-discord-v1": (
         "Nexus Daily Audit",
         re.compile(r"^✅ \*\*Nexus Daily Audit\*\* \(\d{4}-\d{2}-\d{2}\)$"),
@@ -329,6 +333,12 @@ _NEXUS_VISIBLE_OUTPUT_CONTRACTS = {
             r"— (?:stängd|behöver beslut)$"
         ),
     ),
+}
+_LEGACY_NEXUS_TITLE_CONTRACTS = {
+    "nexus-daily-discord-v1",
+    "nexus-weekly-discord-v1",
+    "nexus-monthly-discord-v1",
+    "nexus-yearly-discord-v1",
 }
 _NEXUS_FORBIDDEN_VISIBLE_OUTPUT = (
     "[SILENT]",
@@ -360,6 +370,93 @@ _NEXUS_FORBIDDEN_VISIBLE_OUTPUT = (
     "scratch",
 )
 _CRON_VISIBLE_OUTPUT_REPAIR_EXTRACT_V1 = "extract-valid-receipt-v1"
+_HUMAN_REPORT_DELIVERY_V1 = "human-report-v1"
+_MACHINE_DELIVERY_PLATFORMS = {"webhook", "api_server"}
+_CANONICAL_JOB_ID_LINE_RE = re.compile(
+    r"^\*\*Job ID(?::)?\*\*:?\s*\S.*$",
+    re.IGNORECASE,
+)
+_CANONICAL_DATE_LINE_RE = re.compile(
+    r"^\*\*Datum(?::)?\*\*:?\s*\d{6},\s*\d{2}:\d{2}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _format_human_report_delivery(job: dict, content: str) -> str:
+    """Return the one canonical envelope for a human-facing cron report.
+
+    Hermes owns title, job id, and delivery timestamp. Skills and scripts own
+    only the body. During migration, a complete legacy canonical envelope is
+    removed before the system envelope is added again, and a validated Nexus
+    body title is removed so the recipient never sees two competing titles.
+    """
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        return content
+    contract = metadata.get("delivery_contract")
+    if not contract:
+        return content
+    if contract != _HUMAN_REPORT_DELIVERY_V1:
+        raise ValueError(f"unsupported delivery contract: {contract}")
+
+    title = metadata.get("delivery_title")
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("human-report-v1 requires metadata.delivery_title")
+    title = title.strip()
+    if "\n" in title or "\r" in title or len(title) > 80 or title.startswith("#"):
+        raise ValueError("metadata.delivery_title is not a safe single-line title")
+
+    job_id = str(job.get("id") or "").strip()
+    if not job_id or "\n" in job_id or "\r" in job_id:
+        raise ValueError("human-report-v1 requires a safe job id")
+
+    lines = content.strip().splitlines()
+    if (
+        len(lines) >= 3
+        and lines[0].strip().startswith("# ")
+        and _CANONICAL_JOB_ID_LINE_RE.fullmatch(lines[1].strip())
+        and _CANONICAL_DATE_LINE_RE.fullmatch(lines[2].strip())
+    ):
+        lines = lines[3:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+    visible_contract = metadata.get("visible_output_contract")
+    nexus_contract = _NEXUS_VISIBLE_OUTPUT_CONTRACTS.get(visible_contract)
+    if (
+        lines
+        and nexus_contract is not None
+        and visible_contract in _LEGACY_NEXUS_TITLE_CONTRACTS
+    ):
+        _label, header_re = nexus_contract
+        if header_re.fullmatch(lines[0].strip()):
+            lines = lines[1:]
+            while lines and not lines[0].strip():
+                lines.pop(0)
+
+    body = "\n".join(lines).strip()
+    header = (
+        f"# {title}\n"
+        f"**Job ID**: {job_id}\n"
+        f"**Datum**: {_hermes_now().strftime('%y%m%d, %H:%M')}"
+    )
+    return f"{header}\n\n{body}" if body else header
+
+
+def _fallback_human_delivery_title(job: dict) -> str:
+    """Derive a safe migration title when a legacy human job lacks metadata."""
+    source = str(job.get("name") or job.get("id") or "Cronrapport").strip()
+    words = re.sub(r"[-_]+", " ", source).split()
+    title = " ".join(word[:1].upper() + word[1:] for word in words).strip()
+    return (title or "Cronrapport")[:80]
+
+
+def _targets_include_human_delivery(targets: list[dict]) -> bool:
+    return any(
+        str(target.get("platform") or "").strip().lower()
+        not in _MACHINE_DELIVERY_PLATFORMS
+        for target in targets
+    )
 
 
 def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
@@ -385,10 +482,13 @@ def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     _label, header_re = nexus_contract
     if not lines or not header_re.fullmatch(lines[0]):
+        if contract == "nexus-human-body-v1":
+            return "obligatorisk första rapportrad saknas eller har fel format"
         return "obligatorisk Nexus-titel saknas eller har fel format"
 
-    if len(text) > 900:
-        return "Nexus-kvittot överskrider 900 tecken"
+    max_length = 800 if contract == "nexus-human-body-v1" else 900
+    if len(text) > max_length:
+        return f"Nexus-kvittot överskrider {max_length} tecken"
     if any(line.startswith(("# ", "## ", "### ")) for line in lines):
         return "filrubriker får inte förekomma i Discord-kvittot"
 
@@ -432,6 +532,13 @@ def _repair_cron_visible_output(job: dict, text: str) -> str | None:
 def _summarize_cron_output_contract_failure(job: dict, reason: str) -> str:
     """Return a deterministic, recipient-safe failure receipt."""
     metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    if metadata.get("delivery_contract") == _HUMAN_REPORT_DELIVERY_V1:
+        return (
+            "**Läget:** Rapporten stoppades innan leverans.\n\n"
+            f"- 🔴 **Leverans:** {reason}.\n\n"
+            "**Förslag på lösning**\n"
+            "Körningen och originalsvaret är sparade lokalt för felsökning."
+        )
     contract = metadata.get("visible_output_contract")
     contract_spec = _NEXUS_VISIBLE_OUTPUT_CONTRACTS.get(contract)
     label = contract_spec[0] if contract_spec else (job.get("name") or "Cronleverans")
@@ -1506,7 +1613,43 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
+    metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    delivery_contract = metadata.get("delivery_contract")
+    require_human_contract = bool(
+        isinstance(user_cfg, dict)
+        and user_cfg.get("cron", {}).get("require_human_delivery_contract", False)
+    )
+    if (
+        not delivery_contract
+        and require_human_contract
+        and _targets_include_human_delivery(targets)
+    ):
+        # Runtime backstop for legacy or out-of-band jobs. CronForge still
+        # rejects missing reviewed metadata on create/edit; at run time Hermes
+        # heals the omission so raw or ambiguously titled text never escapes.
+        job = dict(job)
+        metadata = dict(metadata)
+        metadata.update(
+            {
+                "delivery_contract": _HUMAN_REPORT_DELIVERY_V1,
+                "delivery_title": _fallback_human_delivery_title(job),
+            }
+        )
+        job["metadata"] = metadata
+        delivery_contract = _HUMAN_REPORT_DELIVERY_V1
+        logger.warning(
+            "Job '%s': human delivery metadata missing; applied runtime fallback title %r",
+            job.get("id", "?"),
+            metadata["delivery_title"],
+        )
+    if delivery_contract:
+        try:
+            delivery_content = _format_human_report_delivery(job, content)
+        except ValueError as exc:
+            msg = f"human report delivery contract rejected output: {exc}"
+            logger.error("Job '%s': %s", job.get("id", "?"), msg)
+            return msg
+    elif wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
@@ -1534,7 +1677,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         mirror_enabled = False
     mirror_text = ""
     if mirror_enabled:
-        _, mirror_text = BasePlatformAdapter.extract_media(content)
+        mirror_source = delivery_content if delivery_contract else content
+        _, mirror_text = BasePlatformAdapter.extract_media(mirror_source)
         mirror_text = (mirror_text or "").strip()
 
     try:
