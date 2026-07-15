@@ -2,7 +2,8 @@
 
 This command is intentionally incapable of promotion, rollback, restart, or
 scheduling.  It validates a pinned, clean source commit, runs the fixed
-focused test harness, and stages a sealed release with messaging dependencies.
+focused test harness, and stages a sealed release with messaging and Edge TTS
+dependencies.
 Promotion remains a separate human-approved canary operation.
 """
 
@@ -51,6 +52,8 @@ FOCUS_TESTS: tuple[str, ...] = (
     "tests/gateway/test_telegram_rich_messages.py",
 )
 
+RUNTIME_EXTRAS: tuple[str, ...] = ("messaging", "edge-tts")
+
 _IMPORT_PROBE = r"""
 import importlib
 import json
@@ -64,6 +67,7 @@ for name in (
     "telegram",
     "discord",
     "aiohttp",
+    "edge_tts",
 ):
     module = importlib.import_module(name)
     origin = pathlib.Path(module.__file__).resolve()
@@ -596,16 +600,11 @@ def _stage_build(uv: Path, npm: Path, final_release: Path) -> int:
         ):
             if dependency_dir.exists() or dependency_dir.is_symlink():
                 shutil.rmtree(dependency_dir, ignore_errors=False)
+        uv_sync = [str(uv), "sync", "--frozen", "--no-dev", "--no-editable"]
+        for extra in RUNTIME_EXTRAS:
+            uv_sync.extend(("--extra", extra))
         result = _run_digest(
-            [
-                str(uv),
-                "sync",
-                "--frozen",
-                "--no-dev",
-                "--no-editable",
-                "--extra",
-                "messaging",
-            ],
+            uv_sync,
             cwd=cwd,
             home=home,
             timeout=_BUILD_TIMEOUT,

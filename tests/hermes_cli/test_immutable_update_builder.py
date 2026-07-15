@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli.immutable_update_builder import (
     FOCUS_TESTS,
+    RUNTIME_EXTRAS,
     CommandDigest,
     ImmutableUpdateBuilder,
     UpdateBuildError,
@@ -201,6 +202,10 @@ def test_official_harness_is_fixed_and_hashed() -> None:
     assert len(_harness_sha256()) == 64
 
 
+def test_runtime_extras_include_messaging_and_edge_tts() -> None:
+    assert RUNTIME_EXTRAS == ("messaging", "edge-tts")
+
+
 def test_stage_build_emits_digest_not_raw_tool_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -212,6 +217,7 @@ def test_stage_build_emits_digest_not_raw_tool_output(
     uv.write_text(
         "#!/bin/sh\n"
         "echo raw-output-must-not-survive\n"
+        "printf '%s\\n' \"$*\" > uv-args\n"
         "mkdir -p .venv/bin\n"
         "printf '#!/bin/sh\\nexit 0\\n' > .venv/bin/python\n"
         "chmod 700 .venv/bin/python\n",
@@ -246,6 +252,16 @@ def test_stage_build_emits_digest_not_raw_tool_output(
     assert record["state"] == "passed"
     assert len(record["dependency_output_sha256"]) == 64
     assert len(record["tui_build_output_sha256"]) == 64
+    assert (staging / "uv-args").read_text(encoding="utf-8").split() == [
+        "sync",
+        "--frozen",
+        "--no-dev",
+        "--no-editable",
+        "--extra",
+        "messaging",
+        "--extra",
+        "edge-tts",
+    ]
     assert (staging / "hermes_cli/tui_dist/entry.js").read_text(encoding="utf-8") == (
         'console.log("tui")\n'
     )

@@ -53,11 +53,12 @@ retention command. It only:
 4. runs the fixed repository `scripts/run_tests.sh` focus harness in a clean
    environment;
 5. revalidates the ref and worktree, then stages with
-   `uv sync --frozen --no-dev --no-editable --extra messaging`;
+   `uv sync --frozen --no-dev --no-editable --extra messaging --extra edge-tts`;
 6. rewrites uv-generated absolute staging shebangs to the final release path
    before the manifest is sealed;
 7. verifies the sealed manifest, size, write modes, non-editable imports,
-   messaging imports, and the installed `hermes --help` entrypoint.
+   messaging and Edge TTS imports, and the installed `hermes --help`
+   entrypoint.
 
 It writes only states, counts, commit/digest values, and output byte counts to
 `$HERMES_HOME/release-status/immutable-update-builder.json` (mode 0600). Raw
