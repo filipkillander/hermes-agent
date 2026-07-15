@@ -2627,6 +2627,10 @@ class TestVisibleOutputContract:
             "metadata": {"visible_output_contract": contract},
         }
 
+    def _enable_repair(self, job):
+        job["metadata"]["visible_output_repair"] = "extract-valid-receipt-v1"
+        return job
+
     def test_valid_nexus_report_passes(self):
         from cron.scheduler import _cron_visible_output_contract_error
 
@@ -2771,6 +2775,65 @@ class TestVisibleOutputContract:
         assert _cron_visible_output_contract_error(
             self._make_contract_job(), oversize_report
         ) == "Nexus-kvittot överskrider 900 tecken"
+
+    def test_repair_extracts_an_already_valid_receipt_after_model_preamble(self):
+        from cron.scheduler import _repair_cron_visible_output
+
+        job = self._enable_repair(self._make_contract_job())
+        raw = (
+            "Alla kontroller gröna: audit 0 flaggor.\n\n"
+            "✅ **Nexus Daily Audit** (2026-07-14)\n"
+            "Done-listan är skriven och kontrollerad.\n"
+            "- Säkra länkar: 2 applicerade; 0 kvar.\n"
+            "- Frågor till Filip: 0."
+        )
+        assert _repair_cron_visible_output(job, raw) == (
+            "✅ **Nexus Daily Audit** (2026-07-14)\n"
+            "Done-listan är skriven och kontrollerad.\n"
+            "- Säkra länkar: 2 applicerade; 0 kvar.\n"
+            "- Frågor till Filip: 0."
+        )
+
+    def test_repair_is_opt_in_and_never_hides_invalid_receipt_body(self):
+        from cron.scheduler import _repair_cron_visible_output
+
+        raw = (
+            "Preamble.\n"
+            "✅ **Nexus Daily Audit** (2026-07-14)\n"
+            "- entity-sweep: 0 fynd"
+        )
+        assert _repair_cron_visible_output(self._make_contract_job(), raw) is None
+        assert _repair_cron_visible_output(
+            self._enable_repair(self._make_contract_job()), raw
+        ) is None
+
+    def test_repair_never_turns_silence_into_a_visible_receipt(self):
+        from cron.scheduler import _repair_cron_visible_output
+
+        job = self._enable_repair(self._make_contract_job())
+        assert _repair_cron_visible_output(job, "[TYST]") is None
+
+    def test_repair_delivers_valid_receipt_and_keeps_run_green(self):
+        job = self._enable_repair(self._make_contract_job())
+        raw = (
+            "Alla kontroller gröna: audit 0 flaggor.\n\n"
+            "✅ **Nexus Daily Audit** (2026-07-14)\n"
+            "Done-listan är skriven och kontrollerad.\n"
+            "- Säkra länkar: 2 applicerade; 0 kvar."
+        )
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", raw, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        delivered = deliver_mock.call_args.args[1]
+        assert delivered.startswith("✅ **Nexus Daily Audit** (2026-07-14)")
+        assert "Alla kontroller gröna" not in delivered
+        assert mark_mock.call_args.args[1] is True
+        assert mark_mock.call_args.args[2] is None
 
     def test_invalid_nexus_output_is_replaced_and_marks_run_failed(self):
         job = self._make_contract_job()

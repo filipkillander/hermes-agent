@@ -359,6 +359,7 @@ _NEXUS_FORBIDDEN_VISIBLE_OUTPUT = (
     "api call",
     "scratch",
 )
+_CRON_VISIBLE_OUTPUT_REPAIR_EXTRACT_V1 = "extract-valid-receipt-v1"
 
 
 def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
@@ -395,6 +396,36 @@ def _cron_visible_output_contract_error(job: dict, text: str) -> str | None:
     leaked = [token for token in _NEXUS_FORBIDDEN_VISIBLE_OUTPUT if token.casefold() in folded]
     if leaked:
         return "intern kontrolltext finns i mottagartexten"
+    return None
+
+
+def _repair_cron_visible_output(job: dict, text: str) -> str | None:
+    """Return a contract-valid recipient block when repair is explicitly enabled.
+
+    The repair is intentionally narrow and deterministic: it may discard text
+    before an already complete, titled receipt, but it never invents content,
+    rewrites a receipt, or removes invalid text after its title.  The extracted
+    candidate must pass the same full contract before it can be delivered.
+    """
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("visible_output_repair") != _CRON_VISIBLE_OUTPUT_REPAIR_EXTRACT_V1:
+        return None
+
+    contract = metadata.get("visible_output_contract")
+    contract_spec = _NEXUS_VISIBLE_OUTPUT_CONTRACTS.get(contract)
+    if contract_spec is None or _is_cron_silence_response(text):
+        return None
+
+    _label, header_re = contract_spec
+    raw_lines = text.splitlines()
+    for index, raw_line in enumerate(raw_lines):
+        if not header_re.fullmatch(raw_line.strip()):
+            continue
+        candidate = "\n".join(raw_lines[index:]).strip()
+        if _cron_visible_output_contract_error(job, candidate) is None:
+            return candidate
     return None
 
 
@@ -3502,14 +3533,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if should_deliver and success:
                 contract_error = _cron_visible_output_contract_error(job, deliver_content)
                 if contract_error:
-                    logger.error(
-                        "Job '%s': visible output contract rejected delivery: %s",
-                        job["id"],
-                        contract_error,
-                    )
-                    success = False
-                    error = f"Visible output contract rejected delivery: {contract_error}"
-                    deliver_content = _summarize_cron_output_contract_failure(job, contract_error)
+                    repaired_content = _repair_cron_visible_output(job, deliver_content)
+                    if repaired_content is not None:
+                        logger.warning(
+                            "Job '%s': visible output contract repaired before delivery: %s",
+                            job["id"],
+                            contract_error,
+                        )
+                        deliver_content = repaired_content
+                    else:
+                        logger.error(
+                            "Job '%s': visible output contract rejected delivery: %s",
+                            job["id"],
+                            contract_error,
+                        )
+                        success = False
+                        error = f"Visible output contract rejected delivery: {contract_error}"
+                        deliver_content = _summarize_cron_output_contract_failure(job, contract_error)
 
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
