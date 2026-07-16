@@ -208,8 +208,8 @@ def test_official_harness_is_fixed_and_hashed() -> None:
     assert len(_harness_sha256()) == 64
 
 
-def test_runtime_extras_include_messaging_and_edge_tts() -> None:
-    assert RUNTIME_EXTRAS == ("messaging", "edge-tts")
+def test_runtime_extras_include_messaging_edge_tts_and_mcp() -> None:
+    assert RUNTIME_EXTRAS == ("messaging", "edge-tts", "mcp")
 
 
 def test_stage_build_emits_digest_not_raw_tool_output(
@@ -267,6 +267,8 @@ def test_stage_build_emits_digest_not_raw_tool_output(
         "messaging",
         "--extra",
         "edge-tts",
+        "--extra",
+        "mcp",
     ]
     assert (staging / "hermes_cli/tui_dist/entry.js").read_text(encoding="utf-8") == (
         'console.log("tui")\n'

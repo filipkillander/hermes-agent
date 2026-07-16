@@ -2,8 +2,8 @@
 
 This command is intentionally incapable of promotion, rollback, restart, or
 scheduling.  It validates a pinned, clean source commit, runs the fixed
-focused test harness, and stages a sealed release with messaging and Edge TTS
-dependencies.
+focused test harness, and stages a sealed release with messaging, Edge TTS,
+and MCP dependencies.
 Promotion remains a separate human-approved canary operation.
 """
 
@@ -52,7 +52,7 @@ FOCUS_TESTS: tuple[str, ...] = (
     "tests/gateway/test_telegram_rich_messages.py",
 )
 
-RUNTIME_EXTRAS: tuple[str, ...] = ("messaging", "edge-tts")
+RUNTIME_EXTRAS: tuple[str, ...] = ("messaging", "edge-tts", "mcp")
 
 _IMPORT_PROBE = r"""
 import importlib
@@ -68,6 +68,7 @@ for name in (
     "discord",
     "aiohttp",
     "edge_tts",
+    "mcp",
 ):
     module = importlib.import_module(name)
     origin = pathlib.Path(module.__file__).resolve()
