@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -116,3 +118,60 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_uses_configured_worker_command_without_shell(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "spark"
+    profile.mkdir(parents=True)
+    executable = tmp_path / "spark-bridge"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    profile.joinpath("config.yaml").write_text(
+        f"""
+kanban:
+  worker_command:
+    - {executable}
+    - --private-socket
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    captured = {}
+
+    class FakeProc:
+        pid = 5150
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pid = kb._default_spawn(_make_task(kb, assignee="spark"), str(workspace))
+
+    assert pid == 5150
+    assert captured["cmd"] == [str(executable), "--private-socket"]
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["HERMES_PROFILE"] == "spark"
+
+
+def test_resolve_worker_command_rejects_shell_string(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "spark"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "kanban:\n  worker_command: '/bin/sh -c unsafe'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    with pytest.raises(ValueError, match="argv list"):
+        kb._resolve_worker_command(str(profile))
