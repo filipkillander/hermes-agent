@@ -7667,8 +7667,9 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     assignee profile's CLI tool surface at dispatch time and pass it as an
     explicit ``--toolsets`` pin so worker startup cannot fall back to a stale
     root/active-profile config or a profile whose top-level ``toolsets`` entry
-    is only the kanban orchestrator surface. ``model_tools`` still appends the
-    task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
+    is only the kanban orchestrator surface. The ``kanban`` toolset is pinned
+    here too instead of relying only on the later ``model_tools`` environment
+    append, keeping the subprocess argv and the agent schema aligned.
     """
     if not hermes_home:
         return None
@@ -7680,10 +7681,11 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            toolsets = set(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        toolsets.add("kanban")
+        return sorted(toolsets)
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",

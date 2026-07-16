@@ -85,7 +85,7 @@ agent:
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
-    for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
+    for required in ("terminal", "web", "file", "skills", "code_execution", "delegation", "kanban"):
         assert required in pinned
 
 
