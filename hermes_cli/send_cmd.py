@@ -42,15 +42,26 @@ def _read_message_body(
     positional: Optional[str],
     file_path: Optional[str],
 ) -> Optional[str]:
-    """Resolve the message body from (in order):
+    """Resolve one unambiguous message body.
 
-    1. An explicit positional message argument.
-    2. ``--file PATH`` or ``--file -`` (where ``-`` means stdin).
-    3. Piped stdin when it is not attached to a TTY.
+    A positional body and ``--file`` are mutually exclusive. This prevents a
+    misplaced recipient bareword from silently replacing the requested file
+    body. Recipients belong only in ``--to``.
+
+    Otherwise use the positional body, ``--file PATH`` / ``--file -``, or
+    piped stdin (in that order).
 
     Returns ``None`` when nothing is available — callers must treat that as
     a usage error.
     """
+    if positional is not None and file_path is not None:
+        print(
+            "hermes send: positional message and --file are mutually exclusive. "
+            "Put every recipient in --to; do not append an address as a bare argument.",
+            file=sys.stderr,
+        )
+        sys.exit(_USAGE_EXIT)
+
     if positional:
         return positional
 

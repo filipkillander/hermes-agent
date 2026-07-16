@@ -201,6 +201,23 @@ def test_file_decode_error_suggests_media_directive(fake_tool, capsys, monkeypat
     assert "[[as_document]]" in err
 
 
+def test_positional_recipient_cannot_override_file_body(fake_tool, capsys, tmp_path):
+    body = tmp_path / "approved-body.md"
+    body.write_text("the intended report body", encoding="utf-8")
+    args = _parse([
+        "--to", "email:filip@killandermusicrecords.com",
+        "--file", str(body),
+        "filip@killandermusicrecords.com",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+    err = capsys.readouterr().err
+    assert "mutually exclusive" in err
+    assert "--to" in err
+
+
 def test_tool_error_returns_failure_exit(monkeypatch, capsys):
     import sys as _sys
     import types as _types
