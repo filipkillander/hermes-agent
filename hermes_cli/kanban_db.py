@@ -7695,6 +7695,53 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
+    """Return a profile-owned deterministic worker command, if configured.
+
+    ``kanban.worker_command`` is an argv list, never a shell string. It lets an
+    external gateway identity execute delegated cards through its already
+    authenticated service boundary instead of copying provider credentials
+    into a fresh model subprocess.
+    """
+    if not hermes_home:
+        return None
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        raw = (
+            kanban_cfg.get("worker_command")
+            if isinstance(kanban_cfg, dict)
+            else None
+        )
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("kanban.worker_command must be a non-empty argv list")
+        command: list[str] = []
+        for value in raw:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("kanban.worker_command entries must be non-empty strings")
+            if "\x00" in value or "\n" in value or "\r" in value:
+                raise ValueError("kanban.worker_command contains an invalid character")
+            command.append(value)
+        executable = Path(command[0]).expanduser()
+        if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError("kanban.worker_command executable is unavailable")
+        command[0] = str(executable)
+        return command
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"could not resolve kanban.worker_command: {exc}") from exc
+
+
 _KANBAN_WORKER_BASE_ENV_CAPABILITIES = (
     # Terminal presentation/runtime.
     "TERM", "COLORTERM", "SHELL", "COMSPEC", "PATHEXT",
@@ -7889,33 +7936,37 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
+    configured_command = _resolve_worker_command(env.get("HERMES_HOME"))
+    if configured_command is not None:
+        cmd = configured_command
+    else:
+        cmd = [
+            *_resolve_hermes_argv(),
+            "-p", profile_arg,
+            # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+            # so they see that profile's shell-hook allowlist instead of the
+            # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+            # profile-local worker sessions still register configured hooks.
+            "--accept-hooks",
+        ]
+        # Per-task force-loaded skills. Each name goes in its own
+        # `--skills X` pair rather than a single comma-joined arg: the CLI
+        # accepts both forms (action='append' + comma-split), but
+        # per-name pairs are easier to read in `ps` output and avoid any
+        # quoting ambiguity if a skill name ever contains unusual chars.
+        if task.skills:
+            for sk in task.skills:
+                if sk:
+                    cmd.extend(["--skills", sk])
+        if task.model_override:
+            cmd.extend(["-m", task.model_override])
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
