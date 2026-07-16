@@ -1371,6 +1371,69 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _kanban_create_session_context() -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Resolve session linkage and the matching notification target for CLI creates.
+
+    The terminal tool runs ``hermes kanban create`` in a child process. Gateway
+    ContextVars are bridged into that child's ``HERMES_SESSION_*`` environment,
+    so this CLI surface must preserve the same linkage contract as the native
+    ``kanban_create`` tool. A chat-originated create without a session id fails
+    closed: creating an unwakeable task while claiming it is monitored is worse
+    than returning an actionable error before the row exists.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        def get_session_env(name: str, default: str = "") -> str:
+            return os.environ.get(name, default)
+
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip() or None
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+
+    if bool(platform) != bool(chat_id):
+        raise ValueError(
+            "incomplete gateway session context (platform/chat_id mismatch); "
+            "refusing to create an unmonitorable task"
+        )
+    if platform and chat_id and not session_id:
+        raise ValueError(
+            "gateway chat context is missing HERMES_SESSION_ID; refusing to "
+            "create a task that cannot wake its originating session"
+        )
+
+    auto_subscribe = True
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        auto_subscribe = bool(
+            cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True)
+        )
+    except Exception:
+        pass
+    if not auto_subscribe:
+        return session_id, None
+
+    if not platform or not chat_id:
+        session_key = get_session_env("HERMES_SESSION_KEY", "").strip()
+        if not session_key:
+            return session_id, None
+        platform = "tui"
+        chat_id = session_key
+
+    return session_id, {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "").strip() or None,
+        "user_id": get_session_env("HERMES_SESSION_USER_ID", "").strip() or None,
+        "notifier_profile": (
+            get_session_env("HERMES_SESSION_PROFILE", "").strip()
+            or os.environ.get("HERMES_PROFILE")
+            or None
+        ),
+    }
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     if not _delegation_allowed(args.assignee):
         return _deny_delegation(args.assignee)
@@ -1396,6 +1459,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        session_id, notify_target = _kanban_create_session_context()
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    subscribed = False
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1418,12 +1487,30 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            session_id=session_id,
         )
         task = kb.get_task(conn, task_id)
+        if notify_target is not None:
+            try:
+                kb.add_notify_sub(conn, task_id=task_id, **notify_target)
+                subscribed = True
+            except Exception as exc:
+                print(
+                    f"kanban: created {task_id}, but automatic monitoring failed: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
     if getattr(args, "json", False):
-        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+        payload = _task_to_dict(task)
+        payload["subscribed"] = subscribed
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if subscribed and notify_target is not None:
+            print(
+                f"Monitoring enabled for {notify_target['platform']}:"
+                f"{notify_target['chat_id']} (session={session_id or '-'})"
+            )
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are

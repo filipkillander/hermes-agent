@@ -166,6 +166,51 @@ def test_run_slash_json_output(kanban_home):
     assert payload["title"] == "jsontask"
     assert payload["assignee"] == "alice"
     assert payload["status"] == "ready"
+    assert payload["subscribed"] is False
+
+
+def test_run_slash_create_from_gateway_session_stamps_and_subscribes(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260707_143048_0a344484")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "1524029912665559131")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "1524029912665559131")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "236774668974030848")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "lumi")
+
+    payload = json.loads(
+        kc.run_slash("create 'monitored from chat' --assignee alice --json")
+    )
+
+    assert payload["session_id"] == "20260707_143048_0a344484"
+    assert payload["subscribed"] is True
+    with kb.connect_closing() as conn:
+        subs = kb.list_notify_subs(conn, payload["id"])
+    assert subs == [{
+        "task_id": payload["id"],
+        "platform": "discord",
+        "chat_id": "1524029912665559131",
+        "thread_id": "1524029912665559131",
+        "user_id": "236774668974030848",
+        "notifier_profile": "lumi",
+        "created_at": subs[0]["created_at"],
+        "last_event_id": 0,
+    }]
+
+
+def test_run_slash_create_from_chat_without_session_id_fails_closed(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kc.run_slash("create 'must not become blind' --assignee alice")
+
+    assert "missing HERMES_SESSION_ID" in out
+    with kb.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
 
 
 def test_run_slash_dispatch_dry_run_counts(kanban_home):

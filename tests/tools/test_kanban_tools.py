@@ -1079,6 +1079,39 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_stamps_session_id_from_contextvar(monkeypatch, worker_env):
+    """Concurrent gateway turns keep session identity in a ContextVar.
+
+    Reading only os.environ can stamp another chat's last-writer-wins id, or no
+    id at all. The native tool must use the same context-safe accessor as its
+    auto-subscribe path.
+    """
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-process-global")
+    from gateway.session_context import _VAR_MAP
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setattr(kt, "_require_delegation_authority", lambda *_args: None)
+
+    var = _VAR_MAP["HERMES_SESSION_ID"]
+    token = var.set("context-session")
+    try:
+        d = json.loads(kt._handle_create({
+            "title": "context-safe chat task",
+            "assignee": "peer",
+            "parents": [worker_env],
+        }))
+    finally:
+        var.reset(token)
+
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id == "context-session"
+    finally:
+        conn.close()
+
+
 def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
     """An explicit ``session_id`` arg from the model wins over the env
     propagation. Edge case but exercised: a tool call could carry a

@@ -180,6 +180,12 @@ def test_build_stages_only_after_focus_and_revalidation(
     })
     uv = tmp_path / "uv"
     uv.write_text("#!/bin/sh\n", encoding="utf-8")
+    npm = tmp_path / "npm"
+    npm.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.immutable_update_builder.shutil.which",
+        lambda name: str(npm) if name == "npm" else None,
+    )
 
     result = builder.build(
         source=repo,

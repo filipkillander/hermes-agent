@@ -305,6 +305,42 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
 
 
+def test_notifier_named_active_profile_uses_primary_adapter(tmp_path, monkeypatch):
+    """A named active profile still owns ``self.adapters``.
+
+    The primary Lumi gateway runs with active profile ``lumi``, not ``default``.
+    Treating every non-default profile as secondary made its own notifier resolve
+    through the empty ``_profile_adapters`` map and silently rewind forever.
+    """
+    db_path = tmp_path / "named-active-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by active lumi", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-lumi",
+            notifier_profile="lumi",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "lumi"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:
