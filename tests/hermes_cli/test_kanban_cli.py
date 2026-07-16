@@ -113,6 +113,18 @@ def test_run_slash_rejects_branch_without_worktree(kanban_home):
     assert "--branch is only valid with --workspace worktree" in out
 
 
+def test_run_slash_create_dir_with_write_paths(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    out = kc.run_slash(
+        f"create 'scoped editor' --assignee alice --workspace dir:{repo} "
+        "--write-path src/editor --write-path tests/editor"
+    )
+    assert "Created" in out
+    with kb.connect() as conn:
+        task = kb.list_tasks(conn)[0]
+    assert task.write_set == ["src/editor", "tests/editor"]
+
+
 def test_run_slash_create_with_parent_and_cascade(kanban_home):
     # Parent then child via --parent
     out1 = kc.run_slash("create 'parent' --assignee alice")

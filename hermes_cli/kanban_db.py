@@ -862,6 +862,12 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    # Declared repo-relative write scopes for shared ``dir`` workspaces.
+    # ``None`` means legacy/unknown and is treated as the entire workspace;
+    # an empty list explicitly declares a read-only task. Normal worktree and
+    # scratch tasks are isolated by construction; explicit shared paths are
+    # still protected by the dispatcher.
+    write_set: Optional[list[str]] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -934,6 +940,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        write_set_value: Optional[list[str]] = None
+        if "write_set" in keys and row["write_set"] is not None:
+            try:
+                parsed = json.loads(row["write_set"])
+                if isinstance(parsed, list):
+                    write_set_value = [str(p) for p in parsed]
+            except Exception:
+                write_set_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -948,6 +962,7 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            write_set=write_set_value,
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1113,6 +1128,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at         INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
+    -- Repo-relative paths this task may write when sharing a ``dir``
+    -- workspace. NULL is the backward-compatible conservative default: the
+    -- whole workspace. [] declares read-only. Worktrees/scratch are isolated.
+    write_set            TEXT,
     branch_name          TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
@@ -1864,6 +1883,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
+    if "write_set" not in cols:
+        _add_column_if_missing(conn, "tasks", "write_set", "write_set TEXT")
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
@@ -2390,6 +2411,43 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_write_set(write_set: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Validate and normalize declared write scopes.
+
+    Scopes are POSIX-style paths relative to a shared ``dir`` workspace.
+    ``None`` keeps the legacy conservative meaning (the entire workspace),
+    while an explicit empty iterable means the task is read-only. Prefix
+    semantics are used at dispatch time: ``src`` overlaps ``src/app.py``.
+    """
+    if write_set is None:
+        return None
+    if isinstance(write_set, (str, bytes)):
+        raise ValueError("write_set must be a list of relative paths, not a string")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in write_set:
+        value = str(raw or "").strip().replace("\\", "/")
+        if not value:
+            raise ValueError("write_set paths must be non-empty")
+        if value in {".", "./"}:
+            value = "."
+        else:
+            while value.startswith("./"):
+                value = value[2:]
+            parts = value.split("/")
+            if value.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+                raise ValueError(
+                    f"write_set path must be a normalized relative path, got {raw!r}"
+                )
+            value = "/".join(parts)
+        if value not in seen:
+            seen.add(value)
+            cleaned.append(value)
+    if "." in seen:
+        return ["."]
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2399,6 +2457,7 @@ def create_task(
     created_by: Optional[str] = None,
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
+    write_set: Optional[Iterable[str]] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
@@ -2454,6 +2513,9 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    write_set_list = _normalize_write_set(write_set)
+    if write_set_list is not None and workspace_kind != "dir":
+        raise ValueError("write_set is only valid for dir workspaces")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2640,10 +2702,10 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        write_set, branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2656,6 +2718,7 @@ def create_task(
                         now,
                         workspace_kind,
                         workspace_path,
+                        json.dumps(write_set_list) if write_set_list is not None else None,
                         branch_name,
                         project_id,
                         tenant,
@@ -2683,6 +2746,7 @@ def create_task(
                         "parents": list(parents),
                         "tenant": tenant,
                         "branch_name": branch_name,
+                        "write_set": write_set_list,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                     },
@@ -3376,6 +3440,88 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _task_write_scope_paths(task: Task) -> list[Path]:
+    """Return absolute write scopes for conflict checks.
+
+    Shared ``dir`` workspaces participate through ``write_set``. Normal scratch
+    directories and git worktrees are isolated per task; legacy explicit
+    scratch paths and reused linked worktrees are protected as whole paths. A
+    NULL dir write_set conservatively covers the whole workspace; [] is an
+    explicit read-only declaration.
+    """
+    if not task.workspace_path:
+        return []
+    root = Path(task.workspace_path).expanduser().resolve(strict=False)
+    if task.workspace_kind == "worktree":
+        # A normal worktree task points at a repo anchor and resolves to its
+        # own ``.worktrees/<task-id>`` directory. Only an already-materialized
+        # linked checkout can be shared accidentally; serialize that exact
+        # checkout while independent worktrees continue in parallel.
+        requested = Path(task.workspace_path).expanduser()
+        # Linked worktrees carry a .git *file* pointing into the common git
+        # directory. This cheap filesystem check avoids running a git
+        # subprocess while claim_task holds SQLite's write transaction.
+        return [root] if (requested / ".git").is_file() else []
+    if task.workspace_kind == "scratch":
+        # Default scratch workspaces are task-specific. Legacy explicit
+        # scratch paths are not, so protect the concrete path conservatively.
+        return [root]
+    if task.workspace_kind != "dir":
+        return []
+    if task.write_set == []:
+        return []
+    if task.write_set is None or "." in task.write_set:
+        return [root]
+    return [
+        (root / rel).resolve(strict=False)
+        for rel in task.write_set
+    ]
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Return True when two file/directory scopes contain one another."""
+    return (
+        left == right
+        or left in right.parents
+        or right in left.parents
+    )
+
+
+def workspace_write_conflict(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[str, str]]:
+    """Return the running task that conflicts with ``task_id``, if any.
+
+    The decision is intentionally narrow: only overlapping declared write
+    scopes in shared ``dir`` workspaces conflict. The caller leaves the ready
+    task queued for a later dispatcher tick; no worker, profile, or board is
+    paused. The second tuple element is an operator-facing reason.
+    """
+    candidate = get_task(conn, task_id)
+    if candidate is None or candidate.status not in {"ready", "review"}:
+        return None
+    candidate_scopes = _task_write_scope_paths(candidate)
+    if not candidate_scopes:
+        return None
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status = 'running' AND id != ?",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        active = Task.from_row(row)
+        active_scopes = _task_write_scope_paths(active)
+        if any(
+            _paths_overlap(candidate_scope, active_scope)
+            for candidate_scope in candidate_scopes
+            for active_scope in active_scopes
+        ):
+            return (
+                active.id,
+                f"shared dir write scope overlaps running task {active.id}",
+            )
+    return None
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3415,6 +3561,20 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+            )
+            return None
+        conflict = workspace_write_conflict(conn, task_id)
+        if conflict is not None:
+            blocking_task_id, reason = conflict
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "workspace_write_conflict",
+                    "blocking_task_id": blocking_task_id,
+                    "detail": reason,
+                },
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -3521,6 +3681,21 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        conflict = workspace_write_conflict(conn, task_id)
+        if conflict is not None:
+            blocking_task_id, reason = conflict
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "workspace_write_conflict",
+                    "blocking_task_id": blocking_task_id,
+                    "detail": reason,
+                    "source_status": "review",
+                },
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5729,6 +5904,10 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    workspace_conflicted: list[tuple[str, str, str]] = field(default_factory=list)
+    """Ready tasks deferred because a running task overlaps their declared
+    write scope, as ``(task_id, blocking_task_id, reason)``. This is local
+    queueing, not a worker or board pause; unrelated tasks still dispatch."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7251,6 +7430,17 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Shared-dir conflict gate: defer only this task when its declared
+        # write scopes overlap a running task. Worktrees, scratch tasks,
+        # read-only dir tasks, and disjoint dir write sets continue in
+        # parallel. The task remains ``ready`` and is retried next tick.
+        conflict = workspace_write_conflict(conn, row["id"])
+        if conflict is not None:
+            blocking_task_id, reason = conflict
+            result.workspace_conflicted.append(
+                (row["id"], blocking_task_id, reason)
+            )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -7374,6 +7564,13 @@ def _dispatch_once_locked(
             continue
         if not _authority_allows(row["assignee"]):
             result.skipped_unauthorized.append((row["id"], row["assignee"]))
+            continue
+        conflict = workspace_write_conflict(conn, row["id"])
+        if conflict is not None:
+            blocking_task_id, reason = conflict
+            result.workspace_conflicted.append(
+                (row["id"], blocking_task_id, reason)
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -8116,6 +8313,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.workspace_kind == "dir":
+        if task.write_set is None:
+            lines.append("Write scope: entire shared workspace (legacy/undeclared)")
+        elif not task.write_set:
+            lines.append("Write scope: read-only (no filesystem writes declared)")
+        else:
+            lines.append(f"Write scope: {', '.join(task.write_set)}")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,

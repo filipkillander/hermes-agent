@@ -51,6 +51,29 @@ logger = logging.getLogger(__name__)
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
     "background_review_read_paths", default=frozenset()
 )
+_background_review_foreground_mutations: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
+    "background_review_foreground_mutations", default=frozenset()
+)
+
+
+def set_background_review_foreground_mutations(names) -> _ctxvars.Token:
+    """Protect skills explicitly touched by the foreground session.
+
+    The background self-improvement fork must never undo, recreate, or amend a
+    skill that the task itself just changed before finalization. Other skills
+    remain available to the review loop, so this is a same-surface invariant,
+    not a global self-improvement pause.
+    """
+    normalized = frozenset(
+        str(name).strip().casefold()
+        for name in (names or ())
+        if str(name).strip()
+    )
+    return _background_review_foreground_mutations.set(normalized)
+
+
+def reset_background_review_foreground_mutations(token: _ctxvars.Token) -> None:
+    _background_review_foreground_mutations.reset(token)
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -372,6 +395,18 @@ def _background_review_write_guard(
             return None
     except Exception:
         return None
+
+    if str(name).strip().casefold() in _background_review_foreground_mutations.get():
+        return {
+            "success": False,
+            "error": (
+                f"Refusing background curator {action} for skill '{name}': "
+                "the foreground session already mutated this skill. A "
+                "post-turn review may not undo or amend the task's explicit "
+                "final state; choose a different skill or report nothing to save."
+            ),
+            "_foreground_mutation_protected": True,
+        }
 
     # Pin must be respected by autonomous maintenance. The curator already
     # skips pinned skills from every auto-transition; the background review

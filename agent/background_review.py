@@ -28,6 +28,43 @@ from agent.thread_scoped_output import thread_scoped_silence
 logger = logging.getLogger(__name__)
 
 
+_MUTATING_SKILL_ACTIONS = {
+    "create", "edit", "patch", "delete", "write_file", "remove_file",
+}
+
+
+def foreground_mutated_skill_names(messages_snapshot: List[Dict]) -> set[str]:
+    """Extract skills the foreground session attempted to mutate.
+
+    Protecting attempted writes as well as successful ones is intentional: a
+    failed foreground cleanup must not become an invitation for the autonomous
+    review fork to mutate the same surface after the user-visible final.
+    """
+    names: set[str] = set()
+    for message in messages_snapshot or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            if not isinstance(function, dict) or function.get("name") != "skill_manage":
+                continue
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except Exception:
+                    continue
+            if not isinstance(arguments, dict):
+                continue
+            action = str(arguments.get("action") or "").strip().lower()
+            name = str(arguments.get("name") or "").strip()
+            if action in _MUTATING_SKILL_ACTIONS and name:
+                names.add(name)
+    return names
+
+
 def background_review_allowed_for_platform(platform: Any) -> bool:
     """Return whether a foreground turn may spawn self-improvement review.
 
@@ -651,6 +688,7 @@ def _run_review_in_thread(
 
     review_agent = None
     review_messages: List[Dict] = []
+    foreground_mutation_token = None
     try:
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
@@ -817,9 +855,15 @@ def _run_review_in_thread(
                 ),
             )
             try:
-                from tools.skill_manager_tool import _reset_background_review_read_marks
+                from tools.skill_manager_tool import (
+                    _reset_background_review_read_marks,
+                    set_background_review_foreground_mutations,
+                )
 
                 _reset_background_review_read_marks()
+                foreground_mutation_token = set_background_review_foreground_mutations(
+                    foreground_mutated_skill_names(messages_snapshot)
+                )
             except Exception:
                 pass
 
@@ -834,6 +878,9 @@ def _run_review_in_thread(
                 review_agent.run_conversation(
                     user_message=(
                         prompt
+                        + "\n\nNever mutate a skill that the foreground "
+                        "session already changed. The tool layer enforces this "
+                        "same-surface rule so final task state cannot be undone."
                         + "\n\nYou can only call memory and skill "
                         "management tools. Other tools will be denied "
                         "at runtime — do not attempt them."
@@ -934,6 +981,17 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+        if foreground_mutation_token is not None:
+            try:
+                from tools.skill_manager_tool import (
+                    reset_background_review_foreground_mutations,
+                )
+
+                reset_background_review_foreground_mutations(
+                    foreground_mutation_token
+                )
+            except Exception:
+                pass
 
 
 def spawn_background_review_thread(
@@ -971,4 +1029,5 @@ __all__ = [
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "foreground_mutated_skill_names",
 ]

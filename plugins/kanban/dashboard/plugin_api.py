@@ -617,6 +617,7 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
+    write_set: Optional[list[str]] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -640,6 +641,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
+            write_set=payload.write_set,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,

@@ -363,6 +363,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "write_set": task.write_set,
         "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -409,6 +410,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "write_set": t.write_set,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -889,6 +891,13 @@ def _handle_create(args: dict, **kw) -> str:
     # fall back to scratch as before. Explicit None path stays None.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    write_set = args.get("write_set")
+    if isinstance(write_set, str):
+        write_set = [write_set]
+    if write_set is not None and not isinstance(write_set, (list, tuple)):
+        return tool_error(
+            f"write_set must be a list of repo-relative paths, got {type(write_set).__name__}"
+        )
     project_id = args.get("project") or args.get("project_id")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
@@ -944,6 +953,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                write_set=write_set,
                 project_id=project_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
@@ -1486,6 +1496,16 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "write_set": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Repo-relative write scopes for a shared 'dir' workspace. "
+                    "Overlapping scopes are queued behind the running task; "
+                    "disjoint scopes continue in parallel. Omit for conservative "
+                    "whole-workspace scope; [] explicitly declares read-only."
                 ),
             },
             "project": {

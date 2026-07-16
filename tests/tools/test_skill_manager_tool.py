@@ -581,6 +581,41 @@ class TestSkillManageDispatcher:
         assert result["success"] is True
         assert usage["review-sediment"]["created_by"] == "agent"
 
+    def test_background_review_cannot_retouch_foreground_mutated_skill(self, tmp_path):
+        """Post-turn self-improvement must preserve the foreground final state."""
+        from tools.skill_manager_tool import (
+            reset_background_review_foreground_mutations,
+            set_background_review_foreground_mutations,
+        )
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        with _skill_dir(tmp_path):
+            created = skill_manage(
+                action="create", name="task-skill", content=VALID_SKILL_CONTENT
+            )
+            assert json.loads(created)["success"] is True
+            scope_token = set_background_review_foreground_mutations({"task-skill"})
+            origin_token = set_current_write_origin(BACKGROUND_REVIEW)
+            try:
+                raw = skill_manage(
+                    action="patch",
+                    name="task-skill",
+                    old_string="description:",
+                    new_string="description:",
+                )
+            finally:
+                reset_current_write_origin(origin_token)
+                reset_background_review_foreground_mutations(scope_token)
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert result["_foreground_mutation_protected"] is True
+        assert "foreground session already mutated" in result["error"]
+
     def test_delete_via_dispatcher_threads_absorbed_into(self, tmp_path):
         # Dispatcher must plumb absorbed_into through to _delete_skill so the
         # validation + message suffix paths are exercised end-to-end.

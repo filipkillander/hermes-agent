@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import run_agent as run_agent_module
 from run_agent import AIAgent
-from agent.background_review import background_review_allowed_for_platform
+from agent.background_review import (
+    background_review_allowed_for_platform,
+    foreground_mutated_skill_names,
+)
 
 
 def test_scheduled_cron_turns_cannot_spawn_background_self_mutation():
@@ -13,6 +16,37 @@ def test_scheduled_cron_turns_cannot_spawn_background_self_mutation():
     assert background_review_allowed_for_platform("discord") is True
     assert background_review_allowed_for_platform("telegram") is True
     assert background_review_allowed_for_platform(None) is True
+
+
+def test_foreground_skill_mutations_are_extracted_from_tool_calls():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_patch",
+                    "function": {
+                        "name": "skill_manage",
+                        "arguments": (
+                            '{"action":"patch","name":'
+                            '"post-release-acceptance-test","old_string":"x",'
+                            '"new_string":""}'
+                        ),
+                    },
+                },
+                {
+                    "id": "call_view",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": '{"name":"other"}',
+                    },
+                },
+            ],
+        }
+    ]
+    assert foreground_mutated_skill_names(messages) == {
+        "post-release-acceptance-test"
+    }
 
 
 def _bare_agent() -> AIAgent:

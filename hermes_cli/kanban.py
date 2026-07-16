@@ -98,6 +98,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
+        "write_set": list(t.write_set) if t.write_set is not None else None,
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
@@ -349,6 +350,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument(
+        "--write-path",
+        action="append",
+        default=None,
+        dest="write_set",
+        help=(
+            "Repo-relative path this task may write in a shared dir workspace "
+            "(repeatable). Omit for conservative whole-workspace scope; pass "
+            "no write paths through the native API to declare read-only."
+        ),
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1474,6 +1486,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
+            write_set=getattr(args, "write_set", None),
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
@@ -2346,6 +2359,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "workspace_conflicted": [
+                {
+                    "task_id": tid,
+                    "blocking_task_id": blocker,
+                    "reason": reason,
+                }
+                for (tid, blocker, reason) in res.workspace_conflicted
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2378,6 +2399,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.workspace_conflicted:
+        for tid, blocker, _reason in res.workspace_conflicted:
+            print(
+                f"Deferred (write scope overlaps running task {blocker}): {tid}"
             )
     if res.skipped_nonspawnable:
         print(
