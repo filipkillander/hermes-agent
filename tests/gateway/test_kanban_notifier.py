@@ -10,9 +10,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -303,6 +307,89 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     # The claim is rewound (adapter resolved to None → treated as disconnected),
     # so the event is still unseen and will deliver once beta's adapter connects.
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
+
+
+def test_notifier_named_active_profile_uses_primary_adapter(tmp_path, monkeypatch):
+    """A named active profile still owns ``self.adapters``.
+
+    The primary Lumi gateway runs with active profile ``lumi``, not ``default``.
+    Treating every non-default profile as secondary made its own notifier resolve
+    through the empty ``_profile_adapters`` map and silently rewind forever.
+    """
+    db_path = tmp_path / "named-active-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by active lumi", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-lumi",
+            notifier_profile="lumi",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "lumi"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+
+
+def test_notifier_discord_thread_wakes_original_thread_session(tmp_path, monkeypatch):
+    """Discord task events must use the same thread-shaped routing key as chat.
+
+    A synthetic ``group`` source reaches the right visible channel but creates a
+    second internal session, dropping the creator's conversation context.
+    """
+    db_path = tmp_path / "discord-thread-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake original Discord thread",
+            assignee="worker",
+            session_id="20260707_143048_0a344484",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="1524029912665559131",
+            thread_id="1524029912665559131",
+            notifier_profile="lumi",
+        )
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "review"})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    runner._active_profile_name = lambda: "lumi"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.handled) == 1
+    source = adapter.handled[0].source
+    assert source.chat_type == "thread"
+    assert source.chat_id == "1524029912665559131"
+    assert source.thread_id == "1524029912665559131"
 
 
 def _unseen_terminal_events_for(tid, chat_id):

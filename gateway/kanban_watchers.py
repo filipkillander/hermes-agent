@@ -529,28 +529,25 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
+                                    # The subscription schema does not yet persist
+                                    # chat_type. A Discord subscription carrying a
+                                    # thread_id is nevertheless unambiguous: real
+                                    # Discord thread events use chat_type="thread".
+                                    # Marking those as "group" creates a different
+                                    # session key and wakes a contextless session.
+                                    # Keep the historical group fallback for other
+                                    # platforms until chat_type is stored end-to-end.
+                                    _thread_id = sub.get("thread_id") or None
+                                    _chat_type = (
+                                        "thread"
+                                        if plat == _Platform.DISCORD and _thread_id
+                                        else "group"
+                                    )
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
-                                        chat_type="group",
-                                        thread_id=sub.get("thread_id") or None,
+                                        chat_type=_chat_type,
+                                        thread_id=_thread_id,
                                         user_id=sub.get("user_id"),
                                         profile=sub_profile or None,
                                     )

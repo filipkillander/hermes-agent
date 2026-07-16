@@ -47,7 +47,11 @@ class GatewayAuthorizationMixin:
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
+        try:
+            active_profile = (self._active_profile_name() or "default").strip()
+        except Exception:
+            active_profile = "default"
+        if profile_name and profile_name not in {"default", active_profile}:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
