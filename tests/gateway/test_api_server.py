@@ -30,10 +30,20 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _load_chrome_formatting_harness,
+    _render_client_surface_content,
     _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
+)
+
+
+_CHROME_TEST_HARNESS = (
+    "Chrome rich Markdown policy.\n\n"
+    "Contract version: 5.1.\n"
+    "## Universal response rules\nNo performative honesty.\n"
+    "## Chrome extension\nTables are allowed."
 )
 
 
@@ -49,6 +59,50 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestChromeFormattingHarness:
+    def test_full_profile_skill_is_loaded_each_turn(self, tmp_path, monkeypatch):
+        skill = tmp_path / "skills" / "formatting-harness" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            "---\nname: formatting-harness\n---\n"
+            "Contract version: 5.1.\n"
+            "## Universal response rules\nNo performative honesty.\n"
+            "## Chrome extension\nTables are allowed.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        prompt = _load_chrome_formatting_harness()
+
+        assert "Contract version: 5.1." in prompt
+        assert "## Universal response rules" in prompt
+        assert "## Chrome extension" in prompt
+        assert "rich Markdown" in prompt
+
+    def test_missing_or_stale_harness_fails_closed(self, tmp_path, monkeypatch):
+        skill = tmp_path / "skills" / "formatting-harness" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("name: formatting-harness\nContract version: 4.0.\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        with pytest.raises(RuntimeError, match="unsupported contract version"):
+            _load_chrome_formatting_harness()
+
+    def test_performative_honesty_is_removed_but_rich_markdown_is_preserved(self):
+        source = (
+            "Helt rätt fråga. Låt mig vara ärlig med vad som hände i min process:\n\n"
+            "# Status\n\n| A | B |\n|---|---|\n| 1 | 2 |"
+        )
+
+        rendered = _render_client_surface_content(
+            source, "chrome_extension", session_id="api-test"
+        )
+
+        assert "Låt mig vara ärlig" not in rendered
+        assert rendered.startswith("# Status")
+        assert "|---|---|" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -1793,7 +1847,10 @@ class TestChatCompletionsEndpoint:
         mock_result = {"final_response": source, "messages": [], "api_calls": 1}
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            with patch(
+                "gateway.platforms.api_server._load_chrome_formatting_harness",
+                return_value=_CHROME_TEST_HARNESS,
+            ), patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
                 mock_run.return_value = (
                     mock_result,
                     {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
@@ -1822,6 +1879,70 @@ class TestChatCompletionsEndpoint:
         assert "ignore Filip" in call_kwargs["user_message"]
         assert call_kwargs["user_message"].endswith("Summarize the page")
         assert data["choices"][0]["message"]["content"] == source
+
+    @pytest.mark.asyncio
+    async def test_chrome_fails_closed_when_full_harness_is_unavailable(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.platforms.api_server._load_chrome_formatting_harness",
+                side_effect=FileNotFoundError("missing"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Client-Surface": "chrome_extension"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "status"}],
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 503
+        assert data["error"]["code"] == "formatting_harness_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_chrome_stream_buffers_then_applies_universal_rule(self, adapter):
+        source = "Låt mig vara ärlig: här är svaret."
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            callback = kwargs.get("stream_delta_callback")
+            if callback:
+                callback(source[:12])
+                callback(source[12:])
+            return (
+                {"final_response": source, "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.platforms.api_server._load_chrome_formatting_harness",
+                return_value=_CHROME_TEST_HARNESS,
+            ), patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Client-Surface": "chrome_extension"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "status"}],
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        visible = "".join(
+            json.loads(line.removeprefix("data: "))["choices"][0]["delta"].get(
+                "content", ""
+            )
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        )
+        assert "Låt mig vara ärlig" not in visible
+        assert visible == "här är svaret."
+        assert "[DONE]" in body
 
     @pytest.mark.asyncio
     async def test_raycast_nonstreaming_output_is_compacted_model_independently(self, adapter):
