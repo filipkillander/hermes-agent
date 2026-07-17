@@ -95,6 +95,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
                cli_only=True, aliases=("snap",), args_hint="[create|restore <id>|prune]"),
     CommandDef("stop", "Kill all running background processes", "Session"),
+    CommandDef("panic", "Global emergency stop — interrupt all agents, clear all goals", "Session",
+               aliases=("emergency",)),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]"),
     CommandDef("deny", "Deny a pending dangerous command (optionally with a reason)", "Session",
@@ -379,6 +381,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "status",
         "steer",
         "stop",
+        "panic",
         "update",
         "version",
     }

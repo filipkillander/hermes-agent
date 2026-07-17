@@ -914,6 +914,32 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Track 2 (effect manifest): blast-radius class for the work this task
+    # authorises. See ``EFFECT_SCOPES`` for the allowed values. None on
+    # legacy rows and on tasks that have not been classified yet.
+    effect_scope: Optional[str] = None
+    # Track 2 (effect manifest): JSON receipt of the authorisation that
+    # promoted this task to its current effect scope. None until an
+    # explicit authorisation is recorded.
+    authorization_receipt: Optional[str] = None
+    # Track 2 (effect manifest): lifecycle state of the authorisation
+    # gate. One of: pending | approved | denied | auto. None on legacy
+    # rows is treated as ``auto``.
+    approval_state: Optional[str] = None
+    # Track 4 (write-set isolation): JSON array of file paths the worker
+    # may touch, or the string ``exclusive:<dir/path>`` to reserve a
+    # directory exclusively. None = no write-set constraint.
+    write_set: Optional[str] = None
+    # Human-readable rollback steps for this task's side effects. None
+    # when no rollback plan is on file.
+    rollback_plan: Optional[str] = None
+    # Track 6 (proveniens): which agent created this task
+    # (lumi, igor, worker:coder, etc). None on legacy rows.
+    created_by_agent: Optional[str] = None
+    # Track 6: originating chat message ID (Discord/Telegram).
+    source_message_id: Optional[str] = None
+    # Track 6: goal session ID if this task was created from a standing goal.
+    parent_goal_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -997,6 +1023,32 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            effect_scope=(
+                row["effect_scope"] if "effect_scope" in keys and row["effect_scope"] else None
+            ),
+            authorization_receipt=(
+                row["authorization_receipt"]
+                if "authorization_receipt" in keys and row["authorization_receipt"]
+                else None
+            ),
+            approval_state=(
+                row["approval_state"] if "approval_state" in keys and row["approval_state"] else None
+            ),
+            write_set=(
+                row["write_set"] if "write_set" in keys and row["write_set"] else None
+            ),
+            rollback_plan=(
+                row["rollback_plan"] if "rollback_plan" in keys and row["rollback_plan"] else None
+            ),
+            created_by_agent=(
+                row["created_by_agent"] if "created_by_agent" in keys and row["created_by_agent"] else None
+            ),
+            source_message_id=(
+                row["source_message_id"] if "source_message_id" in keys and row["source_message_id"] else None
+            ),
+            parent_goal_id=(
+                row["parent_goal_id"] if "parent_goal_id" in keys and row["parent_goal_id"] else None
             ),
         )
 
@@ -1175,7 +1227,33 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Track 2 (effect manifest): classifies the blast radius of the work
+    -- the worker is authorised to perform. One of:
+    --   local_write | external_read | external_write | account_change |
+    --   deploy_publish | secret_use | global_host_change
+    -- NULL on legacy rows and on tasks that have not yet been classified.
+    effect_scope         TEXT,
+    -- Track 2 (effect manifest): JSON receipt capturing the authorisation
+    -- that promoted this task to its current effect scope. Shape:
+    --   {"session_id","message_id","timestamp","scope","user_text"}
+    -- NULL until an explicit authorisation is recorded.
+    authorization_receipt TEXT,
+    -- Track 2 (effect manifest): lifecycle state of the authorisation gate.
+    -- One of: pending | approved | denied | auto. NULL on legacy rows is
+    -- treated as "auto" (no gate was required at creation time).
+    approval_state       TEXT,
+    -- Track 4 (write-set isolation): JSON array of file paths the worker is
+    -- permitted to touch, or the string "exclusive:<dir/path>" to reserve a
+    -- directory exclusively. NULL = no write-set constraint (legacy behaviour).
+    write_set            TEXT,
+    -- Track 6 (proveniens): agent provenance and goal lineage.
+    created_by_agent     TEXT,
+    source_message_id    TEXT,
+    parent_goal_id       TEXT,
+    -- Human-readable rollback steps the worker or operator should follow to
+    -- undo the task's side effects. NULL when no rollback plan is on file.
+    rollback_plan        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1986,6 +2064,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # Track 2 (effect manifest) — see SCHEMA_SQL for column semantics.
+    if "effect_scope" not in cols:
+        _add_column_if_missing(conn, "tasks", "effect_scope", "effect_scope TEXT")
+    if "authorization_receipt" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "authorization_receipt", "authorization_receipt TEXT"
+        )
+    if "approval_state" not in cols:
+        _add_column_if_missing(conn, "tasks", "approval_state", "approval_state TEXT")
+
+    # Track 4 (write-set isolation) — see SCHEMA_SQL for column semantics.
+    if "write_set" not in cols:
+        _add_column_if_missing(conn, "tasks", "write_set", "write_set TEXT")
+
+    # Human-readable rollback steps for the task's side effects.
+    if "rollback_plan" not in cols:
+        _add_column_if_missing(conn, "tasks", "rollback_plan", "rollback_plan TEXT")
+    if "created_by_agent" not in cols:
+        _add_column_if_missing(conn, "tasks", "created_by_agent", "created_by_agent TEXT")
+    if "source_message_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "source_message_id", "source_message_id TEXT")
+    if "parent_goal_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "parent_goal_id", "parent_goal_id TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2407,6 +2509,11 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    effect_scope: Optional[str] = None,
+    authorization_receipt: Optional[str] = None,
+    approval_state: Optional[str] = None,
+    write_set: Optional[str] = None,
+    rollback_plan: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2635,8 +2742,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        effect_scope, authorization_receipt, approval_state,
+                        write_set, rollback_plan
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2659,6 +2768,11 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        effect_scope,
+                        authorization_receipt,
+                        approval_state,
+                        write_set,
+                        rollback_plan,
                     ),
                 )
                 for pid in parents:

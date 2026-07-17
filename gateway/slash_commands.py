@@ -1030,6 +1030,103 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    def _goal_manager_for_session(self, session_entry) -> Any:
+        """Build a GoalManager bound to ``session_entry.session_id``.
+
+        Mirrors the construction in ``_get_goal_manager_for_event`` but
+        accepts a SessionEntry directly so callers that already have one
+        (e.g. ``/stop``) don't have to synthesize a fake event.  Returns
+        None when the goals module is unavailable or the entry has no
+        resolvable session_id.
+        """
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("goal manager unavailable: %s", exc)
+            return None
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return None
+        try:
+            max_turns = self._goal_max_turns_from_config()
+        except Exception:
+            max_turns = None
+        if max_turns is not None:
+            return GoalManager(session_id=sid, default_max_turns=max_turns)
+        return GoalManager(session_id=sid)
+
+    def _pause_standing_goal(self, session_entry) -> bool:
+        """Pause any standing goal for ``session_entry``. Returns True if a
+        goal was actually paused, False otherwise. Safe to call when no
+        goal exists — the GoalManager reports has_goal()=False and we no-op.
+        """
+        mgr = self._goal_manager_for_session(session_entry)
+        if mgr is None:
+            return False
+        try:
+            if not mgr.has_goal():
+                return False
+            state = mgr.pause(reason="stop_command")
+            return state is not None
+        except Exception as exc:
+            logger.debug("STOP: goal pause failed: %s", exc)
+            return False
+
+    def _goal_status_line(self, session_entry) -> str:
+        """Return a one-line status string for the session's standing goal,
+        suitable for inclusion in a /stop receipt. Never raises.
+        """
+        mgr = self._goal_manager_for_session(session_entry)
+        if mgr is None:
+            return "goal: unavailable"
+        try:
+            return mgr.status_line()
+        except Exception:
+            return "goal: (error reading status)"
+
+    def _active_worker_count(self) -> int:
+        """Best-effort count of running/claimed kanban tasks across all
+        boards under the active HERMES_HOME. Used by /stop and /panic
+        receipts so the operator can see if dispatched workers are still
+        in flight. Never raises.
+        """
+        try:
+            import os as _os
+            import sqlite3 as _sqlite3
+            from hermes_constants import get_hermes_home
+            kanban_dir = _os.path.join(str(get_hermes_home()), "kanban", "boards")
+            if not _os.path.isdir(kanban_dir):
+                return 0
+            total = 0
+            for board_dir in _os.listdir(kanban_dir):
+                db_path = _os.path.join(kanban_dir, board_dir, "kanban.db")
+                if not _os.path.isfile(db_path):
+                    continue
+                try:
+                    conn = _sqlite3.connect(db_path, timeout=2)
+                    row = conn.execute(
+                        "SELECT count(*) FROM tasks WHERE status IN ('running','claimed')"
+                    ).fetchone()
+                    total += int(row[0]) if row else 0
+                    conn.close()
+                except Exception:
+                    pass
+            return total
+        except Exception as exc:
+            logger.debug("active worker count failed: %s", exc)
+            return 0
+
+    def _dispatcher_status_line(self) -> str:
+        """One-line summary of gateway dispatcher state for /stop receipts."""
+        try:
+            draining = bool(getattr(self, "_draining", False))
+            running = self._running_agent_count()
+            if draining:
+                return f"dispatcher: draining ({running} active run(s))"
+            return f"dispatcher: {'idle' if running == 0 else f'busy ({running} active run(s))'}"
+        except Exception:
+            return "dispatcher: (unknown)"
+
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stop command - interrupt a running agent.
 
@@ -1039,6 +1136,11 @@ class GatewaySlashCommandsMixin:
         only through normal command dispatch (no running agent) or as a
         fallback.  Force-clean the session lock in all cases for safety.
 
+        Track 1: after interrupting the active turn, also pause any
+        standing goal for the session so a follow-up message doesn't
+        auto-resume it. A receipt is returned showing the interrupted
+        turn, goal status, worker count, and dispatcher status.
+
         The session is preserved so the user can continue the conversation.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
@@ -1047,6 +1149,9 @@ class GatewaySlashCommandsMixin:
         session_key = session_entry.session_key
 
         agent = self._running_agents.get(session_key)
+        interrupted_turn = False
+        pending_only = False
+
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
             await self._interrupt_and_clear_session(
@@ -1056,8 +1161,9 @@ class GatewaySlashCommandsMixin:
                 invalidation_reason="stop_command_pending",
             )
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
-            return EphemeralReply(t("gateway.stop.stopped_pending"))
-        if agent:
+            interrupted_turn = True
+            pending_only = True
+        elif agent:
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             await self._interrupt_and_clear_session(
@@ -1066,32 +1172,154 @@ class GatewaySlashCommandsMixin:
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_handler",
             )
-            return EphemeralReply(t("gateway.stop.stopped"))
+            interrupted_turn = True
+        else:
+            # No run under the caller's own session key.  In a per-user thread
+            # (thread_sessions_per_user=True) each participant is isolated even
+            # inside one shared thread, so a run another user started lives under
+            # a different key.  Authorized users should still be able to /stop it
+            # (#bernard-thread-stop).  Fall back to interrupting any running
+            # agent(s) that share this thread, gated on authorization.
+            sibling_keys = self._sibling_thread_run_keys(source, session_key)
+            if sibling_keys and self._is_user_authorized(source):
+                for sibling_key in sibling_keys:
+                    await self._interrupt_and_clear_session(
+                        sibling_key,
+                        source,
+                        interrupt_reason=_INTERRUPT_REASON_STOP,
+                        invalidation_reason="stop_command_thread_sibling",
+                    )
+                logger.info(
+                    "STOP (thread sibling) by %s — interrupted %d run(s) in thread: %s",
+                    session_key,
+                    len(sibling_keys),
+                    ", ".join(sibling_keys),
+                )
+                interrupted_turn = True
 
-        # No run under the caller's own session key.  In a per-user thread
-        # (thread_sessions_per_user=True) each participant is isolated even
-        # inside one shared thread, so a run another user started lives under
-        # a different key.  Authorized users should still be able to /stop it
-        # (#bernard-thread-stop).  Fall back to interrupting any running
-        # agent(s) that share this thread, gated on authorization.
-        sibling_keys = self._sibling_thread_run_keys(source, session_key)
-        if sibling_keys and self._is_user_authorized(source):
-            for sibling_key in sibling_keys:
+        # ── Track 1: pause any standing goal on /stop ──
+        # After interrupting the active turn (or when no turn was running),
+        # pause the standing goal so a follow-up message doesn't auto-resume
+        # the goal loop. Use the existing GoalManager.pause() method.
+        goal_paused = self._pause_standing_goal(session_entry)
+        if goal_paused:
+            logger.info("STOP: paused standing goal for session %s", session_key)
+
+        # No active turn and no sibling runs and no goal pause — nothing
+        # happened. Preserve the legacy "no active task" message.
+        if not interrupted_turn and not goal_paused:
+            return t("gateway.stop.no_active")
+
+        # Build a receipt summarising the stop effect.
+        receipt_lines = [
+            t("gateway.stop.stopped_pending") if pending_only else t("gateway.stop.stopped"),
+        ]
+        receipt_lines.append(f"  Goal: {self._goal_status_line(session_entry)}")
+        receipt_lines.append(f"  Workers: {self._active_worker_count()} active kanban task(s)")
+        receipt_lines.append(f"  {self._dispatcher_status_line()}")
+        return EphemeralReply("\n".join(receipt_lines))
+
+    async def _handle_panic_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        """Handle /panic command — global emergency stop.
+
+        Interrupts ALL running agents across all session keys, clears ALL
+        standing goals, terminates Lumi-originated worker processes
+        (via process_registry.kill_all), and reports a receipt.
+
+        Does NOT change models, secrets, crons, or other profiles.
+        Gated on authorized users only.
+        """
+        from gateway.run import _INTERRUPT_REASON_STOP
+        source = event.source
+
+        if not self._is_user_authorized(source):
+            return EphemeralReply("⛔ /panic: not authorized")
+
+        interrupted = 0
+        cleared_goals = 0
+        workers_killed = 0
+
+        # 1) Interrupt ALL running agents across all session keys.
+        #    Snapshot keys first because _interrupt_and_clear_session
+        #    mutates _running_agents.
+        all_keys = list(self._running_agents.keys())
+        for sk in all_keys:
+            agent = self._running_agents.get(sk)
+            if agent is None:
+                continue
+            try:
                 await self._interrupt_and_clear_session(
-                    sibling_key,
+                    sk,
                     source,
                     interrupt_reason=_INTERRUPT_REASON_STOP,
-                    invalidation_reason="stop_command_thread_sibling",
+                    invalidation_reason="panic_command",
                 )
-            logger.info(
-                "STOP (thread sibling) by %s — interrupted %d run(s) in thread: %s",
-                session_key,
-                len(sibling_keys),
-                ", ".join(sibling_keys),
-            )
-            return EphemeralReply(t("gateway.stop.stopped"))
+                interrupted += 1
+            except Exception as exc:
+                logger.warning("PANIC: interrupt failed for %s: %s", sk, exc)
 
-        return t("gateway.stop.no_active")
+        # 2) Clear ALL standing goals. We walk every entry in the
+        #    SessionStore, build a GoalManager bound to its session_id,
+        #    and clear() any goal that has_goal(). This covers sessions
+        #    that have a standing goal but no currently-running turn.
+        try:
+            self.session_store._ensure_loaded()
+            for _sk, entry in list(self.session_store._entries.items()):
+                try:
+                    mgr = self._goal_manager_for_session(entry)
+                    if mgr is None:
+                        continue
+                    if mgr.has_goal():
+                        mgr.clear()
+                        cleared_goals += 1
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("PANIC: goal cleanup failed: %s", exc)
+
+        # 3) Terminate Lumi-originated worker processes. The process
+        #    registry tracks every subprocess spawned by this gateway
+        #    (kanban workers, terminal background=true, delegate_task).
+        #    kill_all() signals every still-running process and returns
+        #    the count actually killed. We do NOT touch other profiles'
+        #    state on disk (kanban DB rows, session DB rows) — only the
+        #    in-flight subprocesses this gateway process owns.
+        try:
+            from tools.process_registry import process_registry
+            workers_killed = process_registry.kill_all()
+        except Exception as exc:
+            logger.debug("PANIC: process_registry.kill_all failed: %s", exc)
+
+        # Best-effort remaining worker count for the receipt.
+        remaining_workers = self._active_worker_count()
+
+        logger.info(
+            "PANIC by %s — interrupted %d turn(s), cleared %d goal(s), "
+            "killed %d worker process(es), %d kanban task(s) still in flight",
+            getattr(source, "session_key", None) or "unknown",
+            interrupted,
+            cleared_goals,
+            workers_killed,
+            remaining_workers,
+        )
+
+        receipt_lines = [
+            "🚨 PANIC — Emergency Stop",
+            f"  Interrupted turns: {interrupted}",
+            f"  Cleared goals: {cleared_goals}",
+            f"  Worker processes killed: {workers_killed}",
+            f"  Active kanban tasks remaining: {remaining_workers}",
+            f"  {self._dispatcher_status_line()}",
+        ]
+        if remaining_workers > 0:
+            receipt_lines.append(
+                "  ⚠️ Some dispatched kanban tasks may be reclaimed by other "
+                "gateways — check with /agents."
+            )
+        receipt_lines.append(
+            "  Models, secrets, crons, and other profiles are untouched."
+        )
+        return EphemeralReply("\n".join(receipt_lines))
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:
         """Handle ``/platform list|pause|resume [name]`` — surface and
@@ -2203,6 +2431,20 @@ class GatewaySlashCommandsMixin:
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
+            # ── Track 1: interrupt active goal-turn before clearing ──
+            # /goal stop used to only clear goal state but leave an
+            # already-running goal-turn alive. Now we interrupt it first.
+            if had and event.source:
+                _quick_key = self._session_key_for_source(event.source)
+                if _quick_key and _quick_key in self._running_agents:
+                    from gateway.run import _INTERRUPT_REASON_STOP
+                    await self._interrupt_and_clear_session(
+                        _quick_key,
+                        event.source,
+                        interrupt_reason=_INTERRUPT_REASON_STOP,
+                        invalidation_reason="goal_stop_interrupt",
+                    )
+                    logger.info("GOAL STOP: interrupted active turn for session %s", _quick_key)
             mgr.clear()
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
