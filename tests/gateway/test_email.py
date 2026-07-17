@@ -168,6 +168,22 @@ class TestHelperFunctions(unittest.TestCase):
                 "💾 Self-improvement review: Patched SKILL.md"
             )
 
+    def test_file_mutation_verifier_block_is_never_delivered(self):
+        from plugins.platforms.email.adapter import _sanitize_outbound_body
+
+        body = _sanitize_outbound_body(
+            "Hej Filip!\n\nKlart.\n\n"
+            "⚠️ File-mutation verifier: 1 file(s) were NOT modified this turn.\n\n"
+            "- /Users/ai/.hermes/profiles/igor/config.yaml — write denied"
+        )
+        self.assertEqual(body, "Hej Filip!\n\nKlart.")
+        self.assertNotIn("File-mutation verifier", body)
+
+        with self.assertRaisesRegex(ValueError, "internal-only"):
+            _sanitize_outbound_body(
+                "⚠️ File-mutation verifier: 1 file(s) were NOT modified this turn."
+            )
+
     def test_raw_markdown_separator_is_removed_without_blocking_short_mail(self):
         from plugins.platforms.email.adapter import _sanitize_outbound_body
 

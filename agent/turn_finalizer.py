@@ -51,6 +51,11 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _platform = getattr(agent, "platform", "") or ""
+    if hasattr(_platform, "value"):
+        _platform = _platform.value
+    _is_email_turn = str(_platform).strip().lower() == "email"
+
     if final_response is None and (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -273,9 +278,17 @@ def finalize_turn(
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
+                if _is_email_turn:
+                    logger.warning(
+                        "email final-only boundary suppressed file-mutation "
+                        "verifier footer: session=%s failed_paths=%d",
+                        agent.session_id or "none",
+                        len(_failed),
+                    )
+                else:
+                    footer = agent._format_file_mutation_failure_footer(_failed)
+                    if footer:
+                        final_response = final_response.rstrip() + "\n\n" + footer
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
@@ -295,7 +308,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not _is_email_turn:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()

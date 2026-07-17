@@ -8225,6 +8225,13 @@ def edit_config():
 
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
+    if os.environ.get("HERMES_SESSION_PLATFORM", "").strip().lower() == "email":
+        print(
+            "Cannot change Hermes configuration from an email session. "
+            "Use a trusted local operator surface instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if is_managed():
         managed_error("set configuration values")
         return

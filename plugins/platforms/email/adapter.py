@@ -116,6 +116,10 @@ _EMAIL_INTERNAL_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EMAIL_MUTATION_VERIFIER_BLOCK_RE = re.compile(
+    r"(?ms)^\s*⚠️\s*File-mutation verifier:.*\Z"
+)
+
 _EMAIL_GREETING_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:hej|hejsan|hello|hi)\b",
     re.IGNORECASE,
@@ -164,9 +168,15 @@ def _sanitize_outbound_body(body: str) -> str:
     internal-only message so a background callback can never become a blank or
     cryptic email.
     """
+    # Defense in depth for responses produced by an older/misconfigured
+    # turn finalizer.  The verifier is useful on interactive coding surfaces,
+    # but it is internal runtime metadata and must never cross the email
+    # final-only boundary.
+    body_without_verifier = _EMAIL_MUTATION_VERIFIER_BLOCK_RE.sub("", body or "")
+
     kept = [
         line
-        for line in (body or "").splitlines()
+        for line in body_without_verifier.splitlines()
         if not _EMAIL_INTERNAL_LINE_RE.match(line)
         # A bare Markdown thematic break is rendered as a visible paragraph by
         # the intentionally small email renderer.  Drop only the exact raw
