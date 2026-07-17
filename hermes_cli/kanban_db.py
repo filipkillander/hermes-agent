@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "cancelled", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -3816,6 +3816,74 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    return True
+
+
+def cancel_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    signal_fn=None,
+) -> bool:
+    """Stop an active worker and make a task terminal as ``cancelled``.
+
+    This differs from :func:`reclaim_task`, which deliberately returns work to
+    ``ready``. Cancellation is operator intent to stop the work permanently.
+    If a host-local worker survives SIGTERM/SIGKILL, the claim is retained so
+    the dispatcher cannot start a duplicate worker, and False is returned.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] in {"done", "cancelled", "archived"}:
+        return False
+
+    prev_lock = row["claim_lock"]
+    termination = _terminate_reclaimed_worker(
+        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+    )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_cancel_worker_survived",
+        )
+        return False
+
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'cancelled', completed_at = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "block_kind = NULL "
+            "WHERE id = ? AND status NOT IN ('done', 'cancelled', 'archived') "
+            "AND claim_lock IS ?",
+            (now, task_id, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="cancelled",
+            status="cancelled",
+            error=(f"manual_cancel: {reason}" if reason else "manual_cancel"),
+            metadata=termination,
+        )
+        payload = {
+            "manual": True,
+            "reason": reason,
+            "prev_lock": prev_lock,
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "cancelled", payload, run_id=run_id)
+
+    recompute_ready(conn)
     return True
 
 

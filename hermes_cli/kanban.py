@@ -479,7 +479,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
-    # --- reclaim / reassign (recovery) ---
+    # --- reclaim / cancel / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
         help="Release an active worker claim on a running task",
@@ -488,6 +488,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reclaim.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+
+    p_cancel = sub.add_parser(
+        "cancel",
+        help="Stop any active worker and mark a task cancelled",
+    )
+    p_cancel.add_argument("task_id")
+    p_cancel.add_argument(
+        "reason", nargs="*",
+        help="Optional human-readable cancellation reason",
     )
 
     p_reassign = sub.add_parser(
@@ -1003,6 +1013,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
+            "cancel":   _cmd_cancel,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1803,6 +1814,20 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"Reclaimed {args.task_id}")
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    reason = " ".join(getattr(args, "reason", [])).strip() or None
+    with kb.connect_closing() as conn:
+        ok = kb.cancel_task(conn, args.task_id, reason=reason)
+    if not ok:
+        print(
+            f"cannot cancel {args.task_id} (terminal, unknown id, or worker still alive)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Cancelled {args.task_id}" + (f": {reason}" if reason else ""))
     return 0
 
 
@@ -2920,6 +2945,7 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
+  `cancel <id> [reason]` Stop its worker and mark it cancelled
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

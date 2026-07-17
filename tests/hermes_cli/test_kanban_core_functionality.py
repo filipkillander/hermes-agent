@@ -4189,6 +4189,88 @@ def test_reclaim_task_returns_false_for_already_ready(kanban_home):
         conn.close()
 
 
+def test_cancel_task_terminates_worker_and_closes_run(kanban_home, monkeypatch):
+    """Cancel is terminal, stops the host-local worker, and closes its run."""
+    import signal
+    import secrets
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="stop me", assignee="spark")
+        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
+        future = int(time.time()) + 3600
+        state = {"alive": True}
+        signals: list[int] = []
+
+        def _signal(pid, sig):
+            assert pid == 12345
+            signals.append(sig)
+            if sig == signal.SIGTERM:
+                state["alive"] = False
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=? WHERE id=?",
+            (lock, future, 12345, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, lock, future, 12345, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+        conn.commit()
+
+        assert kb.cancel_task(
+            conn, task_id, reason="wrong device", signal_fn=_signal,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "cancelled"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        run = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert run["status"] == "cancelled"
+        assert run["outcome"] == "cancelled"
+        assert run["ended_at"] is not None
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='cancelled'",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(event["payload"])["reason"] == "wrong device"
+        assert signals == [signal.SIGTERM]
+    finally:
+        conn.close()
+
+
+def test_cancel_task_refuses_terminal_task(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="already done", assignee="spark")
+        assert kb.complete_task(conn, task_id, summary="done") is True
+        assert kb.cancel_task(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "done"
+    finally:
+        conn.close()
+
+
+def test_slash_cancel_command_marks_task_cancelled(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="cancel from chat", assignee="spark")
+    finally:
+        conn.close()
+
+    output = run_slash(f"cancel {task_id} Filip stopped it")
+    assert output == f"Cancelled {task_id}: Filip stopped it"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "cancelled"
+
+
 def test_reassign_task_refuses_running_without_reclaim_first(kanban_home):
     """Without ``reclaim_first=True``, reassigning a running task is a
     no-op returning False (matches assign_task's RuntimeError via
