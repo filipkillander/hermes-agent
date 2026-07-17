@@ -27,6 +27,7 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
+    _agent_send_message_tool,
     _is_telegram_thread_not_found,
     _parse_target_ref,
     _send_matrix_via_adapter,
@@ -3184,6 +3185,44 @@ class TestSendViaAdapterStandaloneFallback:
 # ---------------------------------------------------------------------------
 # _check_send_message — availability gating
 # ---------------------------------------------------------------------------
+
+class TestAgentSendMessageScope:
+    def test_discord_list_is_filtered_to_discord(self):
+        with patch("gateway.session_context.get_session_env", return_value="discord"), \
+             patch("tools.send_message_tool._handle_list", return_value="listed") as list_mock:
+            assert _agent_send_message_tool({"action": "list"}) == "listed"
+
+        list_mock.assert_called_once_with("discord")
+
+    def test_discord_target_is_allowed(self):
+        args = {
+            "action": "send",
+            "target": "discord:KMR STUDIOS/gruppchatt",
+            "message": "hej",
+        }
+        with patch("gateway.session_context.get_session_env", return_value="discord"), \
+             patch("tools.send_message_tool.send_message_tool", return_value="sent") as send_mock:
+            assert _agent_send_message_tool(args) == "sent"
+
+        send_mock.assert_called_once_with(args)
+
+    def test_discord_session_rejects_other_platforms(self):
+        args = {"action": "send", "target": "telegram", "message": "hej"}
+        with patch("gateway.session_context.get_session_env", return_value="discord"), \
+             patch("tools.send_message_tool.send_message_tool") as send_mock:
+            result = json.loads(_agent_send_message_tool(args))
+
+        assert "Discord sessions may only" in result["error"]
+        send_mock.assert_not_called()
+
+    def test_registry_exposes_scoped_handler(self):
+        from tools.registry import registry
+
+        entry = registry.get_entry("send_message")
+        assert entry is not None
+        assert entry.toolset == "messaging"
+        assert entry.handler is _agent_send_message_tool
+
 
 class TestCheckSendMessage:
     """The tool's check_fn governs whether the model sees ``send_message`` as

@@ -146,7 +146,9 @@ SEND_MESSAGE_SCHEMA = {
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
         "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first."
+        "to the home channel without listing first.\n"
+        "When this tool is exposed inside a Discord session, it is intentionally "
+        "restricted to Discord targets and action='list' returns Discord targets only."
     ),
     "parameters": {
         "type": "object",
@@ -194,13 +196,41 @@ def send_message_tool(args, **kw):
     return _handle_send(args)
 
 
-def _handle_list():
+def _handle_list(platform_name: str | None = None):
     """Return formatted list of available messaging targets."""
     try:
         from gateway.channel_directory import format_directory_for_display
-        return json.dumps({"targets": format_directory_for_display()})
+        return json.dumps({"targets": format_directory_for_display(platform_name)})
     except Exception as e:
         return json.dumps(_error(f"Failed to load channel directory: {e}"))
+
+
+def _agent_send_message_tool(args, **kw):
+    """Registry-facing wrapper with a narrow Discord-session boundary.
+
+    The underlying send engine remains cross-platform for explicit non-agent
+    callers such as ``hermes send`` and cron delivery.  When the model receives
+    this tool inside Discord, however, it may only list and address Discord
+    targets.  This restores cross-channel Discord delivery without silently
+    widening a Discord conversation into email, Telegram, or other platforms.
+    """
+    from gateway.session_context import get_session_env
+
+    session_platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    if session_platform == "discord":
+        action = args.get("action", "send")
+        if action == "list":
+            return _handle_list("discord")
+
+        target = str(args.get("target", "")).strip()
+        target_platform = target.split(":", 1)[0].strip().lower()
+        if target_platform != "discord":
+            return tool_error(
+                "Discord sessions may only use send_message with a Discord target. "
+                "Use send_message(action='list') to see reachable Discord channels."
+            )
+
+    return send_message_tool(args, **kw)
 
 
 def _handle_react(args, remove=False):
@@ -1790,16 +1820,13 @@ async def _send_yuanbao(chat_id, message, media_files=None):
 
 
 # --- Registry ---
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
-# model tool. The agent should not decide on its own to fire off cross-platform
-# messages or reactions. The send engine in this module (``_send_to_platform``,
-# ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
-# helpers) remains the shared transport used by:
-#   - cron delivery (cron/scheduler.py)
-#   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
-#   - the gateway kanban notifier (dashboard-toggled, outside agent control)
-#   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
-# Those callers import the helpers directly; none of them need the registry
-# entry.
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=_agent_send_message_tool,
+    check_fn=_check_send_message,
+    emoji="📨",
+)

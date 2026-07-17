@@ -162,6 +162,12 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "messaging": {
+        "description": "Explicit outbound messaging through the connected gateway",
+        "tools": ["send_message"],
+        "includes": []
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",

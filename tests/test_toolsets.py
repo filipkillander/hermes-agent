@@ -211,6 +211,9 @@ class TestToolsetConsistency:
             for inc in ts["includes"]:
                 assert inc in TOOLSETS, f"{name} includes unknown toolset '{inc}'"
 
+    def test_messaging_toolset_contains_only_send_message(self):
+        assert TOOLSETS["messaging"]["tools"] == ["send_message"]
+
     def test_hermes_platforms_share_core_tools(self):
         """All hermes-* platform toolsets share the same core tools.
 

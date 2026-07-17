@@ -459,10 +459,12 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     return None
 
 
-def format_directory_for_display() -> str:
-    """Format the channel directory as a human-readable list for the model."""
+def format_directory_for_display(platform_name: str | None = None) -> str:
+    """Format all targets, or one platform's targets, for the model."""
     directory = load_directory()
     platforms = directory.get("platforms", {})
+    if platform_name:
+        platforms = {platform_name: platforms.get(platform_name, [])}
 
     if not any(platforms.values()):
         return "No messaging platforms connected or no channels discovered yet."

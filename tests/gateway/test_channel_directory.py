@@ -358,6 +358,22 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
 
+    def test_platform_filter_excludes_other_platforms(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "discord": [
+                {"id": "1", "name": "gruppchatt", "guild": "KMR STUDIOS", "type": "channel"},
+            ],
+            "telegram": [
+                {"id": "2", "name": "Private", "type": "group"},
+            ],
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display("discord")
+
+        assert "discord:#gruppchatt" in result
+        assert "Telegram:" not in result
+        assert "telegram:Private" not in result
+
 
 class TestLookupChannelType:
     def _setup(self, tmp_path, platforms):
