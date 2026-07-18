@@ -1,0 +1,185 @@
+# fleet-desired.yaml — versionerat, read-only desired-state contract for the
+# kmros fleet (collector, The Terminal, heartbeat, acceptance, watchdog, updater).
+#
+# This file is the SOLE desired-state source for the fleet. Live systems under
+# /Users/ai/.hermes/ are NOT authoritative; they are reconciled toward this file.
+# Phase A: read-only contract + candidate tests. Nothing here is installed live.
+#
+# Owner decision of record: decision ID links this contract to the human approval
+# (Filip) that governs it. No field here may change fleet behavior without the
+# owner decision ID being bumped and the lineage recorded.
+#
+# SECRET POLICY: This file contains ONLY secret NAMES / identifiers — never
+# secret VALUES. No tokens, passwords, keys, or bearer strings belong here.
+# Tests assert this (see tests/control-plane/test_fleet_desired.py).
+
+schema:
+  version: 1
+  kind: fleet-desired
+  owner_decision_id: kmros-decision-2026-07-18-fleet-contract
+
+# ── Profiles ────────────────────────────────────────────────────────────────
+# Each profile is a long-running agent process. roles map to fleet function.
+# ports are the local control ports each profile listens on.
+# required_platforms restricts where a profile is allowed to run.
+# service_labels are the canonical labels collectors/watchdog key on.
+profiles:
+  lumi:
+    role: orchestrator
+    port: 7401
+    required_platforms: [darwin, linux]
+    service_labels:
+      fleet_role: orchestrator
+      tier: parent
+  igor:
+    role: collector
+    port: 7402
+    required_platforms: [darwin, linux]
+    service_labels:
+      fleet_role: collector
+      tier: worker
+  spark:
+    role: collector
+    port: 7403
+    required_platforms: [darwin, linux]
+    service_labels:
+      fleet_role: collector
+      tier: worker
+
+# ── Source lineage ──────────────────────────────────────────────────────────
+# The desired source the fleet reconciles toward. Profiles track current and
+# previous release so rollback has a concrete target.
+source:
+  lineage: kmros/main
+  upstream_remote: filip
+  profiles:
+    lumi:
+      current_release: 20260710-21b2be528
+      previous_release: 20260710-33de70fb4
+    igor:
+      current_release: 20260710-21b2be528
+      previous_release: 20260710-33de70fb4
+    spark:
+      current_release: 20260710-21b2be528
+      previous_release: 20260710-33de70fb4
+
+# ── Rollout divergence ───────────────────────────────────────────────────────
+# Approved profile divergence during a staged rollout. Profiles may run the
+# previous release this many steps behind current before the contract flags it.
+rollout:
+  approved_divergence:
+    max_release_lag: 1        # profile may be at most 1 release behind current
+    window_minutes: 30        # and only for this long after a new release lands
+  note: "Divergence beyond this window is stale, not green."
+
+# ── Channels ─────────────────────────────────────────────────────────────────
+# channel_id -> canonical brief -> required skills -> knowledge root.
+# Example: vendelip #spel channel 1509925693247459378.
+channels:
+  "1509925693247459378":
+    canonical_brief: "vendelip #spel — gaming social channel"
+    required_skills: [social, gaming-context, discord-protocol]
+    knowledge_root: knowledge/channels/vendelip-spel/
+
+# ── Scheduled work desired state ────────────────────────────────────────────
+# cron + LaunchAgent desired state. `retired` is an EXPLICIT, first-class
+# status meaning "this job is intentionally no longer scheduled; do not
+# resurrect it, do not alert on its absence." Example: nightly restart = retired.
+scheduled:
+  launchagents:
+    nightly-restart:
+      status: retired
+      reason: "Superseded by watchdog health-gated restarts; do not resurrect."
+  cron:
+    nightly-skill-sync:
+      status: active
+      schedule: "0 3 * * *"
+      owner_profile: lumi
+    plist-guard:
+      status: active
+      schedule: "55 4 * * *"
+      owner_profile: lumi
+
+# ── Recovery authority ──────────────────────────────────────────────────────
+# Per-check authority: who is allowed to act, and how many retries before the
+# contract requires human (owner) escalation rather than another auto-retry.
+recovery:
+  checks:
+    heartbeat:
+      authority: watchdog
+      max_attempts: 3
+      on_exhaust: escalate_owner
+    acceptance:
+      authority: acceptance-runner
+      max_attempts: 2
+      on_exhaust: escalate_owner
+    plist-integrity:
+      authority: plist-guard
+      max_attempts: 1
+      on_exhaust: escalate_owner
+  global:
+    max_attempts_per_hour: 12
+    on_exhaust: freeze_until_owner_decision
+
+# ── Owner-controlled keys & effects ─────────────────────────────────────────
+# Only the owner (Filip, via decision_id) may change these. Workers reconcile
+# toward them but never override them.
+owner_controlled:
+  decision_id: kmros-decision-2026-07-18-fleet-contract
+  allowed_effects: [restart_profile, stage_release, retire_cron, escalate]
+  forbidden_effects: [publish_public, send_external_message, mutate_remote, install_live]
+
+# ── Updater ──────────────────────────────────────────────────────────────────
+# Staged updater policy: stage -> soak -> drill -> canary -> promote, with
+# explicit rollback conditions. Phase A is read-only: nothing auto-runs.
+updater:
+  stages:
+    - name: stage
+      action: stage_release
+    - name: soak
+      action: observe
+      soak_minutes: 15
+    - name: drill
+      action: smoke_test
+    - name: canary
+      action: promote_one_profile
+      target_profile: spark
+    - name: promote
+      action: promote_all_profiles
+  rollback:
+    conditions:
+      - "acceptance_failures > 0 during soak"
+      - "heartbeat_misses > 2 during soak"
+      - "drill_smoke_test_failed"
+    action: revert_to_previous_release
+  drills:
+    - name: heartbeat-liveness
+      required: true
+    - name: acceptance-suite
+      required: true
+    - name: plist-integrity
+      required: true
+
+# ── Retention & protected classes ───────────────────────────────────────────
+retention:
+  releases_kept: 6
+  worktrees_kept: 4
+  protected_release_classes: [stable, canary]
+  protected_worktree_classes: [control-plane, secret-loader, delivery-envelope]
+
+# ── Secrets (names only, never values) ───────────────────────────────────────
+# Identifiers tell the secret-loader what to fetch; values never live here.
+secrets:
+  - name: discord-bot-token
+    identifier: DISCORD_BOT_TOKEN
+  - name: telegram-bot-token
+    identifier: TELEGRAM_BOT_TOKEN
+  - name: feishu-app-secret
+    identifier: FEISHU_APP_SECRET
+
+# ── Freshness ────────────────────────────────────────────────────────────────
+# When this contract was last affirmed. Stale contracts (older than max_age_hours)
+# must NOT be reported green — reconciliation halts and escalates to the owner.
+freshness:
+  last_affirmed_at: "2026-07-18T12:00:00Z"
+  max_age_hours: 24
