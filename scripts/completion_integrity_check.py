@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Completion Integrity Gate (CIC) for Fas A — v1.1 (strict, external hash).
+"""Completion Integrity Gate (CIC) for Fas A — v2 (trust context, manifest binding, containment).
 
 Read-only enforcement code. Reads a requirements manifest (YAML), validates it
 against the schema BEFORE any evaluation, then computes a deterministic status
@@ -7,49 +7,44 @@ for every requirement and returns a JSON verdict. The CIC never mutates state:
 no task creation, no board writes, no push, no install, no restart, no file
 writes outside the read-only verification path.
 
-Design invariants (task t_200e833a, krav 1-12):
+Design invariants (task t_e5b2a010, krav 1-10):
 
-  1. AUKTORITET: Filip's original Fas A requirements are authority. The manifest
-     is consumed as evidence, never trusted as status.
-  2. SCHEMAVALIDERING FÖRE UTVÄRDERING: the manifest MUST validate against
-     control-plane/fas-a-requirements.schema.json before any evaluation. If
-     validation fails → gate=FAIL, no further evaluation. Empty/truncated YAML
-     → FAIL.
-  3. CANONICAL ID SET: exactly {FAS-A-001 ... FAS-A-013}, no missing, no extra,
-     no duplicates. Violation → FAIL.
-  4. NO FREE EXPECTED: accepted outcome is derived deterministically from the
-     check type, not from a YAML `expected` field. A manifest may NEVER declare
-     `missing`, `unverified`, or `unauthorized` as accepted. The CIC computes
-     the actual result and compares to a type-specific deterministic rule.
-  5. STRICT TYPED CHECKS: schema uses discriminated union with `type` and
-     additionalProperties=false per check type. The CIC additionally enforces
-     the per-type required fields at runtime (defence in depth).
-  6. all_of: every sub-check must pass. One sub-check fail → whole requirement
-     FAIL. Sub-checks are evaluated strictly (no owner bypass inside all_of).
-  7. TECHNICAL ≠ OWNER: technical requirements (file/test-receipt/schema/git)
-     never pass via owner_decision_receipt. Missing technical evidence = FAIL.
-     Only genuine Filip-owned owner_decision_receipt checks may be BLOCKED.
-  8. EXTERNAL MANIFEST HASH: --expected-manifest-hash is the trust anchor. A
-     `source_hash` field inside the manifest is NOT a trust anchor (it can be
-     rewritten by the same party that writes the manifest). Without
-     --expected-manifest-hash, gate is NEVER PASS / closeout_permitted NEVER
-     true. A mismatch → FAIL with manifest_tampered.
-  9. STRICT RECEIPT BINDING: test receipts bind to requirement-id, check-id,
-     branch, commit, fresh UTC timestamp (within 24h), expected result, and an
-     output artefact whose hash is recomputed every run. Owner receipts bind to
-     decision_id, check-id, branch, commit, allowed values, and an EXTERNAL
-     attestation (never candidate-local JSON alone). Missing trust anchor →
-     BLOCKED with trust_anchor_missing.
-  10. FAIL > BLOCKED: when both FAIL and BLOCKED requirements are present,
-      gate=FAIL. Both failing_ids and blocked_ids are reported.
-  11. GIT-REF/BRANCH VALIDATION + SHELL-FREE: branch names only
-      [A-Za-z0-9._/-], max 200 chars, no '..', no NULL, no newlines. commit_sha
-      is exactly 40 hex chars. All subprocess calls use list args, shell=False.
-      No os.system, no eval/exec, no tempfile writes.
-  12. PRODUCTION ALLOWLIST + SYMLINK ESCAPE: --base-dir must resolve under one
-      of PATH_ALLOWLIST_PREFIXES. Every path inside a check is resolved with
-      os.path.realpath() and the realpath is checked against the allowlist. A
-      symlink that escapes the allowlist → FAIL with path_not_allowlisted.
+  1. EN AUKTORITET: The requirements manifest is the single semantic authority.
+     No hardcoded REQUIREMENT_SEMANTICS table in Python. CIC reads requirement
+     texts, source_hash, check type, and all_of structure from the manifest.
+  2. TRUST-GRÄNS: CLI/default mode has no trusted trust context and therefore
+     NEVER sets closeout_permitted=true. An injectable TrustContext protocol
+     allows future harness integration. Without verified trust context: fail-
+     closed, closeout_permitted=false. Test-only fake verifier via DI, never
+     exposed via CLI.
+  3. MANIFESTBINDNING: A verified trust context binds the exact manifest
+     bytes/digest. Any change to ID, text, source_hash, check type, all_of
+     structure, or check arguments changes the digest and gives
+     manifest_tampered. Without trust context: fail-closed, no PASS.
+  4. STRICT TEST RECEIPTS: Exact strict schema (additionalProperties=false
+     equivalent) with required fields: requirement_id, check_id, branch, commit,
+     result (exactly "pass"), timestamp (valid ISO-8601 UTC, NO freshness
+     window), output_path (required, must exist within base_dir), output_hash
+     (sha256, recomputed from artefact), receipt_hash (sha256, recomputed from
+     receipt bytes). Mismatch, missing field, or untrusted receipt binding → FAIL.
+  5. OWNER RECEIPTS: Without trust context, owner decision receipts ALWAYS give
+     BLOCKED in production/CLI mode, never authorized from self-declared JSON.
+     Test-only trust context can authorize for test purposes only.
+  6. FAS-A-012: all_of of technical current-truth evidence (file_sha256) and
+     separate owner decision (owner_decision_receipt). Missing technical = FAIL;
+     missing owner trust = BLOCKED; FAIL has priority; both ID lists reported.
+  7. INGA PÅHITTADE IMPLEMENTATION PATHS: Neutral evidence-receipt-paths under
+     control-plane/evidence/ in the manifest. No hardcoded paths to
+     gateway/channel_route_contract.py, scripts/fleet_collector.py, etc.
+  8. PATH CONTAINMENT: Manifest, schema, receipts, and output artefacts bound to
+     exact realpath(base_dir). Sibling worktrees, absolute paths outside base_dir,
+     traversal, and symlink-escape are rejected. PATH_ALLOWLIST_PREFIXES replaced
+     with base_dir-containment.
+  9. GIT REF: Branch/ref validated with git check-ref-format semantics, shell=False,
+     list-args. Rejects leading dash, leading slash, --help, -x, .., control chars.
+  10. STATUS: Technical errors → FAIL. Genuine missing owner/harness trust →
+      BLOCKED. FAIL has priority over BLOCKED and both lists are always preserved.
+      Without trusted trust, closeout_permitted is never true.
 
 Output: a single JSON object on stdout. Exit 0 = PASS, 1 = FAIL, 2 = BLOCKED.
 Deterministic: identical inputs produce identical output across runs.
@@ -67,22 +62,13 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import yaml
 
 # ── Hard-coded constants (never read from YAML) ─────────────────────────────
 
 GIT_REPO = "/Users/ai/.hermes/hermes-agent"
-
-# Path allowlist for --base-dir, file_sha256 / receipt_path / schema_valid
-# paths. Any path whose realpath does NOT start with one of these prefixes →
-# FAIL with path_not_allowlisted. The realpath check guards against symlink
-# escapes: a symlink inside the worktree that points to /etc/passwd is rejected.
-PATH_ALLOWLIST_PREFIXES = (
-    "/Users/ai/.hermes/worktrees/kmros-",
-    "/Users/ai/Dropbox/FILIP KILLANDER/repository/the-terminal-worktrees/kmros-",
-)
 
 # Canonical ID set — exactly these 13 IDs, no more, no less, no duplicates.
 CANONICAL_REQUIREMENT_IDS = frozenset(
@@ -103,16 +89,6 @@ ALLOWED_CHECK_TYPES = {
 # Shell metacharacters that must never appear in a check argument.
 SHELL_METACHARACTERS = (";", "|", "$(", "`")
 
-# Owner-id placeholders that always yield BLOCKED for owner_decision_receipt.
-OWNER_PLACEHOLDER_VALUES = {
-    "",
-    "PENDING_OWNER_DECISION",
-    "PENDING",
-    "TBD",
-    "TODO",
-    "NONE",
-}
-
 # Deterministic expected outcome per check type (krav 3). The CIC compares the
 # computed actual against this — never against a YAML `expected` field.
 DETERMINISTIC_EXPECTED = {
@@ -125,18 +101,60 @@ DETERMINISTIC_EXPECTED = {
     "all_of": "all_pass",
 }
 
-# Receipt timestamp freshness window (seconds). A test receipt with a
-# timestamp older than this window → FAIL with stale_timestamp.
-RECEIPT_TIMESTAMP_WINDOW_SECONDS = 24 * 3600  # 24 hours
+# Required fields in a test receipt (strict, additionalProperties=false equivalent).
+# No freshness window — timestamp must be valid ISO-8601 UTC but age is not checked.
+REQUIRED_RECEIPT_FIELDS = frozenset({
+    "requirement_id",
+    "check_id",
+    "branch",
+    "commit",
+    "result",
+    "timestamp",
+    "output_path",
+    "output_hash",
+    "receipt_hash",
+})
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-# Branch/ref name: only [A-Za-z0-9._/-], max 200 chars, no '..', no NULL, no
-# newlines. (The character class already excludes control chars and whitespace.)
-_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+
+
+# ── TrustContext protocol (krav 2) ──────────────────────────────────────────
+
+
+@runtime_checkable
+class TrustContext(Protocol):
+    """Injectable trust context for the CIC.
+
+    Production CLI has no trust context (None default). Without trust context,
+    the CIC is fail-closed: closeout_permitted is never true.
+
+    A real trust provider (future harness) will implement this interface to:
+    - verify_manifest_digest: verify the manifest digest matches an approved digest.
+    - verify_receipt_binding: verify a receipt's binding is trusted.
+    - verify_owner_decision: verify an owner decision is authorized.
+
+    The actual trust verifier and owner provisioning are NOT implemented in this
+    candidate. Test-only fake verifiers implement this protocol via DI in tests.
+    """
+
+    def verify_manifest_digest(self, digest: str) -> bool:
+        """Return True iff the manifest digest matches an approved digest."""
+        ...
+
+    def verify_receipt_binding(
+        self, receipt_hash: str, requirement_id: str, check_id: str
+    ) -> bool:
+        """Return True iff the receipt binding is trusted."""
+        ...
+
+    def verify_owner_decision(self, owner_id: str, receipt: dict) -> bool:
+        """Return True iff the owner decision is authorized."""
+        ...
 
 
 # ── Data model ──────────────────────────────────────────────────────────────
+
 
 @dataclass
 class CheckResult:
@@ -149,6 +167,7 @@ class CheckResult:
     expected: str
     reason: str = ""
 
+
 @dataclass
 class GateResult:
     """Top-level gate result."""
@@ -156,9 +175,10 @@ class GateResult:
     gate: str  # "PASS" | "FAIL" | "BLOCKED"
     manifest_id: str
     manifest_hash: str
-    manifest_hash_matches: bool
+    manifest_verified: bool
     schema_valid: bool
     id_set_valid: bool
+    trust_context_present: bool
     results: list = field(default_factory=list)
     failing_ids: list = field(default_factory=list)
     blocked_ids: list = field(default_factory=list)
@@ -170,9 +190,10 @@ class GateResult:
             "gate": self.gate,
             "manifest_id": self.manifest_id,
             "manifest_hash": self.manifest_hash,
-            "manifest_hash_matches": self.manifest_hash_matches,
+            "manifest_verified": self.manifest_verified,
             "schema_valid": self.schema_valid,
             "id_set_valid": self.id_set_valid,
+            "trust_context_present": self.trust_context_present,
             "results": [
                 {
                     "requirement_id": r.requirement_id,
@@ -216,12 +237,14 @@ def _check_args_for_metachars(check: dict) -> str | None:
     return None
 
 
-def validate_path(path_str: str, base_dir: Path | None = None) -> tuple[bool, str, str | None]:
-    """Validate ``path_str`` against the path allowlist using realpath.
+def validate_path(path_str: str, base_dir: Path) -> tuple[bool, str, str | None]:
+    """Validate ``path_str`` is within ``base_dir`` using realpath (krav 8).
 
-    Returns ``(ok, resolved_or_error, real_path)``. ``base_dir`` resolves
-    relative paths. realpath is used so symlinks that escape the allowlist
-    are rejected (krav 8, 12).
+    Returns ``(ok, resolved_or_error, real_path)``. ``base_dir`` is REQUIRED.
+    realpath resolves symlinks AND normalizes '..' segments. A path is inside
+    base_dir iff realpath(path) equals realpath(base_dir) or starts with
+    realpath(base_dir) + "/". Sibling worktrees, absolute paths outside base_dir,
+    traversal, and symlink-escape are rejected with path_not_in_base_dir.
     """
     if not isinstance(path_str, str) or not path_str:
         return False, "empty_path", None
@@ -231,34 +254,22 @@ def validate_path(path_str: str, base_dir: Path | None = None) -> tuple[bool, st
         return False, "control_char_in_path", None
 
     candidate = Path(path_str)
-    if not candidate.is_absolute() and base_dir is not None:
+    if not candidate.is_absolute():
         candidate = base_dir / candidate
+
     try:
-        # realpath resolves symlinks AND normalizes '..' segments. strict=False
-        # lets us validate paths for files that may not yet exist (e.g.
-        # receipts that have not been produced). os.path.realpath does not
-        # raise on missing paths.
         real_str = os.path.realpath(str(candidate))
+        base_real = os.path.realpath(str(base_dir))
     except (OSError, RuntimeError) as exc:
         return False, f"path_resolution_error:{exc}", None
 
-    for prefix in PATH_ALLOWLIST_PREFIXES:
-        # A path is inside an allowlisted root iff it equals the prefix OR
-        # continues right after the prefix with a path boundary. The prefix
-        # may itself end with a separator (e.g. ".../kmros-") — in that case the
-        # prefix is already a boundary and we accept anything that starts with
-        # it. Otherwise (prefix is a directory root without trailing slash),
-        # the next char in the real path must be "/".
-        if real_str == prefix:
-            return True, real_str, real_str
-        if real_str.startswith(prefix):
-            # Boundary: either the prefix ends with "/" or "-", or the next
-            # character in real_str is a path separator.
-            if prefix.endswith("/") or prefix.endswith("-"):
-                return True, real_str, real_str
-            if len(real_str) > len(prefix) and real_str[len(prefix)] == "/":
-                return True, real_str, real_str
-    return False, "path_not_allowlisted", None
+    # A path is inside base_dir iff it equals base_real OR continues right
+    # after base_real with a path separator.
+    if real_str == base_real:
+        return True, real_str, real_str
+    if real_str.startswith(base_real + "/"):
+        return True, real_str, real_str
+    return False, "path_not_in_base_dir", None
 
 
 def validate_commit_sha(sha: str) -> bool:
@@ -270,14 +281,53 @@ def validate_sha256(value: str) -> bool:
 
 
 def validate_branch_name(name: str) -> bool:
-    """Branch/ref name: [A-Za-z0-9._/-], max 200 chars, no '..', no NULL, no newlines."""
-    if not isinstance(name, str):
+    """Validate branch/ref name using git check-ref-format (krav 9).
+
+    Uses subprocess.run with shell=False and list args. Returns True iff
+    git check-ref-format --branch <name> exits 0. Falls back to regex
+    if git is not available. Rejects leading dash, leading slash, --help,
+    -x, .., control chars, and other invalid refs.
+    """
+    if not isinstance(name, str) or not name:
         return False
     if ".." in name:
         return False
     if "\x00" in name or "\n" in name:
         return False
-    return bool(_BRANCH_RE.match(name))
+    # Leading dash or slash rejected (git check-ref-format rejects these).
+    if name.startswith("-") or name.startswith("/"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "check-ref-format", "--branch", name],
+            shell=False,
+            capture_output=True,
+        )
+        return proc.returncode == 0
+    except (OSError, FileNotFoundError):
+        # Fallback: regex that rejects leading [-/], .., control chars.
+        return bool(re.match(r"^[A-Za-z0-9._][A-Za-z0-9._/-]{0,199}$", name))
+
+
+def validate_iso_timestamp(ts: str) -> bool:
+    """Validate that ``ts`` is a valid ISO-8601 UTC timestamp (krav 4).
+
+    No freshness window — the timestamp must be valid ISO-8601 UTC but age
+    is NOT checked. Commit-bound evidence must NOT be invalidated merely
+    because 24 hours have passed; live-freshness belongs to later harness gates.
+    """
+    if not isinstance(ts, str) or not ts:
+        return False
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        return False  # Not explicitly UTC
+    return dt.utcoffset() == _dt.timedelta(0)
 
 
 # ── Hash helpers ────────────────────────────────────────────────────────────
@@ -299,7 +349,19 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-# ── Schema validation (krav 2) ─────────────────────────────────────────────
+def _compute_receipt_hash(data: dict) -> str:
+    """Compute the receipt hash from receipt data, excluding the receipt_hash field.
+
+    The receipt_hash is the sha256 of the canonical JSON (sorted keys, compact
+    separators) of the receipt data WITHOUT the receipt_hash field itself. This
+    avoids the self-referential problem and is deterministic.
+    """
+    data_without_hash = {k: v for k, v in data.items() if k != "receipt_hash"}
+    canonical = json.dumps(data_without_hash, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ── Schema validation (krav 1) ──────────────────────────────────────────────
 
 
 def validate_manifest_against_schema(
@@ -323,12 +385,11 @@ def validate_manifest_against_schema(
         return False, f"schema_check_error:{type(exc).__name__}:{exc}"
 
 
-# ── Canonical ID set check (krav 2) ────────────────────────────────────────
+# ── Canonical ID set check ─────────────────────────────────────────────────
 
 
 def validate_canonical_id_set(requirements: list) -> tuple[bool, str, list[str]]:
-    """Return ``(ok, reason, offending_ids)``. ``offending_ids`` lists
-    duplicates, missing, and extra IDs (for diagnostic)."""
+    """Return ``(ok, reason, offending_ids)``."""
     if not isinstance(requirements, list):
         return False, "requirements_not_list", []
     ids = []
@@ -340,7 +401,6 @@ def validate_canonical_id_set(requirements: list) -> tuple[bool, str, list[str]]
     canonical = set(CANONICAL_REQUIREMENT_IDS)
     missing = sorted(canonical - id_set)
     extra = sorted(id_set - canonical)
-    # Duplicates: any id appearing more than once.
     seen = set()
     dupes = []
     for i in ids:
@@ -359,16 +419,11 @@ def validate_canonical_id_set(requirements: list) -> tuple[bool, str, list[str]]
     return True, "", []
 
 
-# ── Check evaluators (shell=False, allowlisted) ────────────────────────────
+# ── Check evaluators (shell=False, base_dir containment) ────────────────────
 
 
 def _git_ancestor(repo: str, commit: str, branch: str, expect_ancestor: bool) -> tuple[str, str]:
-    """Run ``git merge-base --is-ancestor`` with shell=False.
-
-    Returns ``(observed, reason)`` where observed is ``exit_0`` or ``exit_1``
-    (the actual subprocess return code). On a git error (e.g. unknown commit),
-    observed is ``git_error``.
-    """
+    """Run ``git merge-base --is-ancestor`` with shell=False."""
     cmd = ["git", "-C", repo, "merge-base", "--is-ancestor", commit, branch]
     try:
         proc = subprocess.run(cmd, shell=False, capture_output=True, text=True)
@@ -377,34 +432,32 @@ def _git_ancestor(repo: str, commit: str, branch: str, expect_ancestor: bool) ->
     observed = f"exit_{proc.returncode}"
     if expect_ancestor:
         return observed, "" if proc.returncode == 0 else "commit_not_ancestor"
-    # git_not_ancestor: expected exit_1 (commit is NOT an ancestor)
     return observed, "" if proc.returncode == 1 else "commit_is_ancestor"
 
 
-def _file_sha256(path_str: str, expected_sha256: str, base_dir: Path | None) -> tuple[str, str, str | None]:
+def _file_sha256(
+    path_str: str, expected_sha256: str, base_dir: Path
+) -> tuple[str, str, str | None]:
     ok, msg, real = validate_path(path_str, base_dir=base_dir)
     if not ok or real is None:
-        return "path_not_allowlisted", msg, None
+        return "path_not_in_base_dir", msg, None
     if not os.path.exists(real):
         return "missing_file", f"file_not_found:{path_str}", None
-    if os.path.islink(real):
-        # realpath already resolved the link; check the resolved target is
-        # still under an allowlist prefix (defence in depth — validate_path
-        # already does this, but be explicit).
-        pass
     actual = sha256_file(real)
     observed = "match" if actual == expected_sha256 else "mismatch"
     return observed, "" if observed == "match" else f"sha256_mismatch:{actual}", actual
 
 
-def _schema_valid(yaml_path: str, schema_path: str, base_dir: Path | None) -> tuple[str, str]:
+def _schema_valid(
+    yaml_path: str, schema_path: str, base_dir: Path
+) -> tuple[str, str]:
     """Validate a YAML file against a JSON Schema. Returns (observed, reason)."""
     ok_y, msg_y, real_y = validate_path(yaml_path, base_dir=base_dir)
     if not ok_y or real_y is None:
-        return "path_not_allowlisted", f"yaml_path:{msg_y}"
+        return "path_not_in_base_dir", f"yaml_path:{msg_y}"
     ok_s, msg_s, real_s = validate_path(schema_path, base_dir=base_dir)
     if not ok_s or real_s is None:
-        return "path_not_allowlisted", f"schema_path:{msg_s}"
+        return "path_not_in_base_dir", f"schema_path:{msg_s}"
     if not os.path.exists(real_y):
         return "invalid", f"yaml_not_found:{yaml_path}"
     if not os.path.exists(real_s):
@@ -423,10 +476,10 @@ def _schema_valid(yaml_path: str, schema_path: str, base_dir: Path | None) -> tu
         return "invalid", f"schema_check_error:{type(exc).__name__}:{exc}"
 
 
-def _parse_receipt(receipt_path: str, base_dir: Path | None) -> tuple[dict | None, str]:
+def _parse_receipt(receipt_path: str, base_dir: Path) -> tuple[dict | None, str]:
     ok, msg, real = validate_path(receipt_path, base_dir=base_dir)
     if not ok or real is None:
-        return None, f"path_not_allowlisted:{msg}"
+        return None, f"path_not_in_base_dir:{msg}"
     if not os.path.exists(real):
         return None, f"receipt_not_found:{receipt_path}"
     try:
@@ -439,188 +492,184 @@ def _parse_receipt(receipt_path: str, base_dir: Path | None) -> tuple[dict | Non
         return None, f"receipt_parse_error:{type(exc).__name__}:{exc}"
 
 
-def _parse_iso_timestamp(ts: str) -> _dt.datetime | None:
-    """Parse an ISO-8601 timestamp (with optional trailing Z) to aware UTC."""
-    if not isinstance(ts, str) or not ts:
-        return None
-    s = ts.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        dt = _dt.datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_dt.timezone.utc)
-    return dt.astimezone(_dt.timezone.utc)
+def _test_receipt(
+    check: dict, base_dir: Path, requirement_id: str, trust_context: TrustContext | None
+) -> tuple[str, str]:
+    """Verify a test receipt with strict schema and trust binding (krav 4).
 
+    Strict receipt schema (additionalProperties=false equivalent):
+    - requirement_id: required, must match the check's requirement ID
+    - check_id: required, must match expected_check_id
+    - branch: required, git check-ref-format validated
+    - commit: required, 40 hex
+    - result: required, exactly "pass"
+    - timestamp: required, valid ISO-8601 UTC (NO freshness window)
+    - output_path: required, must exist within base_dir
+    - output_hash: required, sha256, recomputed from artefact
+    - receipt_hash: required, sha256, recomputed from receipt bytes
 
-def _timestamp_is_fresh(ts: str, now: _dt.datetime | None = None) -> bool:
-    """Return True iff ``ts`` parses to a UTC instant within the last 24h."""
-    dt = _parse_iso_timestamp(ts)
-    if dt is None:
-        return False
-    if now is None:
-        now = _dt.datetime.now(_dt.timezone.utc)
-    age = (now - dt).total_seconds()
-    return 0 <= age <= RECEIPT_TIMESTAMP_WINDOW_SECONDS
-
-
-def _test_receipt(check: dict, base_dir: Path | None, requirement_id: str) -> tuple[str, str]:
-    """Verify a test receipt binds to expected branch/commit/check_id/timestamp."""
+    Without trust context: untrusted_binding → FAIL (fail-closed).
+    """
     receipt_path = check.get("receipt_path", "")
-    expected_branch = check.get("expected_branch", "")
-    expected_commit = check.get("expected_commit", "")
     expected_check_id = check.get("expected_check_id", "")
 
-    # Reject shell metacharacters in any of these args.
-    for key in ("receipt_path", "expected_branch", "expected_commit", "expected_check_id"):
+    # Reject shell metacharacters in check arguments.
+    for key in ("receipt_path", "expected_check_id"):
         v = check.get(key, "")
         if isinstance(v, str) and _contains_shell_metacharacters(v):
             return "unverified", f"shell_metacharacters_in:{key}"
 
-    # Strict branch validation (krav 11).
-    if not validate_branch_name(expected_branch):
-        return "unverified", f"expected_branch_invalid:{expected_branch}"
-    if not validate_commit_sha(expected_commit):
-        return "unverified", "expected_commit_not_40char_hex"
     if not expected_check_id:
         return "unverified", "expected_check_id_empty"
 
+    # Parse receipt (path must be within base_dir).
     data, err = _parse_receipt(receipt_path, base_dir=base_dir)
     if data is None:
         return "unverified", err
 
-    required_fields = ("branch", "commit", "check_id", "timestamp", "output_hash")
-    missing = [f for f in required_fields if f not in data]
+    # Strict schema: no extra fields, no missing fields.
+    extra = set(data.keys()) - REQUIRED_RECEIPT_FIELDS
+    if extra:
+        return "unverified", f"receipt_extra_fields:{','.join(sorted(extra))}"
+    missing = REQUIRED_RECEIPT_FIELDS - set(data.keys())
     if missing:
-        return "unverified", f"receipt_missing_fields:{','.join(missing)}"
+        return "unverified", f"receipt_missing_fields:{','.join(sorted(missing))}"
 
-    if data.get("branch") != expected_branch:
-        return "unverified", f"branch_mismatch:{data.get('branch')}"
-    if data.get("commit") != expected_commit:
-        return "unverified", f"commit_mismatch:{data.get('commit')}"
-    if data.get("check_id") != expected_check_id:
+    # requirement_id must match the check's requirement ID.
+    if str(data.get("requirement_id", "")) != requirement_id:
+        return "unverified", f"requirement_id_mismatch:{data.get('requirement_id')}"
+
+    # check_id must match expected_check_id from the manifest.
+    if str(data.get("check_id", "")) != expected_check_id:
         return "unverified", f"check_id_mismatch:{data.get('check_id')}"
-    if not validate_sha256(str(data.get("output_hash", ""))):
+
+    # branch must be valid (git check-ref-format).
+    branch = str(data.get("branch", ""))
+    if not validate_branch_name(branch):
+        return "unverified", f"branch_invalid:{branch}"
+
+    # commit must be 40 hex.
+    commit = str(data.get("commit", ""))
+    if not validate_commit_sha(commit):
+        return "unverified", "commit_not_40char_hex"
+
+    # result must be exactly "pass".
+    if str(data.get("result", "")) != "pass":
+        return "unverified", f"result_not_pass:{data.get('result')}"
+
+    # timestamp must be valid ISO-8601 UTC (NO freshness window).
+    timestamp = str(data.get("timestamp", ""))
+    if not validate_iso_timestamp(timestamp):
+        return "unverified", "timestamp_invalid"
+
+    # output_path must be within base_dir and exist.
+    output_path = str(data.get("output_path", ""))
+    ok_op, msg_op, real_op = validate_path(output_path, base_dir=base_dir)
+    if not ok_op or real_op is None:
+        return "unverified", f"output_path_not_in_base_dir:{msg_op}"
+    if not os.path.exists(real_op):
+        return "unverified", f"output_artefact_not_found:{output_path}"
+
+    # output_hash must be sha256 and match recomputed hash of the artefact.
+    output_hash = str(data.get("output_hash", ""))
+    if not validate_sha256(output_hash):
         return "unverified", "output_hash_not_sha256"
-    # Recompute the output artefact hash from the referenced output_path (if
-    # present) and compare to the declared output_hash. This binds the receipt
-    # to a real artefact whose hash is recomputed every run (krav 9).
-    output_path = data.get("output_path", "")
-    if isinstance(output_path, str) and output_path:
-        ok_op, msg_op, real_op = validate_path(output_path, base_dir=base_dir)
-        if not ok_op or real_op is None:
-            return "unverified", f"output_path_not_allowlisted:{msg_op}"
-        if not os.path.exists(real_op):
-            return "unverified", f"output_artefact_not_found:{output_path}"
-        recomputed = sha256_file(real_op)
-        if recomputed != str(data.get("output_hash", "")):
-            return "unverified", f"output_hash_mismatch:{recomputed}"
-    # Timestamp freshness (krav 9).
-    if not _timestamp_is_fresh(str(data.get("timestamp", ""))):
-        return "unverified", "stale_timestamp"
+    recomputed_output_hash = sha256_file(real_op)
+    if recomputed_output_hash != output_hash:
+        return "unverified", f"output_hash_mismatch:{recomputed_output_hash}"
+
+    # receipt_hash must be sha256 and match recomputed hash of receipt data.
+    receipt_hash = str(data.get("receipt_hash", ""))
+    if not validate_sha256(receipt_hash):
+        return "unverified", "receipt_hash_not_sha256"
+    recomputed_receipt_hash = _compute_receipt_hash(data)
+    if recomputed_receipt_hash != receipt_hash:
+        return "unverified", f"receipt_hash_mismatch:{recomputed_receipt_hash}"
+
+    # Trust binding: receipt binding must be verified by trust context.
+    # Without trust context: untrusted_binding → FAIL (fail-closed).
+    if trust_context is None:
+        return "unverified", "untrusted_binding"
+    if not trust_context.verify_receipt_binding(
+        receipt_hash, requirement_id, str(data.get("check_id", ""))
+    ):
+        return "unverified", "untrusted_binding"
+
     return "verified", ""
 
 
-def _owner_decision_receipt(check: dict, base_dir: Path | None, requirement_id: str) -> tuple[str, str, bool]:
-    """Verify an owner-decision receipt.
+def _owner_decision_receipt(
+    check: dict, base_dir: Path, requirement_id: str, trust_context: TrustContext | None
+) -> tuple[str, str, bool]:
+    """Verify an owner-decision receipt (krav 5).
 
-    Returns ``(observed, reason, is_blocked)``. ``is_blocked`` is True when the
-    owner_id is missing/placeholder OR the receipt lacks an external trust
-    anchor — in those cases the check is BLOCKED, never PASS or FAIL.
+    Returns ``(observed, reason, is_blocked)``.
 
-    Candidate-local JSON alone NEVER counts as Filip-authorisation. The
-    receipt must carry an ``external_attestation`` block with a
-    ``trust_anchor_source`` that is not the candidate's own worktree, and a
-    signature/hash that the CIC can recompute (krav 9).
+    Without trust context: ALWAYS returns ("blocked", "trust_context_missing", True).
+    Candidate-local JSON alone NEVER counts as authorization.
+
+    With trust context: the trust context decides whether to authorize.
+    No trust_anchor_source allowlist validation (no real trust provider exists).
     """
-    owner_id = str(check.get("owner_id", "")).strip()
-    if owner_id in OWNER_PLACEHOLDER_VALUES or owner_id.upper() in {
-        p.upper() for p in OWNER_PLACEHOLDER_VALUES
-    }:
-        return "blocked", f"owner_id_placeholder:{owner_id}", True
+    # Without trust context: always BLOCKED (fail-closed).
+    if trust_context is None:
+        return "blocked", "trust_context_missing", True
 
+    # With trust context: parse receipt and ask trust context to verify.
     receipt_path = check.get("receipt_path", "")
     if isinstance(receipt_path, str) and _contains_shell_metacharacters(receipt_path):
         return "unauthorized", "shell_metacharacters_in:receipt_path", False
 
     data, err = _parse_receipt(receipt_path, base_dir=base_dir)
     if data is None:
-        # Missing receipt for a concrete owner_id is BLOCKED (trust anchor
-        # missing), not FAIL — owner decisions are not technical evidence.
-        return "blocked", f"trust_anchor_missing:{err}", True
+        return "blocked", f"receipt_not_found:{err}", True
 
-    required_fields = ("owner_id", "decision_id", "commit", "branch", "timestamp",
-                       "output_hash", "external_attestation")
-    missing = [f for f in required_fields if f not in data]
-    if missing:
-        return "blocked", f"trust_anchor_missing:fields:{','.join(missing)}", True
-
-    if str(data.get("owner_id", "")).strip() != owner_id:
-        return "unauthorized", f"owner_id_mismatch:{data.get('owner_id')}", False
-
-    # External trust anchor (krav 9). Candidate-local JSON alone is never
-    # enough. The receipt MUST carry an external_attestation with a
-    # ``trust_anchor_source`` outside the candidate worktree and a recomputable
-    # attestation_hash.
-    attestation = data.get("external_attestation")
-    if not isinstance(attestation, dict):
-        return "blocked", "trust_anchor_missing:no_attestation", True
-    tas = str(attestation.get("trust_anchor_source", "")).strip()
-    if not tas or tas == "candidate_local" or tas.startswith("/Users/ai/.hermes/worktrees/"):
-        return "blocked", f"trust_anchor_missing:source:{tas}", True
-    att_hash = str(attestation.get("attestation_hash", ""))
-    if not validate_sha256(att_hash):
-        return "blocked", "trust_anchor_missing:attestation_hash_not_sha256", True
-
-    decision = str(data.get("decision", "")).strip().lower()
-    if decision not in ("approved", "authorized", "accept", "yes"):
-        return "unauthorized", f"decision_not_approved:{decision}", False
-
-    if not validate_commit_sha(str(data.get("commit", ""))):
-        return "unauthorized", "receipt_commit_not_40char_hex", False
-    if not validate_branch_name(str(data.get("branch", ""))):
-        return "unauthorized", "receipt_branch_invalid", False
-    if not validate_sha256(str(data.get("output_hash", ""))):
-        return "unauthorized", "receipt_output_hash_not_sha256", False
-    # Timestamp freshness for owner receipts too.
-    if not _timestamp_is_fresh(str(data.get("timestamp", ""))):
-        return "unauthorized", "stale_timestamp", False
-
-    return "authorized", "", False
+    owner_id = str(check.get("owner_id", "")).strip()
+    if trust_context.verify_owner_decision(owner_id, data):
+        return "authorized", "", False
+    return "blocked", "owner_decision_not_authorized", True
 
 
 # ── Per-requirement evaluation ─────────────────────────────────────────────
 
 
-def _evaluate_single_check(rid: str, check: dict, base_dir: Path | None) -> CheckResult:
+def _evaluate_single_check(
+    rid: str, check: dict, base_dir: Path, trust_context: TrustContext | None
+) -> CheckResult:
     """Evaluate one check dict (NOT all_of — caller handles all_of separately).
 
-    The expected value is derived deterministically from the check type
-    (krav 3). owner_decision_receipt is the only type that can return BLOCKED.
+    The expected value is derived deterministically from the check type.
+    owner_decision_receipt is the only type that can return BLOCKED.
     """
     ctype = check.get("type", "")
     expected = DETERMINISTIC_EXPECTED.get(ctype, "")
 
     if ctype not in ALLOWED_CHECK_TYPES:
-        return CheckResult(rid, ctype, "fail", "unknown_check_type", expected,
-                           f"unknown_check_type:{ctype}")
+        return CheckResult(
+            rid, ctype, "fail", "unknown_check_type", expected,
+            f"unknown_check_type:{ctype}",
+        )
 
     offender = _check_args_for_metachars(check)
     if offender is not None:
-        return CheckResult(rid, ctype, "fail", "shell_metacharacters_detected",
-                           expected, f"shell_metacharacters_in:{offender}")
+        return CheckResult(
+            rid, ctype, "fail", "shell_metacharacters_detected",
+            expected, f"shell_metacharacters_in:{offender}",
+        )
 
     if ctype == "git_ancestor":
         branch = check.get("branch", "")
         commit = check.get("commit_sha", "")
         if not validate_branch_name(branch):
-            return CheckResult(rid, ctype, "fail", "invalid_branch", expected,
-                               f"branch_invalid:{branch}")
+            return CheckResult(
+                rid, ctype, "fail", "invalid_branch", expected,
+                f"branch_invalid:{branch}",
+            )
         if not validate_commit_sha(commit):
-            return CheckResult(rid, ctype, "fail", "invalid_commit_sha", expected,
-                               f"commit_sha_not_40char_hex:{commit}")
+            return CheckResult(
+                rid, ctype, "fail", "invalid_commit_sha", expected,
+                f"commit_sha_not_40char_hex:{commit}",
+            )
         observed, reason = _git_ancestor(GIT_REPO, commit, branch, expect_ancestor=True)
         status = "pass" if observed == expected else "fail"
         return CheckResult(rid, ctype, status, observed, expected, reason)
@@ -629,11 +678,15 @@ def _evaluate_single_check(rid: str, check: dict, base_dir: Path | None) -> Chec
         branch = check.get("branch", "")
         commit = check.get("commit_sha", "")
         if not validate_branch_name(branch):
-            return CheckResult(rid, ctype, "fail", "invalid_branch", expected,
-                               f"branch_invalid:{branch}")
+            return CheckResult(
+                rid, ctype, "fail", "invalid_branch", expected,
+                f"branch_invalid:{branch}",
+            )
         if not validate_commit_sha(commit):
-            return CheckResult(rid, ctype, "fail", "invalid_commit_sha", expected,
-                               f"commit_sha_not_40char_hex:{commit}")
+            return CheckResult(
+                rid, ctype, "fail", "invalid_commit_sha", expected,
+                f"commit_sha_not_40char_hex:{commit}",
+            )
         observed, reason = _git_ancestor(GIT_REPO, commit, branch, expect_ancestor=False)
         status = "pass" if observed == expected else "fail"
         return CheckResult(rid, ctype, status, observed, expected, reason)
@@ -641,9 +694,14 @@ def _evaluate_single_check(rid: str, check: dict, base_dir: Path | None) -> Chec
     if ctype == "file_sha256":
         path_str = check.get("path", "")
         exp = check.get("expected_sha256", "")
-        if not validate_sha256(exp):
-            return CheckResult(rid, ctype, "fail", "invalid_expected_sha256", expected,
-                               f"expected_sha256_not_64char_hex:{exp}")
+        # PENDING_EVIDENCE is a valid placeholder (schema allows it). It is
+        # never a real sha256, so any existing file will mismatch and a missing
+        # file gives missing_file — either way FAIL (krav 6, 7).
+        if exp != "PENDING_EVIDENCE" and not validate_sha256(exp):
+            return CheckResult(
+                rid, ctype, "fail", "invalid_expected_sha256", expected,
+                f"expected_sha256_not_64char_hex:{exp}",
+            )
         observed, reason, _actual = _file_sha256(path_str, exp, base_dir=base_dir)
         status = "pass" if observed == expected else "fail"
         return CheckResult(rid, ctype, status, observed, expected, reason)
@@ -658,13 +716,15 @@ def _evaluate_single_check(rid: str, check: dict, base_dir: Path | None) -> Chec
         return CheckResult(rid, ctype, status, observed, expected, reason)
 
     if ctype == "test_receipt":
-        observed, reason = _test_receipt(check, base_dir=base_dir, requirement_id=rid)
+        observed, reason = _test_receipt(
+            check, base_dir=base_dir, requirement_id=rid, trust_context=trust_context
+        )
         status = "pass" if observed == expected else "fail"
         return CheckResult(rid, ctype, status, observed, expected, reason)
 
     if ctype == "owner_decision_receipt":
         observed, reason, is_blocked = _owner_decision_receipt(
-            check, base_dir=base_dir, requirement_id=rid
+            check, base_dir=base_dir, requirement_id=rid, trust_context=trust_context
         )
         if is_blocked:
             return CheckResult(rid, ctype, "blocked", observed, expected, reason)
@@ -675,35 +735,38 @@ def _evaluate_single_check(rid: str, check: dict, base_dir: Path | None) -> Chec
     return CheckResult(rid, ctype, "fail", "unreachable", expected, "unreachable_branch")
 
 
-def _evaluate_all_of(rid: str, check: dict, base_dir: Path | None) -> CheckResult:
-    """Evaluate an all_of composite: every sub-check must pass (krav 5).
+def _evaluate_all_of(
+    rid: str, check: dict, base_dir: Path, trust_context: TrustContext | None
+) -> CheckResult:
+    """Evaluate an all_of composite: every sub-check must pass (krav 6).
 
     Sub-checks are evaluated strictly. owner_decision_receipt inside all_of
-    returns BLOCKED only for that sub-check — and per krav 10, if ANY sub-check
-    FAILs, the whole requirement is FAIL (FAIL > BLOCKED). If no sub-check FAILs
-    but some BLOCK, the requirement is BLOCKED.
+    returns BLOCKED only for that sub-check. If ANY sub-check FAILs, the whole
+    requirement is FAIL (FAIL > BLOCKED). If no sub-check FAILs but some BLOCK,
+    the requirement is BLOCKED.
     """
     expected = DETERMINISTIC_EXPECTED["all_of"]
     sub_checks = check.get("checks", [])
     if not isinstance(sub_checks, list) or not sub_checks:
-        return CheckResult(rid, "all_of", "fail", "no_sub_checks", expected,
-                           "all_of_empty")
+        return CheckResult(
+            rid, "all_of", "fail", "no_sub_checks", expected, "all_of_empty"
+        )
     sub_results: list[CheckResult] = []
     any_fail = False
     any_blocked = False
     reasons: list[str] = []
     for sub in sub_checks:
         if not isinstance(sub, dict):
-            sub_results.append(CheckResult(rid, "all_of", "fail", "sub_not_dict",
-                                            expected, "sub_check_not_dict"))
+            sub_results.append(
+                CheckResult(rid, "all_of", "fail", "sub_not_dict", expected, "sub_check_not_dict")
+            )
             any_fail = True
             continue
         sub_rid = f"{rid}::sub{len(sub_results)}"
-        # Nested all_of is allowed by the schema; recurse.
         if sub.get("type") == "all_of":
-            sr = _evaluate_all_of(sub_rid, sub, base_dir=base_dir)
+            sr = _evaluate_all_of(sub_rid, sub, base_dir=base_dir, trust_context=trust_context)
         else:
-            sr = _evaluate_single_check(sub_rid, sub, base_dir=base_dir)
+            sr = _evaluate_single_check(sub_rid, sub, base_dir=base_dir, trust_context=trust_context)
         sub_results.append(sr)
         if sr.status == "fail":
             any_fail = True
@@ -712,22 +775,26 @@ def _evaluate_all_of(rid: str, check: dict, base_dir: Path | None) -> CheckResul
             any_blocked = True
             reasons.append(f"{sub_rid}:{sr.reason}")
     if any_fail:
-        return CheckResult(rid, "all_of", "fail", "not_all_pass", expected,
-                            "|".join(reasons))
+        return CheckResult(
+            rid, "all_of", "fail", "not_all_pass", expected, "|".join(reasons)
+        )
     if any_blocked:
-        return CheckResult(rid, "all_of", "blocked", "sub_blocked", expected,
-                            "|".join(reasons))
+        return CheckResult(
+            rid, "all_of", "blocked", "sub_blocked", expected, "|".join(reasons)
+        )
     return CheckResult(rid, "all_of", "pass", "all_pass", expected, "")
 
 
-def evaluate_requirement(req: dict, base_dir: Path | None) -> CheckResult:
+def evaluate_requirement(
+    req: dict, base_dir: Path, trust_context: TrustContext | None = None
+) -> CheckResult:
     rid = req.get("id", "<unknown>")
     check = req.get("check", {}) or {}
     ctype = check.get("type", "") if isinstance(check, dict) else ""
 
     if ctype == "all_of":
-        return _evaluate_all_of(rid, check, base_dir=base_dir)
-    return _evaluate_single_check(rid, check, base_dir=base_dir)
+        return _evaluate_all_of(rid, check, base_dir=base_dir, trust_context=trust_context)
+    return _evaluate_single_check(rid, check, base_dir=base_dir, trust_context=trust_context)
 
 
 # ── Manifest source-hash verification ──────────────────────────────────────
@@ -751,127 +818,140 @@ def verify_source_hashes(manifest: dict) -> list[str]:
 def run_gate(
     manifest_path: str,
     base_dir: Path | None = None,
-    expected_manifest_hash: str | None = None,
+    trust_context: TrustContext | None = None,
     schema_path: str | None = None,
 ) -> GateResult:
     """Run the integrity gate and return a GateResult.
 
-    ``base_dir`` is the worktree root for resolving relative paths.
-    ``expected_manifest_hash`` is the EXTERNAL trust anchor for closeout
-    (krav 7). Without it, gate is NEVER PASS / closeout_permitted NEVER true.
+    ``base_dir`` is the worktree root for resolving relative paths (REQUIRED).
+    ``trust_context`` is the injectable trust anchor for closeout. Without it,
+    the CIC is fail-closed: closeout_permitted is never true.
     ``schema_path`` defaults to ``base_dir / control-plane/fas-a-requirements.schema.json``.
     """
-    # Resolve manifest path.
-    real_manifest = manifest_path
-    if not os.path.isabs(real_manifest) and base_dir is not None:
-        real_manifest = str((base_dir / real_manifest).resolve(strict=False))
-    if not os.path.exists(real_manifest):
+    # base_dir is required (krav 8).
+    if base_dir is None:
         return GateResult(
             gate="FAIL", manifest_id="", manifest_hash="",
-            manifest_hash_matches=False, schema_valid=False, id_set_valid=False,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=False, reason="base_dir_required",
+        )
+
+    # Validate manifest path is within base_dir (krav 8).
+    ok_m, msg_m, real_m = validate_path(manifest_path, base_dir=base_dir)
+    if not ok_m or real_m is None:
+        return GateResult(
+            gate="FAIL", manifest_id="", manifest_hash="",
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
+            reason=f"manifest_not_in_base_dir:{msg_m}",
+        )
+
+    if not os.path.exists(real_m):
+        return GateResult(
+            gate="FAIL", manifest_id="", manifest_hash="",
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason=f"manifest_not_found:{manifest_path}",
         )
 
-    # Read manifest bytes.
+    # Read manifest bytes and compute sha256 of the raw bytes (krav 3).
     try:
-        with open(real_manifest, "rb") as fh:
-            raw_text_bytes = fh.read()
+        with open(real_m, "rb") as fh:
+            raw_bytes = fh.read()
     except OSError as exc:
         return GateResult(
             gate="FAIL", manifest_id="", manifest_hash="",
-            manifest_hash_matches=False, schema_valid=False, id_set_valid=False,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason=f"manifest_read_error:{exc}",
         )
-    raw_text = raw_text_bytes.decode("utf-8", errors="replace")
-    m_hash = sha256_text(raw_text)
+    m_hash = sha256_bytes(raw_bytes)
 
-    # Empty/truncated manifest → FAIL. (Empty or all-whitespace YAML parses to
-    # None; truncated YAML raises.) Either way we FAIL before evaluation.
+    # Parse YAML.
     try:
-        manifest = yaml.safe_load(raw_text)
+        manifest = yaml.safe_load(raw_bytes.decode("utf-8", errors="replace"))
     except yaml.YAMLError as exc:
         return GateResult(
             gate="FAIL", manifest_id="", manifest_hash=m_hash,
-            manifest_hash_matches=False, schema_valid=False, id_set_valid=False,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason=f"manifest_not_yaml:{type(exc).__name__}:{exc}",
         )
     if manifest is None:
         return GateResult(
             gate="FAIL", manifest_id="", manifest_hash=m_hash,
-            manifest_hash_matches=False, schema_valid=False, id_set_valid=False,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason="manifest_empty",
         )
     if not isinstance(manifest, dict):
         return GateResult(
             gate="FAIL", manifest_id="", manifest_hash=m_hash,
-            manifest_hash_matches=False, schema_valid=False, id_set_valid=False,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason="manifest_not_yaml_mapping",
         )
 
     manifest_id = manifest.get("manifest_id", "")
 
-    # krav 2: schema validation BEFORE evaluation. The schema itself lives
-    # under the worktree (allowlisted via base_dir).
+    # Schema validation BEFORE evaluation (krav 1).
     if schema_path is None:
-        if base_dir is not None:
-            schema_path = str(base_dir / "control-plane" / "fas-a-requirements.schema.json")
-        else:
-            schema_path = "control-plane/fas-a-requirements.schema.json"
+        schema_path = str(base_dir / "control-plane" / "fas-a-requirements.schema.json")
+    # Validate schema path is within base_dir (krav 8).
+    ok_sch, msg_sch, _ = validate_path(schema_path, base_dir=base_dir)
+    if not ok_sch:
+        return GateResult(
+            gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
+            reason=f"schema_not_in_base_dir:{msg_sch}",
+        )
     ok_s, err_s = validate_manifest_against_schema(manifest, schema_path)
-    # Allow schema_path to be resolved via base_dir for the file-exists check.
     if not ok_s and err_s.startswith("schema_not_found:") and base_dir is not None:
-        # Try resolving the schema path relative to base_dir.
         alt_schema = str(base_dir / schema_path) if not os.path.isabs(schema_path) else schema_path
         ok_s, err_s = validate_manifest_against_schema(manifest, alt_schema)
     if not ok_s:
         return GateResult(
             gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
-            manifest_hash_matches=False, schema_valid=False, id_set_valid=False,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason=f"schema_invalid:{err_s}",
         )
 
-    # krav 2: canonical ID set — exactly FAS-A-001..013.
+    # Canonical ID set — exactly FAS-A-001..013.
     ok_ids, err_ids, _off = validate_canonical_id_set(manifest.get("requirements", []))
     if not ok_ids:
         return GateResult(
             gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
-            manifest_hash_matches=False, schema_valid=True, id_set_valid=False,
+            manifest_verified=False, schema_valid=True, id_set_valid=False,
+            trust_context_present=trust_context is not None,
             reason=f"id_set_invalid:{err_ids}",
         )
 
-    # krav 7: external manifest hash. Without --expected-manifest-hash, gate is
-    # NEVER PASS. A mismatch → FAIL with manifest_tampered.
-    if expected_manifest_hash is None:
-        # Read-only inspection path: gate=FAIL (not PASS), closeout blocked.
-        # We still evaluate requirements so failing_ids/blocked_ids are
-        # populated for diagnostics, but closeout_permitted stays False.
-        hash_matches = False
-        manifest_tampered = False
-    else:
-        if not validate_sha256(expected_manifest_hash):
+    # Manifest binding (krav 3): trust context verifies manifest digest.
+    # Without trust context: can compute digest but can't verify → manifest_verified=False.
+    if trust_context is not None:
+        manifest_verified = trust_context.verify_manifest_digest(m_hash)
+        if not manifest_verified:
+            # Manifest tampered: digest doesn't match approved digest → FAIL.
             return GateResult(
                 gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
-                manifest_hash_matches=False, schema_valid=True, id_set_valid=True,
-                reason=f"expected_manifest_hash_not_sha256:{expected_manifest_hash}",
+                manifest_verified=False, schema_valid=True, id_set_valid=True,
+                trust_context_present=True,
+                reason="manifest_tampered",
             )
-        hash_matches = (m_hash == expected_manifest_hash)
-        manifest_tampered = not hash_matches
+    else:
+        manifest_verified = False
 
     # Source-hash drift → FAIL (text was edited after pinning).
     source_mismatches = verify_source_hashes(manifest)
     if source_mismatches:
         return GateResult(
             gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
-            manifest_hash_matches=hash_matches, schema_valid=True, id_set_valid=True,
+            manifest_verified=manifest_verified, schema_valid=True, id_set_valid=True,
+            trust_context_present=trust_context is not None,
             reason=f"source_hash_mismatch:{','.join(source_mismatches)}",
             failing_ids=source_mismatches,
-        )
-
-    if manifest_tampered:
-        return GateResult(
-            gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
-            manifest_hash_matches=False, schema_valid=True, id_set_valid=True,
-            reason="manifest_tampered",
         )
 
     # Evaluate every requirement.
@@ -880,14 +960,15 @@ def run_gate(
     blocked_ids: list[str] = []
 
     for req in manifest.get("requirements", []):
-        result = evaluate_requirement(req, base_dir=base_dir)
+        result = evaluate_requirement(req, base_dir=base_dir, trust_context=trust_context)
         results.append(result)
         if result.status == "fail":
             failing_ids.append(result.requirement_id)
         elif result.status == "blocked":
             blocked_ids.append(result.requirement_id)
 
-    # krav 10: FAIL > BLOCKED. When both present, gate=FAIL; both lists reported.
+    # Gate logic (krav 10): FAIL > BLOCKED > PASS.
+    # closeout_permitted=true only if gate=PASS (which requires trust context).
     if failing_ids:
         gate = "FAIL"
         reason = f"failed_requirements:{','.join(failing_ids)}"
@@ -897,24 +978,25 @@ def run_gate(
         reason = f"blocked_requirements:{','.join(blocked_ids)}"
         closeout_permitted = False
     else:
-        # No fails, no blocks. PASS only if the external manifest hash was
-        # supplied and matches (krav 7). Without it, NEVER PASS.
-        if expected_manifest_hash is not None and hash_matches:
+        # No fails, no blocks. PASS only if trust context verified the manifest.
+        if trust_context is not None and manifest_verified:
             gate = "PASS"
             reason = "all_requirements_pass"
             closeout_permitted = True
         else:
+            # Without trust context: fail-closed (even if all technical reqs pass).
             gate = "FAIL"
-            reason = "expected_manifest_hash_missing"
+            reason = "trust_context_missing"
             closeout_permitted = False
 
     return GateResult(
         gate=gate,
         manifest_id=manifest_id,
         manifest_hash=m_hash,
-        manifest_hash_matches=hash_matches,
+        manifest_verified=manifest_verified,
         schema_valid=True,
         id_set_valid=True,
+        trust_context_present=trust_context is not None,
         results=results,
         failing_ids=failing_ids,
         blocked_ids=blocked_ids,
@@ -928,29 +1010,55 @@ def run_gate(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fas A completion-integrity-gate (read-only, deterministic)."
+        description="Fas A completion-integrity-gate (read-only, deterministic, fail-closed)."
     )
-    parser.add_argument("--manifest", required=True,
-                        help="Path to fas-a-requirements.yaml")
-    parser.add_argument("--base-dir", default=".",
-                        help="Worktree root for resolving relative check paths.")
-    parser.add_argument("--expected-manifest-hash", default=None,
-                        help="External trust anchor: expected sha256 of the manifest "
-                             "file. Without this, gate is NEVER PASS / "
-                             "closeout_permitted is NEVER true. A mismatch → "
-                             "FAIL with manifest_tampered.")
-    parser.add_argument("--schema-path", default=None,
-                        help="Override path to the JSON Schema (defaults to "
-                             "<base-dir>/control-plane/fas-a-requirements.schema.json).")
-    parser.add_argument("--json", action="store_true", default=True,
-                        help="Emit JSON to stdout (default).")
+    parser.add_argument(
+        "--manifest", required=True,
+        help="Path to fas-a-requirements.yaml (must be within --base-dir)."
+    )
+    parser.add_argument(
+        "--base-dir", default=".",
+        help="Worktree root for resolving relative check paths. All paths "
+             "(manifest, schema, receipts, output artefacts) must be within "
+             "realpath(base_dir)."
+    )
+    parser.add_argument(
+        "--trust-context-source", default="none",
+        help="Trust context source (default 'none' = fail-closed). No verified "
+             "trust provider is implemented in this candidate; any value other "
+             "than 'none' is still fail-closed. Future harness integration will "
+             "add verified sources."
+    )
+    parser.add_argument(
+        "--expected-manifest-hash", default=None,
+        help="DEPRECATED: read-only informational hash. Does NOT grant PASS. "
+             "Trust anchor provisioning is exclusively via trust context "
+             "(not yet implemented in production CLI)."
+    )
+    parser.add_argument(
+        "--schema-path", default=None,
+        help="Override path to the JSON Schema (must be within --base-dir; "
+             "defaults to <base-dir>/control-plane/fas-a-requirements.schema.json)."
+    )
+    parser.add_argument(
+        "--json", action="store_true", default=True,
+        help="Emit JSON to stdout (default)."
+    )
     args = parser.parse_args(argv)
 
     base_dir = Path(args.base_dir).resolve(strict=False) if args.base_dir else None
+
+    # Production CLI has NO trust context provider (krav 2).
+    # The --trust-context-source flag is accepted but always results in no
+    # trust context, because no verified trust provider exists yet. This is
+    # fail-closed by design. The --expected-manifest-hash flag is read-only
+    # informational and NEVER grants PASS.
+    trust_context = None
+
     result = run_gate(
         manifest_path=args.manifest,
         base_dir=base_dir,
-        expected_manifest_hash=args.expected_manifest_hash,
+        trust_context=trust_context,
         schema_path=args.schema_path,
     )
 
