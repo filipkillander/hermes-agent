@@ -1,0 +1,15 @@
+{
+  "_comment": "Candidate canonical registry for Vendelip #spel channel route-contract (Fas A-3). Fixture-only; NOT installed live. Maps the Discord channel ID to the brief path, required skills, and knowledge root used by the contract tests.",
+  "version": 1,
+  "channels": {
+    "1509925693247459378": {
+      "platform": "discord",
+      "guild": "vendelip",
+      "name": "#spel",
+      "brief_relpath": "vendelip/spel.md",
+      "required_skills": ["sonar-context", "gaming-skill"],
+      "knowledge_root_relpath": "knowledge_root",
+      "read_policy": "read-only"
+    }
+  }
+}
