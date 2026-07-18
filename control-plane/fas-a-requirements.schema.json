@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hermes.local/fas-a-requirements.schema.json",
-  "title": "Fas A requirements manifest (v2 — trust context, manifest binding, containment)",
-  "description": "Self-contained requirements manifest consumed by the completion-integrity-gate (CIC). The CIC validates this manifest against the schema BEFORE any evaluation, then computes a deterministic status for every requirement. The manifest is the single semantic authority (krav 1). No hardcoded REQUIREMENT_SEMANTICS table in Python. The manifest NEVER carries an 'expected' field — accepted outcome is derived deterministically from the check type.",
+  "title": "Fas A requirements manifest (v3 — schema-realpath, dual status, FAS-A-012 regression)",
+  "description": "Self-contained requirements manifest consumed by the completion-integrity-gate (CIC). v3: the CIC resolves the top-level schema via validate_path and validates against the realpath under base_dir (no cwd fallback); an all_of with BOTH a FAIL and a BLOCKED sub-check lists the requirement ID in BOTH failing_ids and blocked_ids; an FAS-A-012 all_of pinned to an approved digest that is rewritten to owner-only gives manifest_tampered. The CIC validates this manifest against the schema BEFORE any evaluation, then computes a deterministic status for every requirement. The manifest is the single semantic authority (krav 1). No hardcoded REQUIREMENT_SEMANTICS table in Python. The manifest NEVER carries an 'expected' field — accepted outcome is derived deterministically from the check type.",
   "type": "object",
   "additionalProperties": false,
   "required": ["manifest_version", "manifest_id", "requirements"],

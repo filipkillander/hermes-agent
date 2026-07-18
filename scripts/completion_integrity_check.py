@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
-"""Completion Integrity Gate (CIC) for Fas A — v2 (trust context, manifest binding, containment).
+"""Completion Integrity Gate (CIC) for Fas A — v3 (schema-realpath, dual status, FAS-A-012 regression).
 
 Read-only enforcement code. Reads a requirements manifest (YAML), validates it
 against the schema BEFORE any evaluation, then computes a deterministic status
 for every requirement and returns a JSON verdict. The CIC never mutates state:
 no task creation, no board writes, no push, no install, no restart, no file
 writes outside the read-only verification path.
+
+v3 corrections (task t_9f3f941e, on top of v2 commit 4c579a1b0):
+
+  A. SCHEMA-REALPATH: run_gate resolves the top-level schema path via
+     validate_path and opens/validates EXACTLY the returned realpath. The raw
+     relative schema_path is never opened after containment. The cwd-
+     dependent fallback (base_dir / schema_path) was removed. A different
+     cwd with a permissive schema on the same relative path no longer
+     influences the result — only the schema under base_dir is used.
+  B. DUAL STATUS in all_of: a composite all_of with BOTH a FAIL sub-check
+     and a BLOCKED sub-check sets also_blocked=True on the CheckResult and
+     the top-level gate lists the requirement ID in BOTH failing_ids and
+     blocked_ids (deduplicated, stable order). FAIL still drives the gate;
+     both lists are always preserved (krav 6/10).
+  C. FAS-A-012-REGRESSION: an all_of pinned to an approved digest that is
+     then rewritten to an owner-only check (technical part removed) changes
+     the manifest digest and yields manifest_tampered (FAIL), not a
+     trust_context_missing PASS-by-skip.
+  D. SCOPE: no owner provider, Keychain, GPG, ledger, central worker-guard,
+     or runtime integration. CLI/default stays fail-closed.
 
 Design invariants (task t_e5b2a010, krav 1-10):
 
@@ -158,7 +178,15 @@ class TrustContext(Protocol):
 
 @dataclass
 class CheckResult:
-    """Result of evaluating a single requirement (or all_of sub-check)."""
+    """Result of evaluating a single requirement (or all_of sub-check).
+
+    ``also_blocked`` (v3 dual status) is set ONLY for an all_of composite
+    whose gate-driving status is ``fail`` but which also contains at least
+    one ``blocked`` sub-check. It lets the top-level gate add the requirement
+    ID to BOTH ``failing_ids`` and ``blocked_ids`` (deduplicated, stable
+    order), preserving the dual-status signal described in krav 6 / 10.
+    A bare FAIL or BLOCKED result never sets this flag.
+    """
 
     requirement_id: str
     check_type: str
@@ -166,6 +194,7 @@ class CheckResult:
     observed: str
     expected: str
     reason: str = ""
+    also_blocked: bool = False
 
 
 @dataclass
@@ -202,6 +231,7 @@ class GateResult:
                     "observed": r.observed,
                     "expected": r.expected,
                     "reason": r.reason,
+                    "also_blocked": r.also_blocked,
                 }
                 for r in self.results
             ],
@@ -744,6 +774,12 @@ def _evaluate_all_of(
     returns BLOCKED only for that sub-check. If ANY sub-check FAILs, the whole
     requirement is FAIL (FAIL > BLOCKED). If no sub-check FAILs but some BLOCK,
     the requirement is BLOCKED.
+
+    v3 dual status (krav 6/10): when a single all_of has BOTH a FAIL sub-check
+    AND a BLOCKED sub-check, the composite status is ``fail`` (FAIL drives the
+    gate) AND ``also_blocked=True`` is set so the top-level gate adds the
+    requirement ID to BOTH ``failing_ids`` and ``blocked_ids`` (deduplicated,
+    stable order). failing_ids and blocked_ids may both contain the same ID.
     """
     expected = DETERMINISTIC_EXPECTED["all_of"]
     sub_checks = check.get("checks", [])
@@ -761,6 +797,7 @@ def _evaluate_all_of(
                 CheckResult(rid, "all_of", "fail", "sub_not_dict", expected, "sub_check_not_dict")
             )
             any_fail = True
+            reasons.append(f"sub{len(sub_results)-1}:sub_check_not_dict")
             continue
         sub_rid = f"{rid}::sub{len(sub_results)}"
         if sub.get("type") == "all_of":
@@ -775,8 +812,11 @@ def _evaluate_all_of(
             any_blocked = True
             reasons.append(f"{sub_rid}:{sr.reason}")
     if any_fail:
+        # FAIL drives the gate. If a BLOCKED sub-check also exists, set
+        # also_blocked so the requirement ID is dual-listed at the top level.
         return CheckResult(
-            rid, "all_of", "fail", "not_all_pass", expected, "|".join(reasons)
+            rid, "all_of", "fail", "not_all_pass", expected, "|".join(reasons),
+            also_blocked=any_blocked,
         )
     if any_blocked:
         return CheckResult(
@@ -895,21 +935,31 @@ def run_gate(
     manifest_id = manifest.get("manifest_id", "")
 
     # Schema validation BEFORE evaluation (krav 1).
+    # v3 (schema-realpath): the CIC resolves the schema path via validate_path
+    # and opens/validates EXACTLY the returned realpath. The raw relative
+    # schema_path is NEVER opened after containment. There is no cwd-
+    # dependent fallback: only the realpath under base_dir is used.
     if schema_path is None:
         schema_path = str(base_dir / "control-plane" / "fas-a-requirements.schema.json")
-    # Validate schema path is within base_dir (krav 8).
-    ok_sch, msg_sch, _ = validate_path(schema_path, base_dir=base_dir)
-    if not ok_sch:
+    # Validate schema path is within base_dir (krav 8) and capture the realpath.
+    ok_sch, msg_sch, real_sch = validate_path(schema_path, base_dir=base_dir)
+    if not ok_sch or real_sch is None:
         return GateResult(
             gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
             manifest_verified=False, schema_valid=False, id_set_valid=False,
             trust_context_present=trust_context is not None,
             reason=f"schema_not_in_base_dir:{msg_sch}",
         )
-    ok_s, err_s = validate_manifest_against_schema(manifest, schema_path)
-    if not ok_s and err_s.startswith("schema_not_found:") and base_dir is not None:
-        alt_schema = str(base_dir / schema_path) if not os.path.isabs(schema_path) else schema_path
-        ok_s, err_s = validate_manifest_against_schema(manifest, alt_schema)
+    # Existence check on the resolved realpath (not the raw schema_path).
+    if not os.path.exists(real_sch):
+        return GateResult(
+            gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
+            manifest_verified=False, schema_valid=False, id_set_valid=False,
+            trust_context_present=trust_context is not None,
+            reason=f"schema_not_found:{real_sch}",
+        )
+    # Validate the manifest against the schema at the resolved realpath.
+    ok_s, err_s = validate_manifest_against_schema(manifest, real_sch)
     if not ok_s:
         return GateResult(
             gate="FAIL", manifest_id=manifest_id, manifest_hash=m_hash,
@@ -963,9 +1013,28 @@ def run_gate(
         result = evaluate_requirement(req, base_dir=base_dir, trust_context=trust_context)
         results.append(result)
         if result.status == "fail":
+            # v3 dual status: an all_of composite with BOTH a FAIL and a
+            # BLOCKED sub-check sets also_blocked. The ID is added to BOTH
+            # failing_ids and blocked_ids (deduplicated, stable order) so the
+            # dual-status signal survives. FAIL still drives the gate.
             failing_ids.append(result.requirement_id)
+            if getattr(result, "also_blocked", False):
+                blocked_ids.append(result.requirement_id)
         elif result.status == "blocked":
             blocked_ids.append(result.requirement_id)
+
+    # Deduplicate while preserving stable first-seen order (v3 dual status).
+    def _dedup(seq: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    failing_ids = _dedup(failing_ids)
+    blocked_ids = _dedup(blocked_ids)
 
     # Gate logic (krav 10): FAIL > BLOCKED > PASS.
     # closeout_permitted=true only if gate=PASS (which requires trust context).

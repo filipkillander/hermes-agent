@@ -1,18 +1,18 @@
-"""Regression + integrity tests for the Fas A completion-integrity-gate (CIC) — v2.
+"""Regression + integrity tests for the Fas A completion-integrity-gate (CIC) — v3.
 
 These tests are hermetic: they build temporary worktrees, manifests, and
 receipts on disk and exercise ``scripts/completion_integrity_check.py``
 through its public ``run_gate`` API. No real Kanban board, no network, no
 mutations outside the per-test tmpdir.
 
-Coverage of the required regression cases (task t_e5b2a010):
+Coverage of the required regression cases (task t_e5b2a010, v3 t_9f3f941e):
 
 Kept from v1:
   - test_empty_manifest, test_truncated_manifest, test_schema_invalid,
     test_missing_id, test_extra_id, test_duplicate_id,
     test_self_referential_closeout_rejected, test_deterministic_identical_result
 
-New v2 negative probes:
+Kept v2 negative probes:
   - test_all_checks_replaced_with_git_ancestor
   - test_self_computed_cli_manifest_hash
   - test_changed_checktype_after_trust
@@ -23,7 +23,6 @@ New v2 negative probes:
   - test_test_receipt_receipt_hash_mismatch
   - test_test_receipt_untrusted_binding
   - test_fabricated_owner_receipt_fake_trust_anchor
-  - test_fas_a_012_without_technical_part
   - test_evidence_in_sibling_worktree_rejected
   - test_manifest_in_sibling_worktree_rejected
   - test_symlink_escape
@@ -34,10 +33,24 @@ New v2 negative probes:
   - test_production_cli_cannot_reach_test_trust_verifier
   - test_canonical_candidate_never_closeout_without_harness_trust
 
+v3 new probes (task t_9f3f941e):
+  - test_fas_a_012_owner_only_after_approved_digest_is_tampered (replaces the
+    misleading test_fas_a_012_without_technical_part): owner-only after an
+    approved digest gives manifest_tampered, NOT a missing-trust-context skip.
+  - test_fas_a_012_dual_status_fail_and_blocked: an all_of with BOTH a FAIL
+    sub-check and a BLOCKED sub-check lists the ID in BOTH failing_ids and
+    blocked_ids (also_blocked=True); FAIL drives the gate.
+  - test_schema_realpath_uses_base_dir_not_cwd: base_dir's strict schema is
+    used even when a permissive schema sits at the same relative path under
+    the CIC's cwd. The CIC validates against the realpath under base_dir.
+
 Plus kept extras: test_cic_does_not_mutate_filesystem,
 test_canonical_manifest_validates_against_schema,
 test_canonical_manifest_has_all_13_ids_and_exact_texts,
-test_cic_never_uses_shell_true, test_cic_source_has_no_mutation_calls.
+test_cic_never_uses_shell_true, test_cic_source_has_no_mutation_calls,
+test_cic_source_has_no_hardcoded_requirement_semantics,
+test_production_cli_has_no_trust_context_provider,
+test_trust_context_protocol_is_injectable.
 """
 
 from __future__ import annotations
@@ -845,33 +858,295 @@ def test_fabricated_owner_receipt_fake_trust_anchor(cic, tmp_path, fake_git_repo
     assert result2.closeout_permitted is True
 
 
-# ── Test: FAS-A-012 without technical part → FAIL check_type_mismatch ─────────────
+# ── Test: FAS-A-012 owner-only after approved digest is tampered → manifest_tampered ──
+# v3 (task t_9f3f941e, deviation C): replaces the misleading
+# test_fas_a_012_without_technical_part, which could pass purely because
+# trust_context was missing rather than because the tamper was detected.
 
-def test_fas_a_012_without_technical_part(cic, tmp_path, fake_git_repo):
-    """FAS-A-012 with only owner_decision_receipt (not all_of) → FAIL
-    check_type_mismatch. FAS-A-012 MUST be all_of of technical + owner.
+def test_fas_a_012_owner_only_after_approved_digest_is_tampered(cic, tmp_path, fake_git_repo):
+    """FAS-A-012 rewritten from all_of to owner-only, keeping an approved
+    digest, must give gate=FAIL with reason=manifest_tampered and
+    closeout_permitted=false.
+
+    Steps:
+      1. Build a correct FAS-A-012 all_of (technical file_sha256 sub-check
+         with PENDING_EVIDENCE + owner_decision_receipt sub-check with
+         PENDING_OWNER_DECISION), 12 other passing git_ancestor reqs, schema
+         and manifest written under base_dir.
+      2. Pin the manifest digest in a test-only trust context
+         (FakeTrustContext.approved_manifest_hash).
+      3. Rewrite FAS-A-012 to an owner-only check (technical sub-check
+         REMOVED, only the owner_decision_receipt remains) but KEEP the
+         previously approved manifest digest in the trust context.
+      4. Expected: gate=FAIL, reason=manifest_tampered,
+         closeout_permitted=false. The tamper is detected by the manifest
+         digest mismatch, NOT by a missing trust_context — the test passes
+         the trust context, so a missing-trust escape hatch cannot mask it.
     """
     repo = fake_git_repo
     _write_schema(tmp_path)
-    # FAS-A-012 as a bare owner_decision_receipt (WRONG — must be all_of).
-    reqs = _all_13_ids_git_ancestor(repo, override={
-        "FAS-A-012": {"type": "owner_decision_receipt",
-                      "receipt_path": "control-plane/evidence/fas-a-012-owner-receipt.json",
-                      "owner_id": "PENDING_OWNER_DECISION"},
-    })
-    manifest = _write_manifest(tmp_path, requirements=reqs)
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    # FAS-A-012 as bare owner_decision_receipt → BLOCKED (placeholder owner_id).
-    # But the canonical manifest requires all_of; this test verifies that a
-    # bare owner_decision_receipt gives BLOCKED (not PASS), which is the
-    # failure mode the schema guard prevents. The check_type_mismatch is
-    # enforced by the manifest structure (all_of), not by the CIC at runtime.
-    # Here we assert: not PASS, closeout_permitted=false.
-    assert result.gate != "PASS"
+
+    # 1. Build all 13 IDs with FAS-A-012 as the correct all_of (technical +
+    # owner). The other 12 are passing git_ancestor.
+    correct_012 = {
+        "type": "all_of",
+        "checks": [
+            {"type": "file_sha256",
+             "path": "control-plane/evidence/fas-a-012-current-truth.json",
+             "expected_sha256": "PENDING_EVIDENCE"},
+            {"type": "owner_decision_receipt",
+             "receipt_path": "control-plane/evidence/fas-a-012-owner-receipt.json",
+             "owner_id": "PENDING_OWNER_DECISION"},
+        ],
+    }
+    reqs_correct = _all_13_ids_git_ancestor(repo, override={"FAS-A-012": correct_012})
+    manifest_correct = _write_manifest(tmp_path, requirements=reqs_correct,
+                                        manifest_id="test-fas-a-012-correct")
+    digest_correct = hashlib.sha256(manifest_correct.read_bytes()).hexdigest()
+
+    # Sanity: the correct manifest validates against the schema. Without
+    # trust_context it is FAIL (technical sub-check PENDING_EVIDENCE → FAIL,
+    # owner sub-check → BLOCKED). With a trust context that approves the
+    # correct digest it is still FAIL (PENDING_EVIDENCE file_sha256 cannot
+    # pass), but NOT manifest_tampered.
+    sanity = _run_gate(cic, manifest_correct, tmp_path, git_repo=repo["repo"])
+    assert sanity.gate == "FAIL"
+    assert sanity.reason != "manifest_tampered"
+    # FAS-A-012 is FAIL-driven by the technical sub-check and also has a
+    # BLOCKED owner sub-check → dual-listed (v3 dual status).
+    assert "FAS-A-012" in sanity.failing_ids
+    assert "FAS-A-012" in sanity.blocked_ids
+    assert sanity.closeout_permitted is False
+
+    # 2. Pin the correct digest in a test-only trust context.
+    fake_trust = FakeTrustContext(approved_manifest_hash=digest_correct)
+
+    # 3. Rewrite FAS-A-012 to an owner-only check (technical part removed).
+    tampered_012 = {
+        "type": "owner_decision_receipt",
+        "receipt_path": "control-plane/evidence/fas-a-012-owner-receipt.json",
+        "owner_id": "PENDING_OWNER_DECISION",
+    }
+    reqs_tampered = _all_13_ids_git_ancestor(repo, override={"FAS-A-012": tampered_012})
+    manifest_tampered = _write_manifest(tmp_path, requirements=reqs_tampered,
+                                        manifest_id="test-fas-a-012-tampered")
+    # The digest MUST differ from the approved digest.
+    digest_tampered = hashlib.sha256(manifest_tampered.read_bytes()).hexdigest()
+    assert digest_tampered != digest_correct, \
+        "tampered manifest must have a different digest from the approved one"
+
+    # 4. Expected: manifest_tampered. The trust context is present and pins
+    # the OLD digest, so the digest mismatch drives the gate. The test does
+    # NOT pass purely because trust_context is missing — trust_context is
+    # explicitly supplied here.
+    result = _run_gate(cic, manifest_tampered, tmp_path, git_repo=repo["repo"],
+                      trust_context=fake_trust)
+    assert result.gate == "FAIL", f"expected FAIL, got {result.gate}: {result.reason}"
+    assert result.reason == "manifest_tampered", \
+        f"expected manifest_tampered, got {result.reason!r}"
     assert result.closeout_permitted is False
+    assert result.trust_context_present is True
+    assert result.manifest_verified is False
+
+
+# ── Test: FAS-A-012 dual status (FAIL + BLOCKED in same all_of) ────────────────
+# v3 (task t_9f3f941e, deviation B): an all_of composite with BOTH a FAIL
+# sub-check and a BLOCKED sub-check must list the requirement ID in BOTH
+# failing_ids and blocked_ids. FAIL still drives the gate.
+
+def test_fas_a_012_dual_status_fail_and_blocked(cic, tmp_path, fake_git_repo):
+    """FAS-A-012 all_of with missing technical evidence (file_sha256
+    PENDING_EVIDENCE) AND missing owner trust (owner_decision_receipt
+    PENDING_OWNER_DECISION), without trust context, must give:
+
+      gate                 = FAIL
+      failing_ids          contains FAS-A-012
+      blocked_ids          contains FAS-A-012
+      closeout_permitted   = False
+
+    The technical sub-check is FAIL (PENDING_EVIDENCE never matches a real
+    file). The owner sub-check is BLOCKED (no trust context). The composite
+    status is FAIL (FAIL > BLOCKED), but the requirement ID must appear in
+    BOTH lists so the dual-status signal is preserved.
+    """
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+
+    fas_a_012_all_of = {
+        "type": "all_of",
+        "checks": [
+            {"type": "file_sha256",
+             "path": "control-plane/evidence/fas-a-012-current-truth.json",
+             "expected_sha256": "PENDING_EVIDENCE"},
+            {"type": "owner_decision_receipt",
+             "receipt_path": "control-plane/evidence/fas-a-012-owner-receipt.json",
+             "owner_id": "PENDING_OWNER_DECISION"},
+        ],
+    }
+    reqs = _all_13_ids_git_ancestor(repo, override={"FAS-A-012": fas_a_012_all_of})
+    manifest = _write_manifest(tmp_path, requirements=reqs,
+                               manifest_id="test-fas-a-012-dual-status")
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                      trust_context=None)
+
+    assert result.gate == "FAIL", f"expected FAIL, got {result.gate}: {result.reason}"
+    assert result.closeout_permitted is False
+    # FAIL drives the gate, so FAS-A-012 is in failing_ids.
+    assert "FAS-A-012" in result.failing_ids, \
+        f"FAS-A-012 must be in failing_ids: {result.failing_ids}"
+    # The owner sub-check is BLOCKED, so FAS-A-012 is ALSO in blocked_ids
+    # (dual status).
+    assert "FAS-A-012" in result.blocked_ids, \
+        f"FAS-A-012 must be in blocked_ids (dual status): {result.blocked_ids}"
+    # Both lists are deduplicated and stable: FAS-A-012 appears exactly once
+    # in each.
+    assert result.failing_ids.count("FAS-A-012") == 1
+    assert result.blocked_ids.count("FAS-A-012") == 1
+    # The composite CheckResult carries also_blocked=True.
     res = next(r for r in result.results if r.requirement_id == "FAS-A-012")
-    assert res.status == "blocked"
-    assert "trust_context_missing" in res.reason
+    assert res.status == "fail"
+    assert res.also_blocked is True
+
+
+# ── Test: schema realpath uses base_dir, not cwd ──────────────────────────────
+# v3 (task t_9f3f941e, deviation A): run_gate resolves the top-level schema
+# path via validate_path and validates against EXACTLY that realpath. A
+# different cwd carrying a permissive schema on the same relative path must
+# NOT influence the result — only the schema under base_dir is used.
+
+def test_schema_realpath_uses_base_dir_not_cwd(cic, tmp_path, fake_git_repo):
+    """base_dir has a STRICT schema (the canonical schema). A sibling cwd
+    has a PERMISSIVE schema on the same relative path
+    (control-plane/fas-a-requirements.schema.json). The CIC must open and
+    validate against the schema under base_dir's realpath, NOT the cwd's
+    permissive copy.
+
+    The strict schema under base_dir enforces additionalProperties=false on
+    every requirement (no extra fields allowed). The permissive schema under
+    cwd allows any properties. A manifest with an EXTRA forbidden field on
+    a requirement MUST fail against the strict schema under base_dir — even
+    if a permissive schema sits at the same relative path under cwd.
+    """
+    repo = fake_git_repo
+    base_dir = tmp_path / "base"
+    cwd_dir = tmp_path / "cwd"
+
+    # base_dir gets the STRICT (canonical) schema.
+    _write_schema(base_dir)
+
+    # cwd_dir gets a PERMISSIVE schema at the same relative path: it accepts
+    # any properties on requirements (additionalProperties=true) and does not
+    # require source_hash. This must NOT be picked up when base_dir != cwd.
+    (cwd_dir / "control-plane").mkdir(parents=True)
+    permissive_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["manifest_version", "manifest_id", "requirements"],
+        "properties": {
+            "manifest_version": {"type": "string"},
+            "manifest_id": {"type": "string"},
+            "requirements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["id", "text", "check"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "source_hash": {"type": "string"},
+                        "check": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "required": ["type"],
+                            "properties": {"type": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+        },
+    }
+    (cwd_dir / "control-plane" / "fas-a-requirements.schema.json").write_text(
+        json.dumps(permissive_schema)
+    )
+
+    # Build a manifest that the STRICT schema rejects (an extra forbidden
+    # field ``bogus_extra`` on FAS-A-001, which the strict schema's
+    # additionalProperties=false disallows) but the PERMISSIVE schema would
+    # accept. All 13 IDs present, all source_hashes valid.
+    #
+    # We bypass the _write_manifest helper (which auto-fills source_hash and
+    # would mask the violation) and write the YAML directly to base_dir via
+    # tmp_path — still pytest-owned, no conftest, no custom script.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        r = {
+            "id": rid,
+            "text": f"req {rid}",
+            "source_hash": _sha256(f"req {rid}"),
+            "check": {"type": "git_ancestor", "branch": "main",
+                      "commit_sha": repo["base_sha"]},
+        }
+        if i == 1:
+            # Forbidden extra field → strict schema rejects via
+            # additionalProperties=false; permissive schema accepts.
+            r["bogus_extra"] = "this_field_is_not_in_the_strict_schema"
+        reqs.append(r)
+    manifest_doc = {
+        "manifest_version": "2.0",
+        "manifest_id": "test-schema-realpath",
+        "description": "test manifest for schema-realpath v3",
+        "requirements": reqs,
+    }
+    (base_dir / "control-plane").mkdir(parents=True, exist_ok=True)
+    manifest = base_dir / "control-plane" / "fas-a-requirements.yaml"
+    manifest.write_text(yaml.safe_dump(manifest_doc, sort_keys=False))
+
+    # Capture the realpath the CIC would resolve for the schema. The CIC
+    # resolves the schema relative to base_dir, so it must be the base_dir
+    # copy, not the cwd copy.
+    expected_real_schema = os.path.realpath(
+        str(base_dir / "control-plane" / "fas-a-requirements.schema.json")
+    )
+    cwd_real_schema = os.path.realpath(
+        str(cwd_dir / "control-plane" / "fas-a-requirements.schema.json")
+    )
+    assert expected_real_schema != cwd_real_schema, \
+        "test setup: base_dir and cwd schemas must be distinct realpaths"
+
+    # Run the gate with base_dir=base_dir. The cwd has a permissive schema
+    # at the same relative path; if the CIC fell back to cwd it would PASS
+    # the schema step. The v3 fix resolves the schema under base_dir only.
+    result = _run_gate(
+        cic, manifest, base_dir, git_repo=repo["repo"],
+        schema_path="control-plane/fas-a-requirements.schema.json",
+    )
+
+    # The strict schema under base_dir rejects the manifest (FAS-A-001 has a
+    # forbidden extra field). The gate is FAIL with a schema reason, NOT a
+    # pass, NOT trust_context_missing (which would mean the permissive
+    # schema was used and all checks passed).
+    assert result.gate == "FAIL", f"expected FAIL, got {result.gate}: {result.reason}"
+    assert result.closeout_permitted is False
+    assert result.schema_valid is False, \
+        f"strict schema under base_dir must reject the manifest, schema_valid={result.schema_valid}"
+    assert "schema_invalid" in result.reason or "schema_violation" in result.reason, \
+        f"expected schema rejection from base_dir's strict schema, got: {result.reason}"
+    assert "bogus_extra" in result.reason or "Additional properties" in result.reason, \
+        f"expected the extra-field violation to be reported, got: {result.reason}"
+
+    # Cross-check via validate_path: the realpath the CIC would resolve for
+    # the relative schema path under base_dir is the base_dir copy, NOT the
+    # cwd copy. This is the invariant the v3 fix enforces.
+    ok, _msg, real = cic.validate_path(
+        "control-plane/fas-a-requirements.schema.json", base_dir=base_dir
+    )
+    assert ok and real == expected_real_schema, \
+        f"validate_path must resolve to base_dir's schema: real={real}"
+    assert real != cwd_real_schema, \
+        "validate_path must NOT resolve to the cwd's permissive schema"
 
 
 # ── Test: evidence in sibling worktree rejected → FAIL path_not_in_base_dir ──────

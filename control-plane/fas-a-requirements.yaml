@@ -1,5 +1,6 @@
 # Fas A requirements manifest — self-contained, completion-integrity-gate input.
 #
+# v3 — schema-realpath, dual status in all_of, FAS-A-012 regression.
 # v2 — trust context, manifest binding, base_dir containment, strict receipts.
 #
 # Canonical source: Filip's approved Fas A requirement list (stable IDs, exact
@@ -90,12 +91,13 @@
 
 manifest_version: "2.0"
 manifest_id: "fas-a-requirements-v2"
-generated_by: "fas-a-cic-correct-v2"
+generated_by: "fas-a-cic-correct-v3"
 description: >-
-  Fas A completion-integrity-gate requirements. Trust context, manifest
-  binding, base_dir containment, strict receipts. Status is always computed
-  by the CIC, never trusted from this YAML. The manifest is the single
-  semantic authority. Without verified trust context: fail-closed.
+  Fas A completion-integrity-gate requirements. v3: schema-realpath, dual
+  status in all_of, FAS-A-012 regression. Trust context, manifest binding,
+  base_dir containment, strict receipts. Status is always computed by the
+  CIC, never trusted from this YAML. The manifest is the single semantic
+  authority. Without verified trust context: fail-closed.
 
 # Anchors reused by multiple requirement checks. Concrete values pinned to the
 # verified shared base; the CIC reads them only through the check arguments
@@ -235,7 +237,10 @@ requirements:
   # FAS-A-012 is modelled as all_of of technical current-truth evidence
   # (file_sha256) and a separate owner decision (owner_decision_receipt).
   # Missing technical evidence = FAIL. Missing owner trust = BLOCKED.
-  # FAIL has priority; both ID lists are reported.
+  # FAIL has priority; both ID lists are reported. v3 dual status: when a
+  # single all_of contains BOTH a FAIL sub-check AND a BLOCKED sub-check,
+  # the requirement ID is listed in BOTH failing_ids and blocked_ids
+  # (deduplicated, stable order); the composite gate is FAIL.
 
   - id: FAS-A-012
     text: "Fleet contract current-truth och owner decisions verifierade"
