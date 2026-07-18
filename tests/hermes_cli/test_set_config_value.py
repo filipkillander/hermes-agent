@@ -102,6 +102,14 @@ class TestConfigYamlRouting:
         assert "gpt-4o" in config
         assert "model" not in _read_env(_isolated_hermes_home)
 
+    def test_email_session_cannot_mutate_config(self, _isolated_hermes_home):
+        with patch.dict(os.environ, {"HERMES_SESSION_PLATFORM": "email"}):
+            with pytest.raises(SystemExit) as exc:
+                set_config_value("email.identity.signature_role", "Assistent")
+
+        assert exc.value.code == 1
+        assert _read_config(_isolated_hermes_home) == ""
+
     def test_nested_key(self, _isolated_hermes_home):
         set_config_value("terminal.backend", "docker")
         config = _read_config(_isolated_hermes_home)

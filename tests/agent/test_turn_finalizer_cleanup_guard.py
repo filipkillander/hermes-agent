@@ -182,3 +182,23 @@ def test_text_response_on_last_allowed_call_is_completed():
     )
     assert result["final_response"] == "final report"
     assert result["completed"] is True
+
+
+def test_email_turn_suppresses_file_mutation_verifier_footer():
+    agent = _StubAgent(raise_in=())
+    agent.platform = "email"
+    agent._turn_failed_file_mutations = {
+        "/tmp/config.yaml": {"tool": "patch", "error_preview": "write denied"}
+    }
+    agent._file_mutation_verifier_enabled = lambda: True
+    agent._format_file_mutation_failure_footer = lambda failed: "INTERNAL VERIFIER"
+
+    result = _run(
+        agent,
+        final_response="Hej Filip!",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "Hej Filip!"
+    assert "INTERNAL VERIFIER" not in result["final_response"]
