@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hermes.local/fas-a-requirements.schema.json",
-  "title": "Fas A requirements manifest",
-  "description": "Self-contained requirements manifest consumed by the completion-integrity-gate (CIC). The CIC computes status for every requirement; the manifest never carries a status field.",
+  "title": "Fas A requirements manifest (v1.1 — strict typed checks)",
+  "description": "Self-contained requirements manifest consumed by the completion-integrity-gate (CIC). The CIC validates this manifest against the schema BEFORE any evaluation, then computes a deterministic status for every requirement. The manifest NEVER carries an 'expected' field — accepted outcome is derived deterministically from the check type (krav 3).",
   "type": "object",
   "additionalProperties": false,
   "required": ["manifest_version", "manifest_id", "requirements"],
@@ -33,7 +33,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "text", "source_hash", "check", "expected"],
+        "required": ["id", "text", "source_hash", "check"],
         "properties": {
           "id": {
             "type": "string",
@@ -49,26 +49,145 @@
             "pattern": "^[0-9a-f]{64}$"
           },
           "check": {
-            "type": "object",
-            "additionalProperties": true,
-            "required": ["type"],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "git_ancestor",
-                  "git_not_ancestor",
-                  "file_sha256",
-                  "schema_valid",
-                  "test_receipt",
-                  "owner_decision_receipt"
-                ]
-              }
-            }
+            "$ref": "#/$defs/check"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "check": {
+      "oneOf": [
+        { "$ref": "#/$defs/checks/git_ancestor" },
+        { "$ref": "#/$defs/checks/git_not_ancestor" },
+        { "$ref": "#/$defs/checks/file_sha256" },
+        { "$ref": "#/$defs/checks/schema_valid" },
+        { "$ref": "#/$defs/checks/test_receipt" },
+        { "$ref": "#/$defs/checks/owner_decision_receipt" },
+        { "$ref": "#/$defs/checks/all_of" }
+      ]
+    },
+    "checks": {
+      "git_ancestor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "branch", "commit_sha"],
+        "properties": {
+          "type": { "const": "git_ancestor" },
+          "branch": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9._/-]+$"
           },
-          "expected": {
+          "commit_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
+        }
+      },
+      "git_not_ancestor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "branch", "commit_sha"],
+        "properties": {
+          "type": { "const": "git_not_ancestor" },
+          "branch": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9._/-]+$"
+          },
+          "commit_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
+        }
+      },
+      "file_sha256": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "path", "expected_sha256"],
+        "properties": {
+          "type": { "const": "file_sha256" },
+          "path": {
             "type": "string",
             "minLength": 1
+          },
+          "expected_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "schema_valid": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "yaml_path", "schema_path"],
+        "properties": {
+          "type": { "const": "schema_valid" },
+          "yaml_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "schema_path": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "test_receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "receipt_path", "expected_branch", "expected_commit", "expected_check_id"],
+        "properties": {
+          "type": { "const": "test_receipt" },
+          "receipt_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_branch": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9._/-]+$"
+          },
+          "expected_commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "expected_check_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "owner_decision_receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "receipt_path", "owner_id"],
+        "properties": {
+          "type": { "const": "owner_decision_receipt" },
+          "receipt_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "owner_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "all_of": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "checks"],
+        "properties": {
+          "type": { "const": "all_of" },
+          "checks": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/check" }
           }
         }
       }

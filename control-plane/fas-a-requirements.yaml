@@ -1,54 +1,76 @@
 # Fas A requirements manifest — self-contained, completion-integrity-gate input.
 #
-# Canonical source: Filip's approved Fas A requirement list (stable IDs, exact texts).
-# The CIC (scripts/completion_integrity_check.py) computes status for every
-# requirement; the manifest NEVER carries a status field. Only the check
-# arguments below are read by the CIC — no external paths, links, or source-file
-# dependencies are referenced from runnable code.
+# v1.1 — strict typed checks, deterministic expected, external manifest hash.
 #
-# Source section hashes (sha256 of the exact requirement text, UTF-8):
-#   These pin the wording of each requirement. The CIC recomputes the hash from
-#   the `text` field at run time and compares to `source_hash`. A mismatch
-#   (text drift) is a source_hash mismatch → gate=FAIL.
+# Canonical source: Filip's approved Fas A requirement list (stable IDs, exact
+# texts). The CIC (scripts/completion_integrity_check.py) computes status for
+# every requirement; the manifest NEVER carries an `expected` field. The CIC
+# derives the accepted outcome deterministically from the check type (krav 3):
+#   git_ancestor          → exit_0 (commit IS ancestor)
+#   git_not_ancestor       → exit_1 (commit is NOT ancestor)
+#   file_sha256            → match  (file hash equals expected_sha256)
+#   schema_valid           → valid  (YAML validates against schema)
+#   test_receipt           → verified (receipt binds to branch/commit/check_id)
+#   owner_decision_receipt → authorized (Filip-owned choice, BLOCKED if missing
+#                            trust anchor / placeholder owner_id)
+#   all_of                 → all sub-checks pass
+#
+# A manifest may NEVER declare `missing`, `unverified`, or `unauthorized` as
+# accepted. There is no free `expected` field. Missing technical evidence =
+# FAIL. Missing owner trust anchor = BLOCKED. FAIL has priority over BLOCKED.
 #
 # Reference hashes for provenance only (not referenced as paths in runnable code):
 #   handoff sha256:       15fc2243425db99b924463d2aeff08653f59f7dab8d8a23afffe7c369df46ea1
 #   audit sha256:         a5c1a81bd82d65daacaa9bfac01a037e29b7fa55d95ac29458292a558ad42ef6
 #   cockpit-spec sha256:  8ca56832efd0aa9ee5444ca304b8cbaee999392cc8c589989e61b34535414da8
 #
-# Gate semantics (enforced by the CIC, see task t_294c700d):
-#   PASS    — every requirement's evidence_check returns `expected`.
-#   FAIL    — any evidence_check returns something other than `expected`,
-#             or manifest/source hash mismatch, unknown check type, path
-#             escape, or shell metacharacters detected. Closeout blocked,
-#             exact failing requirement IDs listed.
-#   BLOCKED — any requirement uses owner_decision_receipt and its owner_id
-#             is missing or a placeholder (PENDING_OWNER_DECISION / empty /
-#             fabricated). "Fas A klar" is NOT allowed; only fully independent
-#             work cards (not depending on the blocked requirement) may continue.
+# Gate semantics (krav 7, 9, 10):
+#   PASS    — manifest validates against schema; exactly IDs FAS-A-001..013
+#             with no missing/extra/duplicate; manifest hash matches the
+#             externally-supplied --expected-manifest-hash; every requirement's
+#             computed status equals its deterministic expected.
+#   FAIL    — schema invalid; ID set not exactly {FAS-A-001..FAS-A-013};
+#             manifest hash mismatch (manifest_tampered); --expected-manifest-hash
+#             missing on closeout; any requirement's computed status ≠ expected;
+#             source_hash drift; unknown check type; path escape; shell
+#             metacharacters; receipt missing/binding failure. Technical
+#             requirements with missing implementation file/receipt = FAIL
+#             (NOT BLOCKED).
+#   BLOCKED — a genuine Filip-owned requirement (FAS-A-011 canonical required
+#             skills; FAS-A-012 fleet owner_decision_id) uses
+#             owner_decision_receipt with a placeholder owner_id or a receipt
+#             without an external trust anchor. When BOTH FAIL and BLOCKED are
+#             present, gate=FAIL; both failing_ids and blocked_ids are listed.
 #
-# All check types below are from the allowlist enforced by the CIC:
-#   git_ancestor, git_not_ancestor, file_sha256, schema_valid,
-#   test_receipt, owner_decision_receipt.
+# Technical requirements (FAS-A-004..010, FAS-A-013) MUST be measured with
+# actual file / schema / Git-ancestry / test-receipt evidence — they may NEVER
+# pass via owner_decision_receipt. A missing technical implementation is FAIL.
+# Only genuine Filip-owned choices (FAS-A-011, FAS-A-012) may be BLOCKED via
+# owner_decision_receipt.
 
-manifest_version: "1.0"
+manifest_version: "1.1"
 manifest_id: "fas-a-requirements-v1"
-generated_by: "fas-a-cic-implement-v1"
+generated_by: "fas-a-cic-correct-v1"
 description: >-
-  Fas A completion-integrity-gate requirements. Self-contained; status is
-  always computed by the CIC, never trusted from this YAML.
+  Fas A completion-integrity-gate requirements. Strict typed checks;
+  deterministic expected derived from check type; external manifest hash
+  required for closeout. Status is always computed by the CIC, never trusted
+  from this YAML.
 
-# Anchors reused by multiple requirement checks. These are concrete values
-# pinned to the verified shared base; the CIC reads them only through the
-# check arguments below, never as free-form paths.
+# Anchors reused by multiple requirement checks. Concrete values pinned to the
+# verified shared base; the CIC reads them only through the check arguments
+# below, never as free-form paths.
 anchors:
   verified_base_commit: "1181d5f842191b68356d758eacdb1ee41e3c5157"
   integration_branch: "kmros/main"
-  worker_isolation_commit: "9a1964e452c700fb7e57ec3f795fffc1b3472161"
+  worker_isolation_commit_a: "9a1964e452c700fb7e57ec3f795fffc1b3472161"
+  worker_isolation_commit_b: "3840a53d10fe9e5fcae3ebf6fd35e6dfcc32962a"
   schema_path: "control-plane/fas-a-requirements.schema.json"
   manifest_path: "control-plane/fas-a-requirements.yaml"
 
 requirements:
+  # ── Structural requirements (Git ancestry on kmros/main) ──────────────────
+
   - id: FAS-A-001
     text: "Skapa isolerad kandidat från verifierad gemensam bas"
     source_hash: "b109985a17be50f539ecaa9d44da8d99c3710414babb348b0dce098a026d634d"
@@ -56,25 +78,45 @@ requirements:
       type: git_ancestor
       branch: "kmros/main"
       commit_sha: "1181d5f842191b68356d758eacdb1ee41e3c5157"
-    expected: "exit_0"
 
   - id: FAS-A-002
     text: "Integrera exakt shared-live + Lumi + Igor patchar i kmros/main"
     source_hash: "116ada497d00933cf73c1a7abd63c3f7c0ba4cce7d00783d6818a266753aec6f"
     check:
-      type: git_ancestor
-      branch: "kmros/main"
-      commit_sha: "2a15181a157536a07984f634a7df2eb6e0af9716"
-    expected: "exit_0"
+      type: all_of
+      checks:
+        - type: git_ancestor
+          branch: "kmros/main"
+          commit_sha: "2a15181a157536a07984f634a7df2eb6e0af9716"
+        - type: git_ancestor
+          branch: "kmros/main"
+          commit_sha: "c2cd22ae04fd28edf6728262bd96b75c58a3e216"
+        - type: git_ancestor
+          branch: "kmros/main"
+          commit_sha: "df3f10d77f807e5755c5952a92faf5048c5621bc"
+        - type: git_ancestor
+          branch: "kmros/main"
+          commit_sha: "89afa1759c24814137ad26f2bac2fdc606518ca5"
 
   - id: FAS-A-003
     text: "Håll worker-isolation och stop-semantics utanför"
     source_hash: "847bd0b8b0c849998688b20ca431fdc03f9f8075195cd045bd39ead93ba4cfa8"
     check:
-      type: git_not_ancestor
-      branch: "kmros/main"
-      commit_sha: "9a1964e452c700fb7e57ec3f795fffc1b3472161"
-    expected: "exit_1"
+      type: all_of
+      checks:
+        - type: git_not_ancestor
+          branch: "kmros/main"
+          commit_sha: "9a1964e452c700fb7e57ec3f795fffc1b3472161"
+        - type: git_not_ancestor
+          branch: "kmros/main"
+          commit_sha: "3840a53d10fe9e5fcae3ebf6fd35e6dfcc32962a"
+
+  # ── Technical implementation / evidence requirements (FAIL if missing) ─────
+  # FAS-A-004..010 and FAS-A-013 are measured with actual file / schema / Git /
+  # test-receipt evidence. They may NEVER pass via owner_decision_receipt. A
+  # missing technical implementation = FAIL. The expected_* values pin the
+  # concrete evidence the CIC must find; today these files/receipts do not yet
+  # exist, so the canonical gate is FAIL with these IDs in failing_ids.
 
   - id: FAS-A-004
     text: >-
@@ -82,88 +124,95 @@ requirements:
       commit, overlay hash, lock hash, builder version)
     source_hash: "2156f7e7486c7122cef3fcf1d24801ad808be6466244da350b735402c3261bf4"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-004-provenance.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: file_sha256
+      path: "control-plane/evidence/fas-a-004-provenance-manifest.json"
+      expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
   - id: FAS-A-005
     text: ".venv verifierbar och icke-muterbar efter seal (faktisk enforcementkod)"
     source_hash: "03a1e941ea022c9c746be16661f0dc5d4f6af612d3c0ca2fe72ed05784e66742"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-005-venv-seal.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: file_sha256
+      path: "control-plane/evidence/fas-a-005-venv-seal-enforcement.py"
+      expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
   - id: FAS-A-006
     text: "Read-only fleet collector och kontrakttester, ej installerat live"
     source_hash: "4c12b5af9523c606ec9243b93249f932e1b3ac52c82286aa3663df7052d20081"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-006-fleet-collector.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: file_sha256
+      path: "control-plane/evidence/fas-a-006-fleet-collector-contract.py"
+      expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
   - id: FAS-A-007
     text: "#spel route-contract och syntetiska tester i kandidaten"
     source_hash: "596d7b79d57944969c9642f193d0124220b0f58a536215f01176850df86d5957"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-007-spel-contract.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: test_receipt
+      receipt_path: "control-plane/evidence/fas-a-007-spel-contract-receipt.json"
+      expected_branch: "kmros/spel-contract"
+      expected_commit: "0000000000000000000000000000000000000000"
+      expected_check_id: "fas-a-007-spel-contract"
 
   - id: FAS-A-008
     text: "Persistens-canary efter rotorsaksdiagnosen, i kandidaten"
     source_hash: "fbc51262727e56452e306d3a39c37f1ec309516755e14eb449530d36ebb58ffe"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-008-persist-canary.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: test_receipt
+      receipt_path: "control-plane/evidence/fas-a-008-persist-canary-receipt.json"
+      expected_branch: "kmros/persist-diag"
+      expected_commit: "0000000000000000000000000000000000000000"
+      expected_check_id: "fas-a-008-persist-canary"
 
   - id: FAS-A-009
     text: "Read-only The Terminal-cockpit (5 kort, djupvy, 2 handlingar, 4 statusar)"
     source_hash: "1afcb7efdf6b3672ee6b1b14ccdfc1a443dae39fcab020ff73a3ca090ff87893"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-009-cockpit.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: file_sha256
+      path: "control-plane/evidence/fas-a-009-cockpit-spec.yaml"
+      expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
   - id: FAS-A-010
     text: "Cockpit acceptance-kriterier (11 kriterier från spec)"
     source_hash: "52718cb908627213505b536daca290e189621cc2facbccbde3c9ca595a84cd1b"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-010-cockpit-acceptance.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: test_receipt
+      receipt_path: "control-plane/evidence/fas-a-010-cockpit-acceptance-receipt.json"
+      expected_branch: "kmros/cockpit"
+      expected_commit: "0000000000000000000000000000000000000000"
+      expected_check_id: "fas-a-010-cockpit-acceptance"
+
+  # ── Genuine Filip-owned choices (BLOCKED via owner_decision_receipt) ───────
+  # FAS-A-011 (canonical required skills for #spel) and FAS-A-012 (fleet
+  # owner_decision_id) are genuine Filip-owned choices. They may be BLOCKED via
+  # owner_decision_receipt when the owner_id is a placeholder or the receipt
+  # lacks an external trust anchor. Candidate-local JSON alone never counts as
+  # Filip-authorisation.
 
   - id: FAS-A-011
     text: "Canonical required skills för #spel bekräftade"
     source_hash: "63007a361bc9d43a3ff946362bcd7d498593b58fcc4d694696640e25476f1323"
     check:
       type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-011-spel-skills.json"
+      receipt_path: "control-plane/evidence/fas-a-011-spel-skills-receipt.json"
       owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
 
   - id: FAS-A-012
     text: "Fleet contract current-truth och owner decisions verifierade"
     source_hash: "14025bb2bf86e4974e78164ca46c7165cc78a9aebb51c67e159810800cc5a031"
     check:
       type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-012-fleet-contract.json"
+      receipt_path: "control-plane/evidence/fas-a-012-fleet-contract-receipt.json"
       owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+
+  # ── Technical: broad independent test suite (FAIL if missing) ──────────────
 
   - id: FAS-A-013
     text: "Bred testsvit oberoende omkörd av tredje part"
     source_hash: "1d636b1478cdc90e1773f51ddc64152dea85be2af9df27a4c4015e6a86a8aa62"
     check:
-      type: owner_decision_receipt
-      receipt_path: "control-plane/receipts/fas-a-013-test-suite.json"
-      owner_id: "PENDING_OWNER_DECISION"
-    expected: "authorized"
+      type: test_receipt
+      receipt_path: "control-plane/evidence/fas-a-013-independent-test-suite-receipt.json"
+      expected_branch: "kmros/independent-test"
+      expected_commit: "0000000000000000000000000000000000000000"
+      expected_check_id: "fas-a-013-independent-suite"

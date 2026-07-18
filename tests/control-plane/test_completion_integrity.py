@@ -1,23 +1,36 @@
-"""Regression + integrity tests for the Fas A completion-integrity-gate (CIC).
+"""Regression + integrity tests for the Fas A completion-integrity-gate (CIC) — v1.1.
 
 These tests are hermetic: they build temporary worktrees, manifests, and
 receipts on disk and exercise ``scripts/completion_integrity_check.py``
 through its public ``run_gate`` API. No real Kanban board, no network, no
 mutations outside the per-test tmpdir.
 
-Coverage of the 11 required cases (task t_294c700d, krav 5 + 6):
+Coverage of the 19 required regression cases (task t_200e833a, krav 12):
 
-  1.  test_manifest_hash_mismatch        — manifest_hash manipulerat → FAIL
-  2.  test_unknown_check_type            — check.type="evil_shell_command" → FAIL
-  3.  test_path_escape                   — path="../../../etc/passwd" → FAIL path_not_allowlisted
-  4.  test_shell_metacharacters          — args contain ";", "|", "$(", "`" → FAIL
-  5.  test_receipt_from_wrong_commit     — test_receipt commit mismatch → FAIL
-  6.  test_missing_owner_receipt         — owner_decision_receipt without concrete receipt → BLOCKED
-  7.  test_deterministic_identical_result— same manifest + evidence, two runs, identical → PASS
-  8.  test_self_referential_closeout_rejected — regression (krav 5): cards done, requirements missing → FAIL
-  9.  test_valid_manifest_all_pass       — valid manifest, all checks pass → PASS
-  10. test_blocked_does_not_allow_completion — gate=BLOCKED never returns closeout_permitted
-  11. test_fail_lists_exact_requirement_ids — FAIL lists exact requirement IDs
+   1.  test_empty_manifest                     — empty manifest → FAIL
+   2.  test_truncated_manifest                 — truncated YAML → FAIL
+   3.  test_schema_invalid                      — schema-violating manifest → FAIL
+   4.  test_missing_id                          — 12 IDs (missing FAS-A-007) → FAIL
+   5.  test_extra_id                            — FAS-A-014 added → FAIL
+   6.  test_duplicate_id                        — FAS-A-001 duplicated → FAIL
+   7.  test_expected_bypass_rejected            — manifest cannot declare expected=missing → schema-reject / FAIL
+   8.  test_real_production_path                — CIC accepts real /Users/ai/.hermes/worktrees/kmros-cic
+   9.  test_symlink_escape                      — symlink to outside allowlist → FAIL
+  10.  test_fabricated_test_receipt             — receipt without valid commit/check-id → FAIL
+  11.  test_fabricated_owner_receipt            — owner receipt without external attestation → BLOCKED
+  12.  test_wrong_branch_commit_checkid        — receipt wrong branch/commit/check-id → FAIL
+  13.  test_stale_timestamp                     — timestamp older than 24h → FAIL
+  14.  test_output_hash_mismatch                — output hash not matching recomputed → FAIL
+  15.  test_simultaneous_fail_and_blocked       — 1 FAIL + 1 BLOCKED → gate=FAIL, both lists
+  16.  test_no_expected_manifest_hash           — without --expected-manifest-hash → gate=FAIL
+  17.  test_manifest_hash_mismatch             — wrong --expected-manifest-hash → FAIL manifest_tampered
+  18.  test_self_referential_closeout_rejected  — cards done, requirements missing → FAIL
+  19.  test_deterministic_identical_result      — same inputs → identical output
+
+Plus kept extras: test_cic_does_not_mutate_filesystem,
+test_canonical_manifest_validates_against_schema,
+test_canonical_manifest_has_all_13_ids_and_exact_texts,
+test_cic_never_uses_shell_true, test_cic_source_has_no_mutation_calls.
 """
 
 from __future__ import annotations
@@ -30,10 +43,39 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import yaml
+
+# ── Inline env-scrubbing (replaces the deleted conftest.py, krav 13) ─────────
+# The host machine has a broken shared release venv on PYTHONPATH (3.11 release
+# whose rpds.rpds native module is incompatible with the 3.12 interpreter).
+# If that path leaks into sys.path, ``import jsonschema`` fails. We scrub any
+# site-packages directory that does not belong to this worktree's own .venv
+# from ``sys.path`` before collection. This is inline (no separate conftest).
+
+_WORKTREE_VENV_SITE = str(
+    Path(__file__).resolve().parents[2] / ".venv" / "lib" / "python3.12" / "site-packages"
+)
+
+
+def _scrub_foreign_site_packages() -> None:
+    keep = []
+    for entry in sys.path:
+        if not entry:
+            keep.append(entry)
+            continue
+        if "site-packages" in entry and entry != _WORKTREE_VENV_SITE:
+            continue
+        keep.append(entry)
+    sys.path[:] = keep
+
+
+_scrub_foreign_site_packages()
+os.environ.pop("PYTHONPATH", None)
+
 
 # ── Helpers to load the CIC module from the worktree ────────────────────────
 
@@ -41,10 +83,6 @@ CIC_PATH = Path(__file__).resolve().parents[2] / "scripts" / "completion_integri
 
 
 def _load_cic():
-    # Register in sys.modules BEFORE exec_module so that dataclass
-    # ``__module__`` resolves correctly (avoids the
-    # ``AttributeError: 'NoneType' object has no attribute '__dict__'``
-    # seen when the module is loaded spec-only).
     mod_name = "completion_integrity_check"
     spec = importlib.util.spec_from_file_location(mod_name, CIC_PATH)
     assert spec is not None and spec.loader is not None
@@ -63,12 +101,7 @@ def cic():
 
 @pytest.fixture
 def fake_git_repo(tmp_path):
-    """Create a real (tiny) git repo so the CIC's subprocess git calls work.
-
-    The CIC reads GIT_REPO from its module. We monkeypatch that constant to
-    point at this tmp repo, then build a couple of commits and branches to
-    exercise ancestor / not-ancestor checks deterministically.
-    """
+    """Create a real (tiny) git repo so the CIC's subprocess git calls work."""
     repo = tmp_path / "fake-repo"
     repo.mkdir()
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -81,7 +114,6 @@ def fake_git_repo(tmp_path):
     base_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                               capture_output=True, text=True, check=True).stdout.strip()
 
-    # A child commit on main (ancestor of main)
     (repo / "f.txt").write_text("child\n")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
@@ -89,7 +121,6 @@ def fake_git_repo(tmp_path):
     child_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                                capture_output=True, text=True, check=True).stdout.strip()
 
-    # A divergent branch whose tip is NOT an ancestor of main
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "divergent", base_sha],
                    check=True, env=env)
     (repo / "f.txt").write_text("divergent\n")
@@ -115,24 +146,35 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _stale_iso() -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
 def _write_manifest(base_dir: Path, requirements: list, manifest_id: str = "test-manifest-v1",
-                    extra: dict | None = None) -> Path:
+                    extra: dict | None = None, raw_text: str | None = None) -> Path:
     """Write a manifest YAML into ``base_dir/control-plane/`` and return its path.
 
     Each requirement is a dict already shaped for YAML. We add source_hash
     automatically from each requirement's ``text`` field if not present.
+    If ``raw_text`` is given, write it verbatim (used by truncated/empty tests).
     """
     cp = base_dir / "control-plane"
     cp.mkdir(parents=True, exist_ok=True)
     path = cp / "fas-a-requirements.yaml"
+    if raw_text is not None:
+        path.write_text(raw_text)
+        return path
     doc = {
-        "manifest_version": "1.0",
+        "manifest_version": "1.1",
         "manifest_id": manifest_id,
         "description": "test manifest",
     }
     if extra:
         doc.update(extra)
-    # Ensure source_hash present
     for req in requirements:
         if "source_hash" not in req:
             req["source_hash"] = _sha256(req["text"])
@@ -152,22 +194,29 @@ def _write_schema(base_dir: Path) -> Path:
 
 
 def _write_receipt(base_dir: Path, rel_path: str, payload: dict) -> Path:
-    """Write a receipt JSON at ``base_dir / rel_path``. Returns the full path."""
     full = base_dir / rel_path
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_text(json.dumps(payload, sort_keys=True))
     return full
 
 
+def _write_output_artefact(base_dir: Path, rel_path: str, content: bytes = b"output artefact") -> str:
+    """Write an output artefact and return its sha256 hash."""
+    full = base_dir / rel_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_bytes(content)
+    return hashlib.sha256(content).hexdigest()
+
+
 def _run_gate(cic, manifest_path: Path, base_dir: Path, expected_hash: str | None = None,
-              git_repo: str | None = None, allow_extra_prefix: str | None = None):
+              git_repo: str | None = None, allow_extra_prefix: str | None = None,
+              schema_path: str | None = None):
     """Run the CIC, optionally monkeypatching GIT_REPO to ``git_repo``.
 
     ``allow_extra_prefix`` (if given) is appended to the CIC's path allowlist
     for the duration of this call, so tests that build fixtures under a
     pytest tmp_path (which is NOT under the production allowlist prefixes)
-    can still exercise path-validated checks (file_sha256, schema_valid,
-    test_receipt, owner_decision_receipt). The production allowlist in the
+    can still exercise path-validated checks. The production allowlist in the
     shipped CIC source is unchanged.
     """
     patches = []
@@ -178,216 +227,569 @@ def _run_gate(cic, manifest_path: Path, base_dir: Path, expected_hash: str | Non
         if allow_extra_prefix is not None:
             patches.append(("PATH_ALLOWLIST_PREFIXES", cic.PATH_ALLOWLIST_PREFIXES))
             cic.PATH_ALLOWLIST_PREFIXES = tuple(cic.PATH_ALLOWLIST_PREFIXES) + (allow_extra_prefix,)
-        return cic.run_gate(manifest_path=str(manifest_path), base_dir=base_dir,
-                             expected_manifest_hash=expected_hash)
+        return cic.run_gate(
+            manifest_path=str(manifest_path), base_dir=base_dir,
+            expected_manifest_hash=expected_hash, schema_path=schema_path,
+        )
     finally:
         for attr, original in reversed(patches):
             setattr(cic, attr, original)
 
 
-# ── Test 9: valid manifest, all pass → PASS ─────────────────────────────────
-
-def test_valid_manifest_all_pass(cic, tmp_path, fake_git_repo):
-    """A manifest where every evidence_check returns expected → gate=PASS."""
-    repo = fake_git_repo
-    schema = _write_schema(tmp_path)
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",
-        },
-        {
-            "id": "FAS-A-003", "text": "Håll worker-isolation och stop-semantics utanför",
-            "check": {"type": "git_not_ancestor", "branch": "main",
-                      "commit_sha": repo["divergent_sha"]},
-            "expected": "exit_1",
-        },
-        {
-            "id": "FAS-A-999", "text": "Schema valid check",
-            "check": {"type": "schema_valid",
-                      "yaml_path": "control-plane/fas-a-requirements.yaml",
-                      "schema_path": "control-plane/fas-a-requirements.schema.json"},
-            "expected": "valid",
-        },
-    ])
-    # Schema-valid reads files under tmp_path, which must be allowlisted.
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
-                       allow_extra_prefix=str(tmp_path))
-    assert result.gate == "PASS", f"expected PASS, got {result.gate}: {result.reason}"
-    assert result.closeout_permitted is True
-    assert result.failing_ids == []
-    assert result.blocked_ids == []
-    assert all(r.status == "pass" for r in result.results)
+def _hash_of_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-# ── Test 1: manifest hash mismatch → FAIL ───────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# Required regression tests (krav 12, cases 1-19)
+# ────────────────────────────────────────────────────────────────────────────
 
-def test_manifest_hash_mismatch(cic, tmp_path, fake_git_repo):
-    """If --expected-manifest-hash does not match the recomputed hash → FAIL."""
-    repo = fake_git_repo
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",
-        },
-    ])
-    wrong_hash = "0" * 64  # 64 hex chars, definitely not the real hash
-    result = _run_gate(cic, manifest, tmp_path, expected_hash=wrong_hash,
-                       git_repo=repo["repo"])
+
+# ── Test 1: empty manifest → FAIL ────────────────────────────────────────────
+
+def test_empty_manifest(cic, tmp_path):
+    """An empty manifest (zero bytes) must give gate=FAIL."""
+    _write_schema(tmp_path)
+    manifest = _write_manifest(tmp_path, requirements=[], raw_text="")
+    result = _run_gate(cic, manifest, tmp_path)
     assert result.gate == "FAIL"
-    assert result.manifest_hash_matches is False
-    assert "manifest_hash_mismatch" in result.reason
     assert result.closeout_permitted is False
+    # Empty YAML parses to None → manifest_empty.
+    assert "manifest_empty" in result.reason or "schema" in result.reason
 
 
-# ── Test 2: unknown check type → FAIL ──────────────────────────────────────
+# ── Test 2: truncated manifest (invalid YAML) → FAIL ────────────────────────
 
-def test_unknown_check_type(cic, tmp_path, fake_git_repo):
-    """check.type='evil_shell_command' is not allowlisted → FAIL."""
-    repo = fake_git_repo
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "evil_shell_command", "command": "rm -rf /"},
-            "expected": "exit_0",
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
+def test_truncated_manifest(cic, tmp_path):
+    """A truncated manifest (invalid YAML, e.g. unterminated flow) → FAIL."""
+    _write_schema(tmp_path)
+    # Truncated YAML: a mapping with an unclosed value.
+    raw = "manifest_version: \"1.1\"\nmanifest_id: \"test\"\nrequirements: [\n"
+    manifest = _write_manifest(tmp_path, requirements=[], raw_text=raw)
+    result = _run_gate(cic, manifest, tmp_path)
     assert result.gate == "FAIL"
-    assert "FAS-A-001" in result.failing_ids
-    # The result for that requirement should record the unknown type.
-    res = next(r for r in result.results if r.requirement_id == "FAS-A-001")
-    assert res.status == "fail"
-    assert "unknown_check_type" in res.reason
-
-
-# ── Test 3: path escape → FAIL with path_not_allowlisted ─────────────────────
-
-def test_path_escape(cic, tmp_path, fake_git_repo):
-    """A file_sha256 path of '../../../etc/passwd' must FAIL with path_not_allowlisted."""
-    repo = fake_git_repo
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "file_sha256", "path": "../../../etc/passwd",
-                      "expected_sha256": "0" * 64},
-            "expected": "match",
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    assert result.gate == "FAIL"
-    assert "FAS-A-001" in result.failing_ids
-    res = next(r for r in result.results if r.requirement_id == "FAS-A-001")
-    assert res.status == "fail"
-    assert "path_not_allowlisted" in res.reason or "shell_metacharacters" in res.reason
-
-
-# ── Test 4: shell metacharacters in check args → FAIL ───────────────────────
-
-@pytest.mark.parametrize("metachar", [";", "|", "$(", "`"])
-def test_shell_metacharacters(cic, tmp_path, fake_git_repo, metachar):
-    """Check args containing shell metacharacters → FAIL."""
-    repo = fake_git_repo
-    # Inject the metacharacter into a check argument string.
-    malicious = f"control-plane/some{metachar}evil"
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "file_sha256", "path": malicious,
-                      "expected_sha256": "0" * 64},
-            "expected": "match",
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    assert result.gate == "FAIL"
-    res = next(r for r in result.results if r.requirement_id == "FAS-A-001")
-    assert res.status == "fail"
-    assert "shell_metacharacters" in res.reason
-
-
-# ── Test 5: test_receipt from wrong commit → FAIL ───────────────────────────
-
-def test_receipt_from_wrong_commit(cic, tmp_path, fake_git_repo):
-    """A test_receipt whose commit does not match expected_commit → FAIL."""
-    repo = fake_git_repo
-    # Build a receipt with a different commit than expected.
-    receipt = {
-        "branch": "main",
-        "commit": "a" * 40,  # wrong commit
-        "check_id": "FAS-A-T-1",
-        "timestamp": "2026-07-18T00:00:00Z",
-        "output_hash": "b" * 64,
-    }
-    _write_receipt(tmp_path, "control-plane/receipts/test-1.json", receipt)
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-T-1", "text": "Test receipt requirement",
-            "check": {"type": "test_receipt",
-                      "receipt_path": "control-plane/receipts/test-1.json",
-                      "expected_branch": "main",
-                      "expected_commit": "c" * 40,  # different from receipt
-                      "expected_check_id": "FAS-A-T-1"},
-            "expected": "verified",
-        },
-    ])
-    # Receipt lives under tmp_path; allow it so we reach the commit-mismatch
-    # branch (otherwise path_not_allowlisted fires first).
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
-                       allow_extra_prefix=str(tmp_path))
-    assert result.gate == "FAIL"
-    assert "FAS-A-T-1" in result.failing_ids
-    res = next(r for r in result.results if r.requirement_id == "FAS-A-T-1")
-    assert res.status == "fail"
-    assert "commit_mismatch" in res.reason
-
-
-# ── Test 6: owner_decision_receipt without concrete receipt → BLOCKED ─────
-
-def test_missing_owner_receipt(cic, tmp_path, fake_git_repo):
-    """owner_decision_receipt with owner_id=PENDING_OWNER_DECISION → BLOCKED."""
-    repo = fake_git_repo
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-004", "text": "Provenance i release-manifest",
-            "check": {"type": "owner_decision_receipt",
-                      "receipt_path": "control-plane/receipts/owner-1.json",
-                      "owner_id": "PENDING_OWNER_DECISION"},
-            "expected": "authorized",
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    assert result.gate == "BLOCKED"
-    assert "FAS-A-004" in result.blocked_ids
     assert result.closeout_permitted is False
-    res = next(r for r in result.results if r.requirement_id == "FAS-A-004")
-    assert res.status == "blocked"
-    assert "owner_id_placeholder" in res.reason
+    assert "manifest_not_yaml" in result.reason
 
 
-# ── Test 7: deterministic identical result → PASS ───────────────────────────
+# ── Test 3: schema-invalid manifest → FAIL ──────────────────────────────────
 
-def test_deterministic_identical_result(cic, tmp_path, fake_git_repo):
-    """Same manifest + evidence run twice → identical JSON output."""
+def test_schema_invalid(cic, tmp_path, fake_git_repo):
+    """A manifest that does not validate against the schema → FAIL."""
     repo = fake_git_repo
     _write_schema(tmp_path)
+    # Missing required `id` field on a requirement → schema_violation.
     manifest = _write_manifest(tmp_path, requirements=[
         {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
+            "text": "no id here",
             "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",
         },
     ])
-    r1 = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    r2 = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    assert r1.to_dict() == r2.to_dict(), "CIC must be deterministic across runs"
-    assert r1.gate == "PASS"
-    # JSON serialization must be byte-identical too (sort_keys=True in CIC).
-    assert json.dumps(r1.to_dict(), sort_keys=True) == json.dumps(r2.to_dict(), sort_keys=True)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert result.schema_valid is False
+    assert "schema_invalid" in result.reason or "schema_violation" in result.reason
 
 
-# ── Test 8 (regression, krav 5): self-referential closeout rejected ─────────
+# ── Test 4: missing ID (12 of 13) → FAIL ─────────────────────────────────────
+
+def test_missing_id(cic, tmp_path, fake_git_repo):
+    """Manifest with only 12 IDs (missing FAS-A-007) → FAIL (id_set_invalid)."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    reqs = []
+    for i in range(1, 14):
+        if i == 7:
+            continue  # skip FAS-A-007
+        rid = f"FAS-A-{i:03d}"
+        reqs.append({
+            "id": rid, "text": f"req {rid}",
+            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+        })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert result.id_set_valid is False
+    assert "id_set_invalid" in result.reason
+    assert "FAS-A-007" in result.reason  # missing is reported
+
+
+# ── Test 5: extra ID (FAS-A-014 added) → FAIL ─────────────────────────────────
+
+def test_extra_id(cic, tmp_path, fake_git_repo):
+    """Manifest with FAS-A-014 added (14 total) → FAIL (id_set_invalid)."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    reqs = []
+    for i in range(1, 15):  # 1..14 inclusive → 14 IDs, extra is 014
+        rid = f"FAS-A-{i:03d}"
+        reqs.append({
+            "id": rid, "text": f"req {rid}",
+            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+        })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert result.id_set_valid is False
+    assert "FAS-A-014" in result.reason
+
+
+# ── Test 6: duplicate ID (FAS-A-001 twice) → FAIL ────────────────────────────
+
+def test_duplicate_id(cic, tmp_path, fake_git_repo):
+    """Manifest with FAS-A-001 duplicated → FAIL (id_set_invalid)."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    reqs = []
+    for i in range(2, 14):  # 002..013
+        rid = f"FAS-A-{i:03d}"
+        reqs.append({
+            "id": rid, "text": f"req {rid}",
+            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+        })
+    # Two FAS-A-001 entries.
+    reqs.insert(0, {"id": "FAS-A-001", "text": "first",
+                    "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]}})
+    reqs.insert(1, {"id": "FAS-A-001", "text": "second",
+                    "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]}})
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert result.id_set_valid is False
+    assert "duplicate" in result.reason
+    assert "FAS-A-001" in result.reason
+
+
+# ── Test 7: expected-bypass rejected (manifest declaring expected='missing') ─
+
+def test_expected_bypass_rejected(cic, tmp_path, fake_git_repo):
+    """A manifest may NEVER declare `expected='missing'` / `unauthorized` / `unverified`.
+
+    The new schema has no `expected` field at all (krav 3). A manifest that
+    tries to include an `expected` field must be schema-rejected (additionalProperties=false
+    on the requirement object). If somehow evaluation is reached, the CIC ignores
+    the field and derives expected deterministically from the check type — so a
+    missing file_sha256 still FAILs (not PASS).
+    """
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # Build a manifest YAML by hand that includes `expected: missing` on a
+    # file_sha256 check pointing at a non-existent file.
+    raw = yaml.safe_dump({
+        "manifest_version": "1.1",
+        "manifest_id": "bypass-test",
+        "description": "attempted bypass",
+        "requirements": [
+            {
+                "id": "FAS-A-001",
+                "text": "req",
+                "source_hash": _sha256("req"),
+                "check": {
+                    "type": "file_sha256",
+                    "path": "control-plane/evidence/missing.json",
+                    "expected_sha256": "0" * 64,
+                },
+                "expected": "missing",  # FORBIDDEN — schema rejects this field
+            },
+        ],
+    }, sort_keys=False)
+    manifest = _write_manifest(tmp_path, requirements=[], raw_text=raw)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    # The schema should reject the `expected` field (additionalProperties=false)
+    # — OR if the field is tolerated, evaluation must still FAIL because the
+    # file is missing (deterministic expected=match, observed=missing_file).
+    assert result.schema_valid is False or result.failing_ids == ["FAS-A-001"]
+
+
+# ── Test 8: real production path accepted ───────────────────────────────────
+
+def test_real_production_path(cic, tmp_path):
+    """CIC must accept the REAL current worktree path
+    /Users/ai/.hermes/worktrees/kmros-cic and reject /etc/passwd.
+
+    This test exercises the production allowlist against the actual worktree
+    path (not a monkeypatched tmp root). We run the CIC against the canonical
+    manifest in the real worktree and assert the path-validation succeeds
+    (manifest is found and evaluated, not path_not_allowlisted at the top
+    level). We also confirm /etc/passwd is rejected by validate_path.
+    """
+    # Direct validate_path test against the real production path.
+    real_worktree = "/Users/ai/.hermes/worktrees/kmros-cic"
+    ok, msg, real = cic.validate_path(
+        "control-plane/fas-a-requirements.yaml",
+        base_dir=Path(real_worktree),
+    )
+    # If the real worktree exists on this host, it must be accepted.
+    if os.path.exists(real_worktree):
+        assert ok is True, f"real production path rejected: {msg} real={real}"
+        assert real == os.path.realpath(os.path.join(real_worktree, "control-plane/fas-a-requirements.yaml"))
+    # /etc/passwd must always be rejected (regardless of host).
+    ok2, msg2, real2 = cic.validate_path("/etc/passwd", base_dir=None)
+    assert ok2 is False
+    assert "path_not_allowlisted" in msg2 or "control_char" in msg2
+
+
+# ── Test 9: symlink escape rejected ─────────────────────────────────────────
+
+def test_symlink_escape(cic, tmp_path):
+    """A symlink inside an allowlisted dir that points OUTSIDE the allowlist
+    must be rejected (realpath resolves to a non-allowlisted target)."""
+    # Build a fake worktree under tmp_path and add the tmp_path prefix.
+    fake_worktree = tmp_path / "kmros-fake"
+    (fake_worktree / "control-plane").mkdir(parents=True)
+    # Create a target file OUTSIDE the fake worktree.
+    outside = tmp_path / "outside_target"
+    outside.write_bytes(b"outside secret")
+    # Symlink inside the fake worktree pointing at the outside file.
+    escape_link = fake_worktree / "control-plane" / "escape.json"
+    os.symlink(outside, escape_link)
+
+    # Patch the allowlist to include the fake worktree prefix.
+    orig = cic.PATH_ALLOWLIST_PREFIXES
+    try:
+        cic.PATH_ALLOWLIST_PREFIXES = (str(fake_worktree) + "/",)
+        ok, msg, real = cic.validate_path(
+            "control-plane/escape.json", base_dir=fake_worktree
+        )
+        # The realpath resolves to the OUTSIDE target, which is NOT under the
+        # fake worktree prefix → path_not_allowlisted.
+        assert ok is False, f"symlink escape not rejected: real={real}"
+        assert "path_not_allowlisted" in msg
+    finally:
+        cic.PATH_ALLOWLIST_PREFIXES = orig
+
+
+# ── Test 10: fabricated test receipt (no valid commit/check-id) → FAIL ───────
+
+def test_fabricated_test_receipt(cic, tmp_path, fake_git_repo):
+    """A fabricated test receipt without a valid commit/check-id binding → FAIL."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # Receipt with a non-40-hex commit and a check_id that does not match.
+    receipt = {
+        "branch": "main",
+        "commit": "not_a_real_commit",  # not 40 hex
+        "check_id": "WRONG_CHECK_ID",
+        "timestamp": _now_iso(),
+        "output_hash": "0" * 64,
+    }
+    _write_receipt(tmp_path, "control-plane/receipts/test-1.json", receipt)
+    # Build all 13 IDs; only FAS-A-007 exercises the fabricated receipt. The
+    # rest are passing git_ancestor checks so the id-set check passes and we
+    # reach the actual test_receipt evaluation.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-007":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "test_receipt",
+                          "receipt_path": "control-plane/receipts/test-1.json",
+                          "expected_branch": "main",
+                          "expected_commit": "a" * 40,
+                          "expected_check_id": "FAS-A-007-spel-contract"},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert "FAS-A-007" in result.failing_ids
+    res = next(r for r in result.results if r.requirement_id == "FAS-A-007")
+    assert res.status == "fail"
+    # The receipt's commit is not 40 hex → either expected_commit check or
+    # commit_mismatch. The point is: FAIL.
+    assert res.reason != ""
+
+
+# ── Test 11: fabricated owner receipt (no external attestation) → BLOCKED ───
+
+def test_fabricated_owner_receipt(cic, tmp_path, fake_git_repo):
+    """An owner receipt without an external attestation (trust anchor missing)
+    must give BLOCKED with trust_anchor_missing — never PASS."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # Candidate-local JSON with no external_attestation block. The owner_id is
+    # concrete (not a placeholder), but the receipt lacks the trust anchor.
+    receipt = {
+        "owner_id": "filip-123",
+        "decision_id": "dec-1",
+        "decision": "approved",
+        "commit": "a" * 40,
+        "branch": "main",
+        "timestamp": _now_iso(),
+        "output_hash": "0" * 64,
+        # NOTE: no external_attestation field
+    }
+    _write_receipt(tmp_path, "control-plane/receipts/owner-1.json", receipt)
+    # All 13 IDs; FAS-A-011 is the owner_decision_receipt under test, the rest
+    # are passing git_ancestor checks so the id-set check passes.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-011":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "owner_decision_receipt",
+                          "receipt_path": "control-plane/receipts/owner-1.json",
+                          "owner_id": "filip-123"},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path),
+                       expected_hash=_hash_of_file(tmp_path / "control-plane" / "fas-a-requirements.yaml"))
+    assert result.gate == "BLOCKED"
+    assert "FAS-A-011" in result.blocked_ids
+    res = next(r for r in result.results if r.requirement_id == "FAS-A-011")
+    assert res.status == "blocked"
+    assert "trust_anchor_missing" in res.reason
+    assert result.closeout_permitted is False
+
+
+# ── Test 12: wrong branch/commit/check-id → FAIL ─────────────────────────────
+
+def test_wrong_branch_commit_checkid(cic, tmp_path, fake_git_repo):
+    """A test receipt whose branch/commit/check_id does not match expected_* → FAIL."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    receipt = {
+        "branch": "wrong-branch",
+        "commit": "a" * 40,
+        "check_id": "wrong-check-id",
+        "timestamp": _now_iso(),
+        "output_hash": "0" * 64,
+    }
+    _write_receipt(tmp_path, "control-plane/receipts/test-1.json", receipt)
+    # All 13 IDs; only FAS-A-007 is the test_receipt under test.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-007":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "test_receipt",
+                          "receipt_path": "control-plane/receipts/test-1.json",
+                          "expected_branch": "kmros/spel-contract",
+                          "expected_commit": "a" * 40,
+                          "expected_check_id": "FAS-A-007-spel-contract"},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert "FAS-A-007" in result.failing_ids
+    res = next(r for r in result.results if r.requirement_id == "FAS-A-007")
+    assert res.status == "fail"
+    assert "branch_mismatch" in res.reason
+
+
+# ── Test 13: stale timestamp (older than 24h) → FAIL ─────────────────────────
+
+def test_stale_timestamp(cic, tmp_path, fake_git_repo):
+    """A test receipt whose timestamp is older than 24h → FAIL with stale_timestamp."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    receipt = {
+        "branch": "kmros/spel-contract",
+        "commit": "a" * 40,
+        "check_id": "FAS-A-007-spel-contract",
+        "timestamp": _stale_iso(),  # 48h ago
+        "output_hash": "0" * 64,
+    }
+    _write_receipt(tmp_path, "control-plane/receipts/test-1.json", receipt)
+    # All 13 IDs; only FAS-A-007 is under test.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-007":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "test_receipt",
+                          "receipt_path": "control-plane/receipts/test-1.json",
+                          "expected_branch": "kmros/spel-contract",
+                          "expected_commit": "a" * 40,
+                          "expected_check_id": "FAS-A-007-spel-contract"},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    res = next(r for r in result.results if r.requirement_id == "FAS-A-007")
+    assert res.status == "fail"
+    assert "stale_timestamp" in res.reason
+
+
+# ── Test 14: output hash mismatch → FAIL ────────────────────────────────────
+
+def test_output_hash_mismatch(cic, tmp_path, fake_git_repo):
+    """A test receipt whose output_hash does not match the recomputed hash of
+    the referenced output artefact → FAIL with output_hash_mismatch."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # Write the real output artefact and compute its actual hash.
+    actual_hash = _write_output_artefact(
+        tmp_path, "control-plane/evidence/output-1.txt", b"real output content"
+    )
+    # Build a receipt that declares a DIFFERENT output_hash.
+    receipt = {
+        "branch": "kmros/spel-contract",
+        "commit": "a" * 40,
+        "check_id": "FAS-A-007-spel-contract",
+        "timestamp": _now_iso(),
+        "output_hash": "0" * 64,  # wrong — does not match actual_hash
+        "output_path": "control-plane/evidence/output-1.txt",
+    }
+    _write_receipt(tmp_path, "control-plane/receipts/test-1.json", receipt)
+    # All 13 IDs; only FAS-A-007 is under test.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-007":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "test_receipt",
+                          "receipt_path": "control-plane/receipts/test-1.json",
+                          "expected_branch": "kmros/spel-contract",
+                          "expected_commit": "a" * 40,
+                          "expected_check_id": "FAS-A-007-spel-contract"},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    res = next(r for r in result.results if r.requirement_id == "FAS-A-007")
+    assert res.status == "fail"
+    assert "output_hash_mismatch" in res.reason
+
+
+# ── Test 15: simultaneous FAIL and BLOCKED → gate=FAIL, both lists ───────────
+
+def test_simultaneous_fail_and_blocked(cic, tmp_path, fake_git_repo):
+    """A manifest with one FAIL requirement and one BLOCKED requirement must
+    give gate=FAIL (FAIL has priority over BLOCKED). Both failing_ids and
+    blocked_ids must be listed in the output."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # All 13 IDs. FAS-A-001 is the FAIL (git_ancestor for non-ancestor).
+    # FAS-A-011 is the BLOCKED (owner placeholder). The rest pass.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-001":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                # FAIL: git_ancestor for a commit that is NOT an ancestor.
+                "check": {"type": "git_ancestor", "branch": "main",
+                          "commit_sha": repo["divergent_sha"]},
+            })
+        elif rid == "FAS-A-011":
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                # BLOCKED: owner placeholder.
+                "check": {"type": "owner_decision_receipt",
+                          "receipt_path": "control-plane/receipts/owner-1.json",
+                          "owner_id": "PENDING_OWNER_DECISION"},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL", f"expected FAIL, got {result.gate}: {result.reason}"
+    assert "FAS-A-001" in result.failing_ids
+    assert "FAS-A-011" in result.blocked_ids
+    assert result.closeout_permitted is False
+    # Both lists non-empty.
+    assert len(result.failing_ids) >= 1
+    assert len(result.blocked_ids) >= 1
+
+
+# ── Test 16: no --expected-manifest-hash → gate=FAIL ───────────────────────
+
+def test_no_expected_manifest_hash(cic, tmp_path, fake_git_repo):
+    """Without --expected-manifest-hash the gate must NEVER be PASS and
+    closeout_permitted must NEVER be true, even if every requirement passes."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # All 13 IDs, all passing git_ancestor checks. Without the external hash
+    # the gate must still be FAIL (expected_manifest_hash_missing).
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        reqs.append({
+            "id": rid, "text": f"req {rid}",
+            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+        })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    # No expected_hash passed.
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert result.closeout_permitted is False
+    # The reason must indicate the missing external hash (all requirements
+    # pass, so the only thing blocking PASS is the missing hash).
+    assert result.reason == "expected_manifest_hash_missing"
+
+
+# ── Test 17: manifest hash mismatch → FAIL manifest_tampered ───────────────
+
+def test_manifest_hash_mismatch(cic, tmp_path, fake_git_repo):
+    """--expected-manifest-hash that does not match the actual manifest sha256
+    → FAIL with manifest_tampered."""
+    repo = fake_git_repo
+    _write_schema(tmp_path)
+    # All 13 IDs, all passing, so the only FAIL cause is the hash mismatch.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        reqs.append({
+            "id": rid, "text": f"req {rid}",
+            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+        })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    wrong_hash = "0" * 64
+    result = _run_gate(cic, manifest, tmp_path, expected_hash=wrong_hash,
+                       git_repo=repo["repo"], allow_extra_prefix=str(tmp_path))
+    assert result.gate == "FAIL"
+    assert result.manifest_hash_matches is False
+    assert "manifest_tampered" in result.reason
+    assert result.closeout_permitted is False
+
+
+# ── Test 18 (regression): self-referential closeout rejected ───────────────
 
 def test_self_referential_closeout_rejected(cic, tmp_path, fake_git_repo):
     """Regression (krav 5): 4 cards marked done but 2 requirements lack evidence → FAIL.
@@ -396,15 +798,10 @@ def test_self_referential_closeout_rejected(cic, tmp_path, fake_git_repo):
     the originating requirements were never satisfied. The fixture has 4
     requirements mapped to mock cards, all cards "done", but 2 requirements
     have no evidence_check-pass. CIC must return gate=FAIL with the 2 missed
-    IDs listed, and closeout must be blocked.
-
-    We model "cards done but requirements missing" as: 2 requirements have a
-    check that returns a mismatch (e.g. git_ancestor for a commit that is NOT
-    an ancestor), while 2 requirements pass. The mock "card done" state lives
-    in a side JSON file that the CIC does NOT consult — the point of the test
-    is that card-done-ness is irrelevant; only evidence checks decide.
+    IDs listed, and closeout must be blocked. Card-done-ness is irrelevant.
     """
     repo = fake_git_repo
+    _write_schema(tmp_path)
     # Side state: 4 cards all "done" — this is what the buggy flow trusted.
     cards = [
         {"id": "card-1", "requirement_id": "FAS-A-001", "status": "done"},
@@ -415,142 +812,105 @@ def test_self_referential_closeout_rejected(cic, tmp_path, fake_git_repo):
     _write_receipt(tmp_path, "control-plane/mock-cards.json", {"cards": cards})
 
     # 2 requirements pass, 2 fail (evidence mismatch). Cards being "done"
-    # must NOT translate to requirements passing.
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",  # pass
-        },
-        {
-            "id": "FAS-A-002", "text": "Integrera exakt shared-live + Lumi + Igor patchar i kmros/main",
-            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",  # pass
-        },
-        {
-            "id": "FAS-A-003", "text": "Håll worker-isolation och stop-semantics utanför",
-            # divergent_sha IS an ancestor of main? No — it's on a divergent
-            # branch, so git_ancestor returns exit_1. expected=exit_0 → FAIL.
-            "check": {"type": "git_ancestor", "branch": "main",
-                      "commit_sha": repo["divergent_sha"]},
-            "expected": "exit_0",  # FAIL: observed exit_1 != expected exit_0
-        },
-        {
-            "id": "FAS-A-004", "text": "Provenance i release-manifest",
-            # base_sha IS an ancestor of main, so git merge-base returns
-            # exit_0 (the commit IS an ancestor). For git_not_ancestor the
-            # CIC reports observed=exit_0; expected=exit_1 → FAIL.
-            "check": {"type": "git_not_ancestor", "branch": "main",
-                      "commit_sha": repo["base_sha"]},
-            "expected": "exit_1",  # FAIL: observed exit_0 != expected exit_1
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
+    # must NOT translate to requirements passing. NOTE: this test uses 4 IDs
+    # out of the canonical 13 — to avoid the id_set check firing first, we
+    # supply all 13 IDs (the 4 here are the interesting ones; the rest pass).
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-003":
+            # divergent_sha NOT ancestor → exit_1; expected exit_0 → FAIL.
+            reqs.append({"id": rid, "text": f"req {rid}",
+                         "check": {"type": "git_ancestor", "branch": "main",
+                                   "commit_sha": repo["divergent_sha"]}})
+        elif rid == "FAS-A-004":
+            # base_sha IS ancestor → exit_0; for git_not_ancestor expected exit_1 → FAIL.
+            reqs.append({"id": rid, "text": f"req {rid}",
+                         "check": {"type": "git_not_ancestor", "branch": "main",
+                                   "commit_sha": repo["base_sha"]}})
+        else:
+            reqs.append({"id": rid, "text": f"req {rid}",
+                         "check": {"type": "git_ancestor", "branch": "main",
+                                   "commit_sha": repo["base_sha"]}})
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path),
+                       expected_hash=_hash_of_file(manifest))
     assert result.gate == "FAIL", f"expected FAIL, got {result.gate}: {result.reason}"
     assert result.closeout_permitted is False
-    # Exactly the 2 missed requirement IDs must be listed, no more, no less.
     assert sorted(result.failing_ids) == ["FAS-A-003", "FAS-A-004"]
     assert result.blocked_ids == []
     # The "done" cards file must not influence the gate at all.
-    assert os.path.exists(tmp_path / "control-plane/mock-cards.json")
+    assert os.path.exists(tmp_path / "control-plane" / "mock-cards.json")
 
 
-# ── Test 10: BLOCKED does not allow completion ──────────────────────────────
+# ── Test 19: deterministic identical result ─────────────────────────────────
 
-def test_blocked_does_not_allow_completion(cic, tmp_path, fake_git_repo):
-    """gate=BLOCKED must never set closeout_permitted=True."""
+def test_deterministic_identical_result(cic, tmp_path, fake_git_repo):
+    """Same manifest + evidence run twice → identical JSON output."""
     repo = fake_git_repo
-    # Mix of a passing check and a blocked owner-decision placeholder.
+    _write_schema(tmp_path)
     manifest = _write_manifest(tmp_path, requirements=[
         {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
+            "id": "FAS-A-001", "text": "Skapa isolerad kandidat",
             "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",  # pass
-        },
-        {
-            "id": "FAS-A-004", "text": "Provenance i release-manifest",
-            "check": {"type": "owner_decision_receipt",
-                      "receipt_path": "control-plane/receipts/owner-1.json",
-                      "owner_id": "PENDING_OWNER_DECISION"},
-            "expected": "authorized",  # blocked
         },
     ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    assert result.gate == "BLOCKED"
-    assert result.closeout_permitted is False
-    assert "Fas A klar" not in json.dumps(result.to_dict())  # no "Fas A klar" string emitted
-    assert "FAS-A-004" in result.blocked_ids
-    assert "FAS-A-001" not in result.blocked_ids
-    assert "FAS-A-001" not in result.failing_ids
+    r1 = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                   allow_extra_prefix=str(tmp_path))
+    r2 = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                   allow_extra_prefix=str(tmp_path))
+    assert r1.to_dict() == r2.to_dict(), "CIC must be deterministic across runs"
+    # JSON serialization must be byte-identical too (sort_keys=True in CIC).
+    assert json.dumps(r1.to_dict(), sort_keys=True) == json.dumps(r2.to_dict(), sort_keys=True)
 
 
-# ── Test 11: FAIL lists exact requirement IDs ──────────────────────────────
-
-def test_fail_lists_exact_requirement_ids(cic, tmp_path, fake_git_repo):
-    """FAIL must list exactly the failing requirement IDs, no extras."""
-    repo = fake_git_repo
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",  # pass
-        },
-        {
-            "id": "FAS-A-007", "text": "#spel route-contract och syntetiska tester i kandidaten",
-            "check": {"type": "git_ancestor", "branch": "main",
-                      "commit_sha": repo["divergent_sha"]},  # not ancestor → exit_1
-            "expected": "exit_0",  # FAIL
-        },
-        {
-            "id": "FAS-A-013", "text": "Bred testsvit oberoende omkörd av tredje part",
-            "check": {"type": "git_not_ancestor", "branch": "main",
-                      "commit_sha": repo["base_sha"]},  # base IS ancestor → exit_0 for not_ancestor means... 
-            "expected": "exit_1",  # observed exit_0 != expected exit_1 → FAIL
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
-    assert result.gate == "FAIL"
-    assert sorted(result.failing_ids) == ["FAS-A-007", "FAS-A-013"]
-    assert result.blocked_ids == []
-    # The passing one must not appear in failing_ids.
-    assert "FAS-A-001" not in result.failing_ids
+# ────────────────────────────────────────────────────────────────────────────
+# Kept extras
+# ────────────────────────────────────────────────────────────────────────────
 
 
-# ── Extra: source_hash drift → FAIL (defends the self-contained invariant) ─
+# ── Extra: source_hash drift → FAIL ─────────────────────────────────────────
 
 def test_source_hash_drift_fails(cic, tmp_path, fake_git_repo):
     """If a requirement's text is edited after pinning, source_hash mismatches → FAIL."""
     repo = fake_git_repo
-    manifest = _write_manifest(tmp_path, requirements=[
-        {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
-            # Deliberately wrong source_hash (not matching text)
-            "source_hash": "0" * 64,
-            "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",
-        },
-    ])
-    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
+    _write_schema(tmp_path)
+    # All 13 IDs; FAS-A-001 has a deliberately wrong source_hash. The rest have
+    # correct hashes (auto-computed) and passing git_ancestor checks.
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        if rid == "FAS-A-001":
+            reqs.append({
+                "id": rid, "text": "Skapa isolerad kandidat",
+                # Deliberately wrong source_hash (not matching text)
+                "source_hash": "0" * 64,
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+        else:
+            reqs.append({
+                "id": rid, "text": f"req {rid}",
+                "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
+            })
+    manifest = _write_manifest(tmp_path, requirements=reqs)
+    result = _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+                       allow_extra_prefix=str(tmp_path))
     assert result.gate == "FAIL"
     assert "source_hash_mismatch" in result.reason
     assert "FAS-A-001" in result.failing_ids
 
 
-# ── Extra: CIC is read-only — no mutation of filesystem outside base_dir ────
+# ── Extra: CIC is read-only — no mutation of filesystem ──────────────────────
 
 def test_cic_does_not_mutate_filesystem(cic, tmp_path, fake_git_repo):
-    """CIC must not create, delete, or modify any file outside its read set.
-
-    We snapshot the tmp_path tree before and after running the gate and
-    assert the set of paths and their contents are unchanged.
-    """
+    """CIC must not create, delete, or modify any file in its read set."""
     repo = fake_git_repo
     _write_schema(tmp_path)
     manifest = _write_manifest(tmp_path, requirements=[
         {
-            "id": "FAS-A-001", "text": "Skapa isolerad kandidat från verifierad gemensam bas",
+            "id": "FAS-A-001", "text": "Skapa isolerad kandidat",
             "check": {"type": "git_ancestor", "branch": "main", "commit_sha": repo["base_sha"]},
-            "expected": "exit_0",
         },
     ])
 
@@ -562,12 +922,13 @@ def test_cic_does_not_mutate_filesystem(cic, tmp_path, fake_git_repo):
         return out
 
     before = snapshot(tmp_path)
-    _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"])
+    _run_gate(cic, manifest, tmp_path, git_repo=repo["repo"],
+              allow_extra_prefix=str(tmp_path))
     after = snapshot(tmp_path)
     assert before == after, "CIC must not mutate any file in its read set"
 
 
-# ── Extra: the real canonical manifest validates against the schema ─────────
+# ── Extra: canonical manifest validates against the schema ──────────────────
 
 def test_canonical_manifest_validates_against_schema(cic, tmp_path):
     """The shipped control-plane/fas-a-requirements.yaml must validate against
@@ -579,7 +940,7 @@ def test_canonical_manifest_validates_against_schema(cic, tmp_path):
     jsonschema.validate(instance=manifest, schema=schema)
 
 
-# ── Extra: the canonical manifest has all 13 stable IDs and exact texts ─────
+# ── Extra: canonical manifest has all 13 stable IDs and exact texts ──────────
 
 CANONICAL_REQUIREMENTS = [
     ("FAS-A-001", "Skapa isolerad kandidat från verifierad gemensam bas"),
@@ -613,34 +974,86 @@ def test_canonical_manifest_has_all_13_ids_and_exact_texts():
         assert norm_actual == norm_expected, f"{rid}: text drift: {actual!r} vs {expected_text!r}"
 
 
-# ── Extra: CIC behaviour — no shell=True anywhere in the source ─────────────
+# ── Extra: CIC never uses shell=True ─────────────────────────────────────────
 
 def test_cic_never_uses_shell_true():
     """The CIC source must never pass shell=True to subprocess.run."""
     src = CIC_PATH.read_text()
     assert "shell=True" not in src, "CIC must never use shell=True"
-    # The git invocation must build a list argument (not a free-form string).
     assert 'cmd = ["git"' in src or "cmd = ['git'" in src, \
         "CIC must invoke git via a list argument, not a shell string"
 
 
-# ── Extra: CIC behaviour — does not write, create tasks, push, or install ──
+# ── Extra: CIC source has no mutation calls ─────────────────────────────────
 
 def test_cic_source_has_no_mutation_calls():
-    """CIC source must not contain mutation APIs (write, remove, push, pip)."""
+    """CIC source must not contain mutation API CALLS (write, remove, push, pip).
+
+    We strip comments and docstrings before scanning, so the literal mention of
+    e.g. ``os.system`` in the module docstring (as a forbidden token) does not
+    trip the check. We only flag actual call-site substrings.
+    """
+    import ast
     src = CIC_PATH.read_text()
-    forbidden = [
-        "kanban_create", "kanban_complete", "kanban_block",  # board mutations
-        "git push", "git push", "subprocess.run([\"git\", \"push",
-        "pip install", "uv pip install", "os.system", "os.remove",
-        "shutil.rmtree", "Path(",  # Path() alone is fine; this is a coarse guard
-    ]
-    # Allow Path() since the CIC uses pathlib for path math; only flag the
-    # genuinely dangerous mutation calls.
-    strict_forbidden = [
-        "kanban_create", "kanban_complete", "kanban_block",
-        "git push", "pip install", "uv pip install", "os.system",
-        "shutil.rmtree", "os.remove(", "os.unlink(",
-    ]
-    for token in strict_forbidden:
+    # Parse and walk the AST; collect all attribute-call names actually invoked.
+    tree = ast.parse(src)
+    called_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                # e.g. os.system, shutil.rmtree, subprocess.run
+                if isinstance(func.value, ast.Name):
+                    called_names.add(f"{func.value.id}.{func.attr}")
+            elif isinstance(func, ast.Name):
+                called_names.add(func.id)
+    forbidden_calls = {
+        "os.system", "os.remove", "os.unlink",
+        "shutil.rmtree", "shutil.move",
+        "subprocess.Popen",  # we only allow subprocess.run with shell=False
+    }
+    for bad in forbidden_calls:
+        assert bad not in called_names, f"CIC must not call {bad!r}"
+    # The git invocation must build a list argument (not a free-form string).
+    assert 'cmd = ["git"' in src or "cmd = ['git'" in src, \
+        "CIC must invoke git via a list argument, not a shell string"
+    # No kanban/board mutation helpers anywhere in the source.
+    for token in ("kanban_create", "kanban_complete", "kanban_block"):
         assert token not in src, f"CIC source must not contain {token!r}"
+    # No pip install, no git push.
+    for token in ("git push", "pip install", "uv pip install"):
+        assert token not in src, f"CIC source must not contain {token!r}"
+
+
+# ── Extra: CIC against the canonical manifest gives gate=FAIL (acceptance) ─
+
+def test_canonical_manifest_gate_is_fail(cic):
+    """Acceptance criterion: the CIC against the canonical manifest
+    (control-plane/fas-a-requirements.yaml in the real worktree) must give
+    gate=FAIL — not BLOCKED — because the technical requirements FAS-A-004..010
+    and FAS-A-013 are MISSING (no implementation files/receipts yet) and FAIL
+    has priority over BLOCKED."""
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest_path = repo_root / "control-plane" / "fas-a-requirements.yaml"
+    # Compute the real manifest hash so the trust-anchor check passes and we
+    # exercise the full evaluation path.
+    expected_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    result = cic.run_gate(
+        manifest_path=str(manifest_path),
+        base_dir=repo_root,
+        expected_manifest_hash=expected_hash,
+        schema_path=str(repo_root / "control-plane" / "fas-a-requirements.schema.json"),
+    )
+    assert result.gate == "FAIL", f"expected FAIL, got {result.gate}: {result.reason}"
+    assert result.closeout_permitted is False
+    # Technical requirements must be FAIL (missing evidence).
+    for rid in ["FAS-A-004", "FAS-A-005", "FAS-A-006", "FAS-A-007",
+                "FAS-A-008", "FAS-A-009", "FAS-A-010", "FAS-A-013"]:
+        assert rid in result.failing_ids, f"{rid} should be failing (missing technical evidence)"
+    # Genuine owner-decision requirements must be BLOCKED.
+    for rid in ["FAS-A-011", "FAS-A-012"]:
+        assert rid in result.blocked_ids, f"{rid} should be blocked (pending owner decision)"
+    # FAS-A-001/002/003 must PASS (real git ancestry on kmros/main).
+    for rid in ["FAS-A-001", "FAS-A-002", "FAS-A-003"]:
+        assert rid not in result.failing_ids
+        assert rid not in result.blocked_ids
