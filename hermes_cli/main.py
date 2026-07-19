@@ -2258,6 +2258,17 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    explicit_session_id = getattr(args, "session_id", None)
+    skip_memory = bool(getattr(args, "skip_memory", False))
+    if explicit_session_id and (
+        getattr(args, "resume", None) or getattr(args, "continue_last", None)
+    ):
+        print("--session-id creates a fresh session and cannot be combined with --resume/--continue.")
+        sys.exit(2)
+    if use_tui and (explicit_session_id or skip_memory):
+        print("--session-id and --skip-memory are supported only by classic 'hermes chat --cli'.")
+        sys.exit(2)
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):
@@ -2421,11 +2432,13 @@ def cmd_chat(args):
         "query": args.query,
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
+        "session_id": explicit_session_id,
         "worktree": getattr(args, "worktree", False),
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
+        "skip_memory": skip_memory,
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
     }

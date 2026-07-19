@@ -435,6 +435,49 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     return resolved.resolve()
 
 
+def _controller_workspace_scope_error(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    write: bool = False,
+) -> str | None:
+    """Enforce an exact controller-owned file boundary when one is present.
+
+    Normal Hermes sessions are unchanged.  The local kmrOS loop controller
+    sets both variables for a file-only operator session, making attempts to
+    read outside the bound workspace or write outside the contract's exact
+    path set fail before filesystem I/O.
+    """
+
+    root_value = os.environ.get("HERMES_CONTROLLER_WORKSPACE_ROOT", "").strip()
+    if not root_value:
+        return None
+    try:
+        root = Path(root_value).expanduser().resolve(strict=True)
+        resolved = _resolve_path_for_task(filepath, task_id)
+        if not isinstance(resolved, Path):
+            return "Controller workspace scope requires a local filesystem backend."
+        relative = resolved.relative_to(root).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return f"Controller scope blocked path outside the bound workspace: {filepath}"
+    if not write:
+        return None
+    try:
+        allowed_raw = os.environ["HERMES_CONTROLLER_ALLOWED_WRITE_PATHS"]
+        allowed_value = json.loads(allowed_raw)
+    except (KeyError, json.JSONDecodeError):
+        return "Controller write scope is missing or invalid."
+    if (
+        not isinstance(allowed_value, list)
+        or any(not isinstance(item, str) for item in allowed_value)
+        or len(allowed_value) != len(set(allowed_value))
+    ):
+        return "Controller write scope is missing or invalid."
+    if relative not in set(allowed_value):
+        return f"Controller scope blocked path outside the exact write set: {filepath}"
+    return None
+
+
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
@@ -1177,6 +1220,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
+        scope_error = _controller_workspace_scope_error(path, task_id)
+        if scope_error:
+            return json.dumps({"error": scope_error})
+
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
@@ -1646,6 +1693,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    scope_error = _controller_workspace_scope_error(path, task_id, write=True)
+    if scope_error:
+        return tool_error(scope_error)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1774,6 +1824,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        scope_error = _controller_workspace_scope_error(_p, task_id, write=True)
+        if scope_error:
+            return tool_error(scope_error)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -1919,6 +1972,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+
+        scope_error = _controller_workspace_scope_error(path, task_id)
+        if scope_error:
+            return tool_error(scope_error)
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated

@@ -317,6 +317,15 @@ def build_top_level_parser():
         help="Resume a previous session by ID (shown on exit)",
     )
     chat_parser.add_argument(
+        "--session-id",
+        default=None,
+        metavar="SESSION_ID",
+        help=(
+            "Create a fresh session with this explicit ID. Refuses an existing ID and cannot "
+            "be combined with --resume/--continue. Intended for trusted local controllers."
+        ),
+    )
+    chat_parser.add_argument(
         "--continue",
         "-c",
         dest="continue_last",
@@ -384,6 +393,15 @@ def build_top_level_parser():
         action="store_true",
         default=argparse.SUPPRESS,
         help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.",
+    )
+    chat_parser.add_argument(
+        "--skip-memory",
+        action="store_true",
+        default=False,
+        help=(
+            "Start without persistent MEMORY/USER or external memory-provider context while "
+            "still loading project rules, SOUL.md and explicitly requested skills."
+        ),
     )
     _inherited_flag(
         chat_parser,

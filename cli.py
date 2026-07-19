@@ -3659,6 +3659,33 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
+def _resolve_initial_session_id(
+    *,
+    resume: str | None,
+    session_id: str | None,
+    session_db: Any,
+    session_start: datetime,
+) -> tuple[str, bool]:
+    """Select an initial session without allowing controller ID reuse."""
+    if resume and session_id:
+        raise ValueError("session_id cannot be combined with resume")
+    if session_id:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,199}", session_id):
+            raise ValueError(
+                "session_id must be 8-200 characters using only letters, digits, '.', '_', ':' or '-'"
+            )
+        if session_db is None:
+            raise ValueError(
+                "session_id freshness cannot be verified because the session store is unavailable"
+            )
+        if session_db.get_session(session_id) is not None:
+            raise ValueError(f"session_id already exists: {session_id}")
+        return session_id, False
+    if resume:
+        return resume, True
+    timestamp_str = session_start.strftime("%Y%m%d_%H%M%S")
+    return f"{timestamp_str}_{uuid.uuid4().hex[:6]}", False
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -3678,9 +3705,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         verbose: Optional[bool] = None,
         compact: bool = False,
         resume: str = None,
+        session_id: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        skip_memory: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -3695,7 +3724,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
+            session_id: Explicit ID for a fresh session; existing IDs are rejected
             pass_session_id: Include the session ID in the agent's system prompt
+            skip_memory: Skip persistent memory while retaining project context files
         """
         # Initialize Rich console
         self.console = Console()
@@ -3888,6 +3919,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        self.skip_memory = bool(skip_memory) or self.ignore_rules
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -4004,14 +4036,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
         
-        # Session ID: reuse existing one when resuming, otherwise generate fresh
-        if resume:
-            self.session_id = resume
-            self._resumed = True
-        else:
-            timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-            short_uuid = uuid.uuid4().hex[:6]
-            self.session_id = f"{timestamp_str}_{short_uuid}"
+        # An explicit controller-provided ID is fresh and fail-closed. It must
+        # never alias an existing transcript or a resume.
+        self.session_id, self._resumed = _resolve_initial_session_id(
+            resume=resume,
+            session_id=session_id,
+            session_db=self._session_db,
+            session_start=self.session_start,
+        )
         
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
@@ -15684,12 +15716,14 @@ def main(
     list_toolsets: bool = False,
     gateway: bool = False,
     resume: str = None,
+    session_id: str = None,
     worktree: bool = False,
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    skip_memory: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -15710,6 +15744,7 @@ def main(
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
+        session_id: Create a fresh session with this explicit ID
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
     
@@ -15822,9 +15857,11 @@ def main(
         verbose=verbose,
         compact=compact,
         resume=resume,
+        session_id=session_id,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        skip_memory=skip_memory,
     )
 
     if parsed_skills:
