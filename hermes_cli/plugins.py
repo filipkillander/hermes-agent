@@ -2041,6 +2041,8 @@ def discover_plugins(force: bool = False) -> None:
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
     """
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return
     get_plugin_manager().discover_and_load(force=force)
 
 
@@ -2049,6 +2051,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return []
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
@@ -2057,11 +2061,15 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from middleware callbacks.
     """
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return []
     return get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:
     """Return True when middleware callbacks are registered for ``kind``."""
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return False
     manager = get_plugin_manager()
     method = getattr(manager, "has_middleware", None)
     if callable(method):
@@ -2071,6 +2079,8 @@ def has_middleware(kind: str) -> bool:
 
 def has_hook(hook_name: str) -> bool:
     """Return True when a hook has registered callbacks."""
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return False
     return get_plugin_manager().has_hook(hook_name)
 
 
