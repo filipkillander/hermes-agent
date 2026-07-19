@@ -7745,6 +7745,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.worker_toolset_policy import filter_worker_toolsets
 
         token = set_hermes_home_override(hermes_home)
         try:
@@ -7753,7 +7754,10 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         finally:
             reset_hermes_home_override(token)
         toolsets.add("kanban")
-        return sorted(toolsets)
+        delegation_cfg = cfg.get("delegation") if isinstance(cfg, dict) else None
+        # Final dispatch boundary: the explicit --toolsets pin must never
+        # contain profile-owned MCP identities reserved for the principal.
+        return sorted(filter_worker_toolsets(toolsets, delegation_cfg))
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",

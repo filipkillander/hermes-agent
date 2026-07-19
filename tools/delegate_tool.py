@@ -1141,6 +1141,14 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Final capability boundary: apply after every inheritance/intersection
+    # branch and after the orchestrator re-add so no delegated child can gain
+    # a protected profile-owned MCP identity through aliases or explicit
+    # toolset requests.
+    from hermes_cli.worker_toolset_policy import filter_worker_toolsets
+
+    child_toolsets = filter_worker_toolsets(child_toolsets, delegation_cfg)
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,

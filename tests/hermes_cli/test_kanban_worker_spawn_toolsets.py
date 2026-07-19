@@ -120,6 +120,54 @@ toolsets:
     assert resolved != ["kanban"]
 
 
+def test_resolve_worker_cli_toolsets_strips_protected_web_mcp(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "lumi"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - mcp-web_filip_staging
+    - mcp-web_studios_staging
+    - mcp-web_media_staging
+    - mcp-unrelated
+delegation:
+  blocked_worker_toolsets:
+    - mcp-web_filip_staging
+    - mcp-web_studios_staging
+    - mcp-web_media_staging
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    assert "terminal" in resolved
+    assert "kanban" in resolved
+    assert "mcp-unrelated" in resolved
+    assert "mcp-web_filip_staging" not in resolved
+    assert "mcp-web_studios_staging" not in resolved
+    assert "mcp-web_media_staging" not in resolved
+
+
+def test_code_level_worker_floor_survives_missing_profile_blocklist():
+    from hermes_cli.worker_toolset_policy import filter_worker_toolsets
+
+    resolved = filter_worker_toolsets(
+        ["terminal", "web_filip_staging", "mcp-web_media_staging", "mcp-unrelated"],
+        {},
+    )
+
+    assert resolved == ["terminal", "mcp-unrelated"]
+
+
 def test_default_spawn_uses_configured_worker_command_without_shell(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "spark"

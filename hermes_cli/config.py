@@ -2144,6 +2144,12 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Additional toolsets denied to every delegated child and Kanban
+        # worker. The runtime also carries a code-level protected floor for
+        # privileged profile-owned MCP identities, so removing this config
+        # key cannot weaken that boundary. Raw MCP server aliases and their
+        # canonical mcp-<server> names are treated as equivalent.
+        "blocked_worker_toolsets": [],
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch

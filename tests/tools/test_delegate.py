@@ -1861,6 +1861,67 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
     @patch(
         "tools.delegate_tool._load_config",
+        return_value={
+            "blocked_worker_toolsets": [
+                "mcp-web_filip_staging",
+                "mcp-web_studios_staging",
+                "mcp-web_media_staging",
+            ]
+        },
+    )
+    def test_build_child_agent_strips_protected_mcp_from_inheritance(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = [
+            "terminal",
+            "mcp-web_filip_staging",
+            "mcp-web_studios_staging",
+            "mcp-web_media_staging",
+            "mcp-unrelated",
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Test inherited worker boundary",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        enabled = MockAgent.call_args[1]["enabled_toolsets"]
+        self.assertIn("terminal", enabled)
+        self.assertIn("mcp-unrelated", enabled)
+        self.assertFalse(any("web_filip_staging" in item for item in enabled))
+        self.assertFalse(any("web_studios_staging" in item for item in enabled))
+        self.assertFalse(any("web_media_staging" in item for item in enabled))
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_strips_protected_raw_alias_when_requested(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "web_media_staging", "mcp-unrelated"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Test explicit worker boundary",
+                context=None,
+                toolsets=["terminal", "web_media_staging", "mcp-unrelated"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        enabled = MockAgent.call_args[1]["enabled_toolsets"]
+        self.assertEqual(enabled, ["terminal", "mcp-unrelated"])
+
+    @patch(
+        "tools.delegate_tool._load_config",
         return_value={"inherit_mcp_toolsets": False},
     )
     def test_build_child_agent_strict_intersection_when_opted_out(self, mock_cfg):
