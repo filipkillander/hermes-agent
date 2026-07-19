@@ -7,12 +7,20 @@ from run_agent import AIAgent
 from agent.background_review import background_review_allowed_for_platform
 
 
-def test_scheduled_cron_turns_cannot_spawn_background_self_mutation():
+def test_scheduled_cron_turns_cannot_spawn_background_self_mutation(monkeypatch):
+    monkeypatch.delenv("HERMES_CONTROLLER_ISOLATED", raising=False)
     assert background_review_allowed_for_platform("cron") is False
     assert background_review_allowed_for_platform(" CRON ") is False
     assert background_review_allowed_for_platform("discord") is True
     assert background_review_allowed_for_platform("telegram") is True
     assert background_review_allowed_for_platform(None) is True
+
+
+def test_controller_isolated_turns_cannot_spawn_background_self_mutation(monkeypatch):
+    monkeypatch.setenv("HERMES_CONTROLLER_ISOLATED", "1")
+    assert background_review_allowed_for_platform("tool") is False
+    assert background_review_allowed_for_platform("discord") is False
+    assert background_review_allowed_for_platform(None) is False
 
 
 def _bare_agent() -> AIAgent:

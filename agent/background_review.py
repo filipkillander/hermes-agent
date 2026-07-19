@@ -34,11 +34,15 @@ def background_review_allowed_for_platform(platform: Any) -> bool:
     Scheduled cron runs are automation receipts, not interactive learning
     turns.  Letting them launch the post-turn fork makes a successful cron able
     to mutate skills or memory after its own completion boundary, and makes the
-    recorded cron status blind to that extra work.  Keep manual/interactive
-    platforms unchanged while making every ``platform=cron`` turn read-only
-    after finalization.
+    recorded cron status blind to that extra work.  Controller-isolated runs
+    have the same hard completion boundary: the loop controller must be able
+    to prove that no hidden memory/skill mutation starts after it accepts the
+    operator result.  Keep manual/interactive platforms unchanged while
+    making cron and controller-isolated turns read-only after finalization.
     """
 
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return False
     return str(platform or "").strip().lower() != "cron"
 
 

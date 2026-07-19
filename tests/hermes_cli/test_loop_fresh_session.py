@@ -76,6 +76,10 @@ def test_cmd_chat_forwards_independent_memory_skip(monkeypatch):
     import hermes_cli.main as main_mod
     from hermes_cli._parser import build_top_level_parser
 
+    # cmd_chat intentionally sets this process-wide flag. Register the key
+    # with monkeypatch first so teardown restores the caller's environment and
+    # later tests cannot inherit controller isolation accidentally.
+    monkeypatch.setenv("HERMES_CONTROLLER_ISOLATED", "0")
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=main_mod.cmd_chat)
     args = parser.parse_args(
@@ -160,6 +164,42 @@ def test_prepare_agent_startup_is_noop_for_controller_isolation(monkeypatch):
         lambda _args: None,
     )
     main_mod._prepare_agent_startup(Namespace(controller_isolated=True))
+
+
+def test_controller_isolation_disables_all_plugin_surfaces(monkeypatch):
+    from hermes_cli import plugins
+
+    calls = []
+
+    class _Manager:
+        def discover_and_load(self, *, force=False):
+            calls.append(("discover", force))
+
+        def invoke_hook(self, hook_name, **kwargs):
+            calls.append(("hook", hook_name, kwargs))
+            return ["unexpected"]
+
+        def invoke_middleware(self, kind, **kwargs):
+            calls.append(("middleware", kind, kwargs))
+            return ["unexpected"]
+
+        def has_hook(self, hook_name):
+            calls.append(("has_hook", hook_name))
+            return True
+
+        def has_middleware(self, kind):
+            calls.append(("has_middleware", kind))
+            return True
+
+    monkeypatch.setenv("HERMES_CONTROLLER_ISOLATED", "1")
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: _Manager())
+
+    plugins.discover_plugins(force=True)
+    assert plugins.invoke_hook("on_session_start", session_id="loop") == []
+    assert plugins.invoke_middleware("tool_request", args={}) == []
+    assert plugins.has_hook("pre_tool_call") is False
+    assert plugins.has_middleware("tool_request") is False
+    assert calls == []
 
 
 @pytest.mark.parametrize("continue_value", [True, "existing session"])
