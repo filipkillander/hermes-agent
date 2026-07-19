@@ -403,6 +403,12 @@ def build_top_level_parser():
             "still loading project rules, SOUL.md and explicitly requested skills."
         ),
     )
+    chat_parser.add_argument(
+        "--controller-isolated",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     _inherited_flag(
         chat_parser,
         "--safe-mode",

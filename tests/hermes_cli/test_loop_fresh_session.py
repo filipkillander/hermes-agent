@@ -21,11 +21,18 @@ def test_chat_parser_exposes_fresh_session_and_memory_isolation_flags():
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     args = parser.parse_args(
-        ["chat", "--session-id", "kmros-loop-20260719-0001", "--skip-memory"]
+        [
+            "chat",
+            "--session-id",
+            "kmros-loop-20260719-0001",
+            "--skip-memory",
+            "--controller-isolated",
+        ]
     )
 
     assert args.session_id == "kmros-loop-20260719-0001"
     assert args.skip_memory is True
+    assert args.controller_isolated is True
 
 
 def test_explicit_session_id_is_fresh_and_resume_is_rejected():
@@ -80,6 +87,11 @@ def test_cmd_chat_forwards_independent_memory_skip(monkeypatch):
             "--session-id",
             "kmros-loop-20260719-0001",
             "--skip-memory",
+            "--controller-isolated",
+            "-t",
+            "file",
+            "-s",
+            "kmros-loop-operator",
         ]
     )
     captured = {}
@@ -88,8 +100,16 @@ def test_cmd_chat_forwards_independent_memory_skip(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
     monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
-    monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check", lambda: False)
-    monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
+    monkeypatch.setattr(
+        main_mod,
+        "_termux_should_prefetch_update_check",
+        lambda: pytest.fail("isolated controller must not prefetch updates"),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_sync_bundled_skills_for_startup",
+        lambda: pytest.fail("isolated controller must not sync skills"),
+    )
     monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
 
     main_mod.cmd_chat(args)
@@ -97,6 +117,49 @@ def test_cmd_chat_forwards_independent_memory_skip(monkeypatch):
     assert captured["session_id"] == "kmros-loop-20260719-0001"
     assert captured["skip_memory"] is True
     assert captured["ignore_rules"] is False
+    assert captured["controller_isolated"] is True
+    assert main_mod.os.environ["HERMES_CONTROLLER_ISOLATED"] == "1"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["chat", "--controller-isolated"],
+        [
+            "chat", "--cli", "-q", "prompt", "--session-id",
+            "kmros-loop-20260719-0001", "--skip-memory", "--controller-isolated",
+            "-s", "kmros-loop-operator",
+        ],
+        [
+            "chat", "--cli", "-q", "prompt", "--session-id",
+            "kmros-loop-20260719-0001", "--skip-memory", "--controller-isolated",
+            "-t", "file",
+        ],
+    ],
+)
+def test_controller_isolated_invocation_fails_closed(argv, monkeypatch):
+    import hermes_cli.main as main_mod
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, chat_parser = build_top_level_parser()
+    chat_parser.set_defaults(func=main_mod.cmd_chat)
+    args = parser.parse_args(argv)
+    monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.cmd_chat(args)
+    assert exc.value.code == 2
+
+
+def test_prepare_agent_startup_is_noop_for_controller_isolation(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setattr(
+        main_mod,
+        "_apply_safe_mode",
+        lambda _args: None,
+    )
+    main_mod._prepare_agent_startup(Namespace(controller_isolated=True))
 
 
 @pytest.mark.parametrize("continue_value", [True, "existing session"])
