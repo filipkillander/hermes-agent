@@ -808,6 +808,15 @@ def _evaluate_all_of(
         if sr.status == "fail":
             any_fail = True
             reasons.append(f"{sub_rid}:{sr.reason}")
+            # v4 recursive dual-status propagation: when an inner all_of
+            # returns status=fail with also_blocked=True (meaning a BLOCKED
+            # sub-check exists somewhere inside the composite), the outer
+            # all_of must preserve that BLOCKED signal so the top-level gate
+            # dual-lists the requirement ID. Without this, nesting an
+            # all_of(with FAIL+BLOCKED) inside another all_of drops the
+            # BLOCKED signal at the outer level.
+            if getattr(sr, "also_blocked", False):
+                any_blocked = True
         elif sr.status == "blocked":
             any_blocked = True
             reasons.append(f"{sub_rid}:{sr.reason}")

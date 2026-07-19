@@ -1602,3 +1602,130 @@ def test_trust_context_protocol_is_injectable(cic):
         "run_gate must accept trust_context parameter (DI seam)"
     # The TrustContext protocol must exist.
     assert hasattr(cic, "TrustContext"), "CIC must expose TrustContext protocol"
+
+
+# ── v4: recursive dual-status propagation through nested all_of ─────────────
+
+
+def test_nested_all_of_propagates_also_blocked(cic, tmp_path):
+    """v4 regression: an inner all_of with FAIL+BLOCKED nested inside an
+    outer all_of must preserve also_blocked=True on the outer result.
+
+    Reproduces Filip's reported gap: a flat all_of with FAIL+BLOCKED sets
+    also_blocked=true, but the SAME composite nested inside another all_of
+    returned also_blocked=false because the outer _evaluate_all_of only
+    checked sr.status == "fail" and ignored sr.also_blocked.
+
+    This test exercises the public run_gate chain (not a private helper)
+    with a schema-valid manifest containing all 13 IDs, models FAS-A-012 as
+    an outer all_of containing an inner all_of, and asserts:
+      - gate == "fail"
+      - FAS-A-012 appears exactly once in failing_ids
+      - FAS-A-012 appears exactly once in blocked_ids
+      - FAS-A-012's CheckResult has also_blocked == True
+      - closeout_permitted == False
+    """
+    import json as _json
+    import pathlib
+    import hashlib
+    # Build a 13-requirement manifest. FAS-A-001..011 and FAS-A-013 use
+    # trivially-passing checks (git_ancestor against a real branch in the
+    # worktree's repo); FAS-A-012 is the nested all_of under test.
+    import subprocess
+    # Use tmp_path as base_dir so manifest/schema/receipts are contained.
+    base = tmp_path
+    repo = pathlib.Path(cic.__file__).resolve().parent.parent  # worktree root for git lookups
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True
+    ).stdout.strip()
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True
+    ).stdout.strip()
+    # Copy the real schema into tmp_path/control-plane/ so containment passes.
+    (base / "control-plane").mkdir(exist_ok=True)
+    schema_src = repo / "control-plane" / "fas-a-requirements.schema.json"
+    schema_path = base / "control-plane" / "fas-a-requirements.schema.json"
+    schema_path.write_bytes(schema_src.read_bytes())
+
+    def passing_check():
+        return {"type": "git_ancestor", "branch": branch, "commit_sha": head}
+
+    reqs = []
+    for i in range(1, 14):
+        rid = f"FAS-A-{i:03d}"
+        text_i = f"requirement {i}"
+        sh = hashlib.sha256(text_i.encode("utf-8")).hexdigest()
+        if i == 12:
+            # Nested all_of: outer contains inner all_of + a passing check.
+            inner_all_of = {
+                "type": "all_of",
+                "checks": [
+                    # Missing technical evidence (file does not exist) -> FAIL
+                    {
+                        "type": "file_sha256",
+                        "path": "control-plane/evidence/fas-a-012-current-truth.json",
+                        "expected_sha256": "PENDING_EVIDENCE",
+                    },
+                    # Owner decision without trust context -> BLOCKED
+                    {
+                        "type": "owner_decision_receipt",
+                        "receipt_path": "control-plane/evidence/fas-a-012-owner-receipt.json",
+                        "owner_id": "PENDING_OWNER_DECISION",
+                    },
+                ],
+            }
+            reqs.append({
+                "id": rid,
+                "text": text_i,
+                "source_hash": sh,
+                "check": {
+                    "type": "all_of",
+                    "checks": [inner_all_of, passing_check()],
+                },
+            })
+        else:
+            reqs.append({
+                "id": rid,
+                "text": text_i,
+                "source_hash": sh,
+                "check": passing_check(),
+            })
+
+    manifest = {
+        "manifest_version": "1.1",
+        "manifest_id": "fas-a-requirements-v1",
+        "generated_by": "test",
+        "description": "test manifest",
+        "anchors": {},
+        "requirements": reqs,
+    }
+    manifest_path = tmp_path / "fas-a-requirements.yaml"
+    import yaml
+    manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False))
+
+    # schema_path already set above (copied into tmp_path/control-plane/).
+
+    # Run the full gate chain (public API). No trust context -> owner
+    # decision receipts are BLOCKED; missing technical file is FAIL.
+    result = cic.run_gate(
+        manifest_path=str(manifest_path),
+        schema_path=str(schema_path),
+        base_dir=str(base),
+        trust_context=None,
+    )
+    assert result.gate == "FAIL", f"expected gate=fail, got {result.gate}"
+    assert result.closeout_permitted is False, "closeout must be false"
+    # FAS-A-012 in failing_ids exactly once
+    assert result.failing_ids.count("FAS-A-012") == 1,         f"FAS-A-012 should appear once in failing_ids, got {result.failing_ids.count('FAS-A-012')}"
+    # FAS-A-012 in blocked_ids exactly once
+    assert result.blocked_ids.count("FAS-A-012") == 1,         f"FAS-A-012 should appear once in blocked_ids, got {result.blocked_ids.count('FAS-A-012')}"
+    # Find the CheckResult for FAS-A-012 and assert also_blocked
+    for cr in result.results:
+        if cr.requirement_id == "FAS-A-012":
+            assert cr.also_blocked is True,                 f"FAS-A-012 CheckResult must have also_blocked=True, got {cr.get('also_blocked')}"
+            break
+    else:
+        # check_results may not be in the JSON output; verify via failing+blocked dual listing
+        pass
