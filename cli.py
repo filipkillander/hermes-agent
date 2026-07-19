@@ -948,6 +948,8 @@ def _prepare_deferred_agent_startup() -> None:
     global _deferred_agent_startup_done
     if _deferred_agent_startup_done:
         return
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") == "1":
+        return
     if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
         return
     _deferred_agent_startup_done = True
@@ -15724,6 +15726,7 @@ def main(
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
     skip_memory: bool = False,
+    controller_isolated: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -15761,6 +15764,14 @@ def main(
     """
     global _active_worktree
 
+    if controller_isolated:
+        if not session_id or not skip_memory or toolsets != "file" or worktree or w:
+            raise ValueError("invalid controller-isolated invocation")
+        parsed_controller_skills = _parse_skills_argument(skills)
+        if len(parsed_controller_skills) != 1:
+            raise ValueError("controller-isolated mode requires exactly one explicit skill")
+        os.environ["HERMES_CONTROLLER_ISOLATED"] = "1"
+
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
     # UnicodeEncodeError on cp1252.  No-op on Linux/macOS.
@@ -15772,7 +15783,7 @@ def main(
 
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
-    os.environ["HERMES_INTERACTIVE"] = "1"
+    os.environ["HERMES_INTERACTIVE"] = "0" if controller_isolated else "1"
     
     # Handle gateway mode (messaging + cron)
     if gateway:

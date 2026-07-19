@@ -511,7 +511,8 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if os.environ.get("HERMES_CONTROLLER_ISOLATED") != "1" and \
+            (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -1462,7 +1463,7 @@ def init_agent(
     # prompt build, which sits on the time-to-first-token critical path.
     # The warm runs during agent init (network/credential setup dominates),
     # so by the time the first prompt is built the line is already cached.
-    if agent._environment_probe:
+    if agent._environment_probe and os.environ.get("HERMES_CONTROLLER_ISOLATED") != "1":
         try:
             from tools.env_probe import warm_environment_probe_async
             warm_environment_probe_async()

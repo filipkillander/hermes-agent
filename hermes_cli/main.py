@@ -2260,6 +2260,36 @@ def cmd_chat(args):
 
     explicit_session_id = getattr(args, "session_id", None)
     skip_memory = bool(getattr(args, "skip_memory", False))
+    controller_isolated = bool(getattr(args, "controller_isolated", False))
+    if controller_isolated:
+        skills = getattr(args, "skills", None)
+        if isinstance(skills, str):
+            skills = [skills]
+        isolation_errors = []
+        if use_tui or not getattr(args, "cli", False):
+            isolation_errors.append("explicit --cli")
+        if not explicit_session_id:
+            isolation_errors.append("--session-id")
+        if not skip_memory:
+            isolation_errors.append("--skip-memory")
+        if not getattr(args, "query", None):
+            isolation_errors.append("single -q/--query")
+        if getattr(args, "toolsets", None) != "file":
+            isolation_errors.append("exactly -t file")
+        if not isinstance(skills, list) or len(skills) != 1 or not str(skills[0]).strip():
+            isolation_errors.append("exactly one explicit --skills value")
+        if getattr(args, "yolo", False):
+            isolation_errors.append("no --yolo")
+        if getattr(args, "accept_hooks", False):
+            isolation_errors.append("no --accept-hooks")
+        if getattr(args, "worktree", False):
+            isolation_errors.append("no Hermes-managed --worktree")
+        if isolation_errors:
+            print(
+                "--controller-isolated requires " + ", ".join(isolation_errors) + "."
+            )
+            sys.exit(2)
+        os.environ["HERMES_CONTROLLER_ISOLATED"] = "1"
     if explicit_session_id and (
         getattr(args, "resume", None) or getattr(args, "continue_last", None)
     ):
@@ -2361,7 +2391,7 @@ def cmd_chat(args):
     # Start update check in background (runs while other init happens).
     # On Termux this imports rich/prompt_toolkit in the foreground and then
     # competes for CPU on single-core devices, so keep it opt-in there.
-    if _termux_should_prefetch_update_check():
+    if not controller_isolated and _termux_should_prefetch_update_check():
         try:
             from hermes_cli.banner import prefetch_update_check
 
@@ -2370,10 +2400,11 @@ def cmd_chat(args):
             pass
 
     # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
+    if not controller_isolated:
+        try:
+            _sync_bundled_skills_for_startup()
+        except Exception:
+            pass
 
     # --yolo: bypass all dangerous command approvals
     if getattr(args, "yolo", False):
@@ -2439,6 +2470,7 @@ def cmd_chat(args):
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "skip_memory": skip_memory,
+        "controller_isolated": controller_isolated,
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
     }
@@ -12422,6 +12454,12 @@ def _should_background_mcp_startup(args) -> bool:
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
     _apply_safe_mode(args)
+
+    if getattr(args, "controller_isolated", False):
+        # The trusted loop controller deliberately runs without plugin, MCP or
+        # shell-hook discovery.  cmd_chat performs the stricter invocation
+        # validation before the model process is allowed to start.
+        return
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
