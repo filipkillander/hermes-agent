@@ -3864,6 +3864,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Local KMR policy: Force Draft protects create calls, but a later
+        # update could otherwise promote a new page.  Keep routine edits to
+        # existing published pages possible (status omitted) while requiring
+        # the separate owner/break-glass lane for publication and structural
+        # site changes.
+        from tools.wordpress_mcp_policy import check_wordpress_mcp_call
+
+        policy_block = check_wordpress_mcp_call(server_name, tool_name, args)
+        if policy_block is not None:
+            logger.warning(
+                "MCP call blocked by WordPress policy: %s/%s (%s)",
+                server_name,
+                tool_name,
+                policy_block.get("code", "policy_block"),
+            )
+            return json.dumps(policy_block, ensure_ascii=False)
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
