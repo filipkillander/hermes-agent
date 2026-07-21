@@ -44,6 +44,10 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
+from agent.required_material import (
+    check_persona_fail_closed,
+    compute_injection_receipt,
+)
 
 
 def _ra():
@@ -151,15 +155,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _persona_content = ""  # tracked for injection receipt (P0-050)
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
+            _persona_content = _soul_content
 
     if not _soul_loaded:
+        # P0-050 ROUTE-002: fail-closed for missing SOUL.md.
+        # When required_material_fail_closed=true in config, raise
+        # BlockedRequiredMaterial instead of silently falling back.
+        check_persona_fail_closed(agent, _persona_content)
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        _persona_content = DEFAULT_AGENT_IDENTITY
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -288,6 +299,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         skills_prompt = ""
     if skills_prompt:
         stable_parts.append(skills_prompt)
+
+    # P0-050: track skills content for injection receipt
+    _skills_content = skills_prompt or "" 
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
@@ -460,10 +474,47 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 
+    # P0-050: Track volatile-tier components for injection receipt
+    _memory_content = ""
+    _user_context_content = ""
+    if agent._memory_store:
+        if agent._memory_enabled:
+            _memory_content = agent._memory_store.format_for_system_prompt("memory") or ""
+        if agent._user_profile_enabled:
+            _user_context_content = agent._memory_store.format_for_system_prompt("user") or ""
+
+    stable_str = "\n\n".join(p.strip() for p in stable_parts if p and p.strip())
+    context_str = "\n\n".join(p.strip() for p in context_parts if p and p.strip())
+    volatile_str = "\n\n".join(p.strip() for p in volatile_parts if p and p.strip())
+
+    # P0-050 ROUTE-001: compute per-turn injection receipt and store on agent.
+    try:
+        _receipt = compute_injection_receipt(
+            persona=_persona_content,
+            user_context=_user_context_content,
+            memory=_memory_content,
+            skills=_skills_content,
+            stable=stable_str,
+            context=context_str,
+            volatile=volatile_str,
+        )
+        agent._last_injection_receipt = _receipt
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "P0-050 injection receipt: persona=%s user=%s memory=%s skills=%s",
+            _receipt["persona_present"],
+            _receipt["user_context_present"],
+            _receipt["memory_present"],
+            _receipt["skills_present"],
+        )
+    except Exception:
+        # Receipt computation must never block prompt assembly.
+        agent._last_injection_receipt = None
+
     return {
-        "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
-        "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
-        "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
+        "stable":   stable_str,
+        "context":  context_str,
+        "volatile": volatile_str,
     }
 
 
