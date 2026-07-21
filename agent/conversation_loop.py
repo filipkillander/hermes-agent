@@ -602,6 +602,34 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # ── SCOPE-003: Context gate ──────────────────────────────────────────
+    # Hard token limit check at turn start.  If observed tokens exceed the
+    # configured hard limit, raise ContextGateStop to halt the turn before
+    # the model is called.  Applies to main, /goal, internal, and background
+    # turns — every path that enters run_conversation.  When the limit is
+    # not configured (None = default), this is a no-op (backward compatible).
+    try:
+        from agent.scope_guard import check_context_gate, ContextGateStop
+        from hermes_cli.config import load_config as _load_config_for_gate
+        _gate_config = _load_config_for_gate()
+        # Use the estimated request tokens for the upcoming turn as the
+        # observed token count.  Fall back to session_total_tokens when
+        # estimation is not available (empty messages on first turn).
+        _observed_tokens = getattr(agent, "session_total_tokens", 0)
+        try:
+            _estimated = estimate_request_tokens_rough(
+                messages, agent.model, agent.base_url,
+            )
+            if _estimated and _estimated > _observed_tokens:
+                _observed_tokens = _estimated
+        except Exception:
+            pass
+        check_context_gate(_observed_tokens, config=_gate_config)
+    except ContextGateStop:
+        raise
+    except Exception:
+        pass  # Gate is best-effort — never block a turn on config load failure
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None

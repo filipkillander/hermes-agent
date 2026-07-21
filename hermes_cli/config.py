@@ -6037,6 +6037,40 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                 config["mcp_servers"] = raw_mcp_servers
                 _persist_migration(config)
 
+    # ── SCOPE-001: strip forbidden mutation toolsets from webhook platform ──
+    # Webhook has full mutation toolset by default — any incoming webhook can
+    # write files, run terminal commands, mutate kanban, modify memory, or
+    # create cron jobs.  Migrate the config to remove these toolsets so the
+    # webhook platform is read-only by default.  Code-level enforcement in
+    # _get_platform_tools() also strips them at runtime, but this migration
+    # keeps the config clean and visible.
+    try:
+        from agent.scope_guard import WEBHOOK_FORBIDDEN_TOOLSETS
+        config = read_raw_config()
+        pt = config.get("platform_toolsets")
+        if isinstance(pt, dict):
+            webhook_ts = pt.get("webhook")
+            if isinstance(webhook_ts, list):
+                filtered = [
+                    ts for ts in webhook_ts
+                    if str(ts).strip() not in WEBHOOK_FORBIDDEN_TOOLSETS
+                ]
+                removed = set(webhook_ts) - set(filtered)
+                if removed:
+                    pt["webhook"] = filtered
+                    _persist_migration(config)
+                    results["config_added"].append(
+                        f"platform_toolsets.webhook: stripped forbidden "
+                        f"mutation toolsets: {sorted(removed)} (SCOPE-001)"
+                    )
+                    if not quiet:
+                        print(
+                            f"  ✓ SCOPE-001: stripped forbidden webhook "
+                            f"toolsets: {sorted(removed)}"
+                        )
+    except Exception as _scope001_err:
+        logger.debug("SCOPE-001 webhook migration skipped: %s", _scope001_err)
+
     # ── Always: validate platform_toolsets after migration ──
     # A migration (or hand-edit) that leaves an invalid toolset name in
     # platform_toolsets silently disables the affected tools — resolve_toolset()

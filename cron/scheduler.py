@@ -208,6 +208,38 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _resolve_cron_enabled_toolsets_with_scope(job: dict, cfg: dict) -> list[str] | None:
+    """Resolve cron toolsets and apply SCOPE-002 mutation_scope enforcement.
+
+    Layered on top of _resolve_cron_enabled_toolsets: when a job declares
+    ``read-only`` scope, write-capable toolsets (file, terminal, kanban,
+    memory, cronjob, delegation) are stripped from the resolved list.
+    ``full`` and ``exact-write-set`` pass through unchanged (the write_set
+    itself is enforced by the agent's tool guardrails, not here).
+    """
+    base = _resolve_cron_enabled_toolsets(job, cfg)
+    if base is None:
+        return base
+
+    from agent.scope_guard import MutationScope, enforce_read_only_toolsets
+    raw_scope = job.get("mutation_scope")
+    scope = MutationScope.parse(raw_scope)
+
+    if scope is MutationScope.READ_ONLY:
+        filtered = enforce_read_only_toolsets(base)
+        stripped = set(base) - set(filtered)
+        if stripped:
+            logger.info(
+                "SCOPE-002: job '%s' declared read-only scope, stripping "
+                "write-capable toolsets: %s",
+                job.get("id", "?"),
+                sorted(stripped),
+            )
+        return filtered
+
+    return base
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -3290,7 +3322,7 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=_resolve_cron_enabled_toolsets_with_scope(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from

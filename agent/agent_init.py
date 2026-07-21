@@ -575,6 +575,18 @@ def init_agent(
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
+
+    # SCOPE-004: Mutation scope for this agent (read-only / exact-write-set / full).
+    # Defaults to FULL for backward compatibility.  Set by delegate_task scope
+    # inheritance when this agent is a child, or by cron jobs (SCOPE-002).
+    agent._mutation_scope = None  # None = FULL (unrestricted, backward compat)
+
+    # SCOPE-005: Background activity tracking for quiescence before final response.
+    # Tracks threads/tasks that may mutate state so finalize_turn can await/cancel
+    # them before delivering the final visible response.  Threads are daemon by
+    # default; this list is for explicit quiescence (join with timeout).
+    agent._background_activities: list = []
+    agent._background_activities_lock = threading.Lock()
     
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed

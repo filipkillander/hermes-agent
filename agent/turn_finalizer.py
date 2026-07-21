@@ -28,6 +28,86 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.background_review import background_review_allowed_for_platform
 
 
+
+def _quiesce_background_sync(agent, timeout: float = 5.0):
+    """Synchronously quiesce background activities before final response.
+
+    SCOPE-005: Joins tracked background threads with a timeout.  When
+    asyncio tasks are tracked and an event loop is available, delegates to
+    the async ``quiesce_background_activities()``.  Threads that don't
+    finish within the timeout are left as daemon threads (they won't block
+    process exit) and logged as stragglers.
+
+    This is best-effort: failures are logged but never block the final
+    response.
+    """
+    import threading as _threading
+
+    _bg_lock = getattr(agent, "_background_activities_lock", None)
+    if _bg_lock is None:
+        return
+
+    with _bg_lock:
+        _bg_list = getattr(agent, "_background_activities", None)
+        if not _bg_list:
+            return
+        # Snapshot the list and clear it so new activities aren't missed.
+        activities = list(_bg_list)
+        _bg_list.clear()
+
+    # Separate threads from asyncio tasks.
+    _threads = [a for a in activities if isinstance(a, _threading.Thread)]
+    _async_tasks = [a for a in activities if not isinstance(a, _threading.Thread)]
+
+    # Join threads with timeout.
+    if _threads:
+        from agent.conversation_loop import logger as _loop_logger
+        _pending = [t for t in _threads if not t.is_alive()]
+        _stragglers = [t for t in _threads if t.is_alive()]
+        if _stragglers:
+            _loop_logger.info(
+                "SCOPE-005: quiescing %d background threads (timeout=%.1fs)",
+                len(_stragglers), timeout,
+            )
+            for t in _stragglers:
+                t.join(timeout=timeout / max(len(_stragglers), 1))
+            _still_alive = [t for t in _stragglers if t.is_alive()]
+            if _still_alive:
+                _loop_logger.warning(
+                    "SCOPE-005: %d background threads still alive after "
+                    "quiesce — proceeding with final response",
+                    len(_still_alive),
+                )
+
+    # Await asyncio tasks if there's a running loop.
+    if _async_tasks:
+        try:
+            import asyncio as _asyncio
+
+            try:
+                _loop = _asyncio.get_running_loop()
+            except RuntimeError:
+                _loop = None
+
+            if _loop and _loop.is_running():
+                # We're inside an async context — schedule the quiescence.
+                from agent.scope_guard import quiesce_background_activities
+
+                _loop.create_task(
+                    quiesce_background_activities(_async_tasks, timeout=timeout)
+                )
+            else:
+                # No running loop — create one just for quiescence.
+                from agent.scope_guard import quiesce_background_activities
+
+                _asyncio.run(
+                    quiesce_background_activities(_async_tasks, timeout=timeout)
+                )
+        except Exception:
+            pass  # Async quiescence is best-effort
+
+
+
 def finalize_turn(
     agent,
     *,
@@ -522,5 +602,16 @@ def finalize_turn(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    # ── SCOPE-005: Background quiescence ───────────────────────────────
+    # Before delivering the final visible response, await/cancel all
+    # background activities so no mutation may begin after the final
+    # response.  This covers background review threads and any other
+    # tracked background activities.  When no activities are tracked,
+    # this is a no-op (backward compatible).
+    try:
+        _quiesce_background_sync(agent)
+    except Exception as _quiesce_err:
+        logger.debug("SCOPE-005: quiesce failed: %s", _quiesce_err)
 
     return result

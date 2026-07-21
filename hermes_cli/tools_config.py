@@ -1927,6 +1927,23 @@ def _get_platform_tools(
                 ", ".join(_named),
             )
 
+    # -- SCOPE-001: Webhook toolset restriction ---------------------------
+    # Strip mutation toolsets (file, terminal, kanban, memory, cronjob) from
+    # the webhook platform so incoming webhooks cannot trigger mutations.
+    # Enforcement is in code (not just config) so a stale/migrated config
+    # cannot re-introduce the vulnerability.
+    if platform == "webhook":
+        from agent.scope_guard import filter_webhook_toolsets
+        filtered = filter_webhook_toolsets(enabled_toolsets)
+        if len(filtered) < len(enabled_toolsets):
+            logger.info(
+                "SCOPE-001: stripped %d forbidden toolset(s) from webhook "
+                "platform: removed {%s}",
+                len(enabled_toolsets) - len(filtered),
+                ", ".join(sorted(enabled_toolsets - set(filtered))),
+            )
+        enabled_toolsets = set(filtered)
+
     return enabled_toolsets
 
 

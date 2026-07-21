@@ -1344,6 +1344,44 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
+
+    # ── SCOPE-004: Scope inheritance ──────────────────────────────────────
+    # Children inherit the parent's mutation scope as their maximum authority.
+    # A child can only narrow, never expand:
+    #   - read-only parent → read-only child (regardless of request)
+    #   - exact-write-set parent → child can be read-only or exact-write-set
+    #   - full parent → child can be any scope
+    # When the effective scope is read-only, write-capable toolsets were
+    # already stripped above (child_toolsets).  We store the scope on the
+    # child so nested delegations can chain the inheritance.
+    try:
+        from agent.scope_guard import (
+            MutationScope,
+            child_scope_from_parent,
+            enforce_read_only_toolsets,
+        )
+        parent_scope = getattr(parent_agent, "_mutation_scope", None)
+        if parent_scope is None:
+            parent_scope = MutationScope.FULL
+        elif not isinstance(parent_scope, MutationScope):
+            parent_scope = MutationScope.parse(parent_scope)
+        # Compute the child's effective scope — default to FULL when no
+        # explicit request (backward compatible with existing callers).
+        child_scope = child_scope_from_parent(parent_scope, None)
+        child._mutation_scope = child_scope
+        # If the effective scope is read-only, strip write-capable toolsets
+        # from the child's enabled_toolsets.  This is a safety net — the
+        # primary enforcement is at toolset construction above.  Guard with
+        # isinstance to avoid acting on mock objects in tests.
+        if child_scope.is_read_only:
+            child_enabled = getattr(child, "enabled_toolsets", None)
+            if isinstance(child_enabled, (list, tuple, set, frozenset)):
+                child.enabled_toolsets = enforce_read_only_toolsets(
+                    list(child_enabled)
+                )
+    except Exception:
+        # Scope inheritance is best-effort — never break delegation on failure
+        logger.debug("SCOPE-004: scope inheritance failed", exc_info=True)
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role

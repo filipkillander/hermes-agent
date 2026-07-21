@@ -1644,6 +1644,13 @@ class AIAgent:
             target=propagate_context_to_thread(target), daemon=True, name="bg-review"
         )
         t.start()
+        # SCOPE-005: Track background thread for quiescence before final response.
+        _bg_lock = getattr(self, "_background_activities_lock", None)
+        if _bg_lock is not None:
+            with _bg_lock:
+                _bg_list = getattr(self, "_background_activities", None)
+                if _bg_list is not None:
+                    _bg_list.append(t)
 
     def _build_memory_write_metadata(
         self,
