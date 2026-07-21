@@ -1,0 +1,42 @@
+manifest_version: '1.0'
+manifest_id: example-requirements-v1
+goal_id: GO_EXAMPLE_GOAL
+source_message: Initial requirements from goal kickoff message
+generated_by: completion-gate-example
+description: Example requirements manifest for the reusable completion-integrity-gate.
+requirements:
+- id: REQ-001
+  text: Create feature branch from verified base
+  source_hash: c75cd7d9f576737e9c7b206d489a043eb0d0659f20753a4d4d1fee6f0a0d442b
+  check:
+    type: git_ancestor
+    branch: main
+    commit_sha: 520110d15e968b6587b3b2d012037561c372bc93
+- id: REQ-002
+  text: Implement core module with tests
+  source_hash: b004e55851dc20f73128abbe87ba977f3766801fbaacd0da1e553b921c2670ee
+  check:
+    type: test_receipt
+    receipt_path: control-plane/evidence/req-002-receipt.json
+    expected_check_id: REQ-002
+- id: REQ-003
+  text: All existing tests pass
+  source_hash: 6b6c81d12b04291309f04e56e2cdba4f37ca004c2dd06018aa0766907f1ebfe8
+  check:
+    type: test_receipt
+    receipt_path: control-plane/evidence/req-003-receipt.json
+    expected_check_id: REQ-003
+- id: REQ-004
+  text: New tests including negative test pass
+  source_hash: d7214d98fa7e6df2370fd4856252c54bd911229e1da7ba2b9c5cc0f8d98a0667
+  check:
+    type: test_receipt
+    receipt_path: control-plane/evidence/req-004-receipt.json
+    expected_check_id: REQ-004
+- id: REQ-005
+  text: Code review completed by reviewer
+  source_hash: 5c83d2d99c4290c4242142585b785b4c5176bb36bcf97ce1e6957b336165c419
+  check:
+    type: owner_decision_receipt
+    receipt_path: control-plane/evidence/req-005-owner-receipt.json
+    owner_id: PENDING_OWNER_DECISION
