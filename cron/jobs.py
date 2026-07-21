@@ -306,6 +306,16 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
 
+    # SCOPE-002: ensure mutation_scope has a valid value for every job.
+    # Old jobs without this field default to "full" (backward compatible).
+    if "mutation_scope" not in normalized or normalized.get("mutation_scope") is None:
+        normalized["mutation_scope"] = "full"
+    else:
+        from agent.scope_guard import resolve_mutation_scope
+        normalized["mutation_scope"] = resolve_mutation_scope(
+            normalized.get("mutation_scope")
+        ).value
+
     return normalized
 
 
@@ -911,6 +921,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    mutation_scope: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -955,6 +966,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        mutation_scope: Optional scope declaration restricting what the cron
+                agent may mutate.  One of: ``read-only`` (no write-capable
+                toolsets), ``exact-write-set`` (limited to declared toolsets),
+                or ``full`` (unrestricted, default for backward compat).
+                Ignored when ``no_agent=True``.  See SCOPE-002.
 
     Returns:
         The created job dict
@@ -987,6 +1003,10 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    # SCOPE-002: normalize mutation_scope via the scope_guard parser.
+    # None/missing defaults to "full" for backward compatibility.
+    from agent.scope_guard import resolve_mutation_scope
+    normalized_mutation_scope = resolve_mutation_scope(mutation_scope).value
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1076,6 +1096,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "mutation_scope": normalized_mutation_scope,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
