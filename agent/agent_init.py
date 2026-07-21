@@ -1323,6 +1323,20 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
+    # P0-050: Read agent section early for fail-closed config (needed before
+    # memory loading and skill enforcement).  The full _agent_section is also
+    # read again later for tool_use_enforcement etc. -- that's fine, it's
+    # cheap (dict get on an already-parsed config).
+    _p050_agent_section = _agent_cfg.get("agent", {})
+    if not isinstance(_p050_agent_section, dict):
+        _p050_agent_section = {}
+    agent._p050_config = {
+        "required_skills": _p050_agent_section.get("required_skills", []),
+        "required_material_fail_closed": _p050_agent_section.get(
+            "required_material_fail_closed", False
+        ),
+    }
+
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
@@ -1343,6 +1357,22 @@ def init_agent(
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                 )
                 agent._memory_store.load_from_disk()
+
+                # P0-050 ROUTE-003: fail-closed for missing USER.md/MEMORY.md.
+                # When required_material_fail_closed=true and either file
+                # has no entries, raise BlockedRequiredMaterial instead of
+                # silently skipping.  Only checked when memory features are
+                # actually enabled (the user opted into memory/user_profile).
+                from agent.required_material import check_memory_fail_closed
+                check_memory_fail_closed(
+                    agent,
+                    user_present=bool(
+                        agent._memory_store.format_for_system_prompt("user")
+                    ),
+                    memory_present=bool(
+                        agent._memory_store.format_for_system_prompt("memory")
+                    ),
+                )
         except Exception:
             pass  # Memory is optional -- don't break agent init
     
@@ -1426,6 +1456,20 @@ def init_agent(
         agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
     except Exception:
         pass
+
+    # P0-050 ROUTE-004: enforce required_skills are present and parseable.
+    # When required_material_fail_closed=true and a required skill is missing,
+    # raise BlockedRequiredMaterial.  When fail-closed is off (default), log a
+    # warning but don't raise -- full backward compatibility.
+    try:
+        from agent.required_material import enforce_required_skills
+        enforce_required_skills(agent)
+    except Exception as _p050_exc:
+        from agent.required_material import BlockedRequiredMaterial
+        if isinstance(_p050_exc, BlockedRequiredMaterial):
+            raise
+        # Other exceptions are non-blocking (enforcement is best-effort).
+        _ra().logger.debug("Required skills enforcement error (non-blocking): %s", _p050_exc)
 
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
