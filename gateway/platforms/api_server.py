@@ -90,6 +90,43 @@ def _hermes_version() -> str:
         return "dev"
 
 
+def _code_revision() -> str:
+    """Return the git SHA of the running release, or 'unknown' if it can't be resolved.
+
+    Reads the release_revision from the runtime registry for the current profile,
+    falling back to the git HEAD of the hermes-agent repo. Never raises.
+    """
+    import os
+    try:
+        # Try runtime registry first (authoritative for releases)
+        import yaml
+        registry_path = os.path.expanduser("~/.hermes/runtime-registry.yaml")
+        if os.path.exists(registry_path):
+            with open(registry_path) as f:
+                registry = yaml.safe_load(f)
+            profile = os.environ.get("HERMES_PROFILE", "lumi")
+            profiles = registry.get("profiles", {})
+            entry = profiles.get(profile, {})
+            rev = entry.get("release_revision")
+            if rev:
+                return rev
+    except Exception:
+        pass
+    try:
+        # Fall back to git HEAD
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()[:12]
+    except Exception:
+        pass
+    return "unknown"
+
+
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -1587,7 +1624,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version(), "code_revision": _code_revision()}
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -1623,6 +1660,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "status": "ok",
             "platform": "hermes-agent",
             "version": _hermes_version(),
+            "code_revision": _code_revision(),
             "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}),
             "active_agents": gw_active,
